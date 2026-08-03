@@ -30,6 +30,7 @@ from app.schemas.research import (
     FundamentalsStatus,
     MembershipImportResult,
     StockDailyResponse,
+    StockTechnicalResponse,
     StockDataStatusResponse,
     StockIndustryOut,
     StockIndustryListResponse,
@@ -42,6 +43,7 @@ from app.schemas.research import (
 )
 from app.services.research import stock_data, stock_fundamentals, stock_universe
 from app.services.research.parquet_store import DAILY_QFQ, DAILY_RAW
+from app.services.stock_technical import analyze_technical
 
 router = APIRouter(prefix="/stocks", tags=["stocks"])
 
@@ -287,3 +289,14 @@ def get_stock_daily(
         items=[DailyBarOut(**row) for row in rows],
         total=len(rows),
     )
+
+
+@router.get("/{code}/technical", response_model=StockTechnicalResponse)
+def get_stock_technical(
+    code: str,
+    db: Session = Depends(get_db),
+) -> StockTechnicalResponse:
+    """基于前复权日线计算单股技术面摘要和可解释风险提示。"""
+    normalized = code.zfill(6)
+    rows = stock_data.get_daily_bars(db, normalized, layer=DAILY_QFQ)
+    return StockTechnicalResponse(**analyze_technical(normalized, rows))

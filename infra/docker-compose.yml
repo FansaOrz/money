@@ -20,28 +20,39 @@ services:
       dockerfile: apps/api/Dockerfile
     restart: unless-stopped
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://money:change-me@db:5432/money}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
-      IMPORT_SESSION_TTL_MINUTES: ${IMPORT_SESSION_TTL_MINUTES:-30}
+      MONEY_DATABASE_URL: ${MONEY_DATABASE_URL:-postgresql+psycopg://money:change-me@db:5432/money}
+      MONEY_CORS_ORIGINS: ${MONEY_CORS_ORIGINS:-http://localhost:3000}
+      MONEY_IMPORT_SESSION_TTL_MINUTES: ${MONEY_IMPORT_SESSION_TTL_MINUTES:-30}
+      MONEY_RESEARCH_DATA_DIR: /data/research
+      MONEY_RESEARCH_DB: /data/research/research.duckdb
     ports:
       - "8000:8000"
+    volumes:
+      - research_data:/data/research
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   web:
     build:
       context: ..
       dockerfile: apps/web/Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        API_PROXY_URL: http://api:8000
     restart: unless-stopped
     environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      API_PROXY_URL: http://api:8000
     ports:
       - "3000:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
   postgres_data:
+  research_data:

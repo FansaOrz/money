@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, peekApiCache } from "@/lib/api";
 import {
   fmtBeijingTime,
   fmtDate,
@@ -70,6 +70,19 @@ interface FundDetailView {
   introSource: string | null;
   introFetchedAt: string | null;
   metrics: MetricItem[];
+  metricsAsOf: string | null;
+  metricsBasis: string | null;
+  advice: {
+    action: string;
+    label: string;
+    score: number | null;
+    confidence: string;
+    horizon: string;
+    summary: string;
+    reasons: string[];
+    risks: string[];
+    invalidation: string;
+  } | null;
   holdings: HoldingRow[];
   industries: IndustryRow[];
   reportDate: string | null;
@@ -253,6 +266,26 @@ function normalizeFundDetail(raw: FundDetailResponse, fallbackCode: string): Fun
     introSource: str(profile?.source),
     introFetchedAt: str(profile?.fetched_at),
     metrics: metrics.slice(0, 12),
+    metricsAsOf: str(obj.metrics_as_of),
+    metricsBasis: str(obj.metrics_basis),
+    advice:
+      obj.advice && typeof obj.advice === "object"
+        ? {
+            action: str(obj.advice.action) ?? "watch",
+            label: str(obj.advice.label) ?? "暂时观望",
+            score: toNumber(obj.advice.score),
+            confidence: str(obj.advice.confidence) ?? "low",
+            horizon: str(obj.advice.horizon) ?? "未来 1～3 个月",
+            summary: str(obj.advice.summary) ?? "",
+            reasons: Array.isArray(obj.advice.reasons)
+              ? obj.advice.reasons.filter((item): item is string => typeof item === "string")
+              : [],
+            risks: Array.isArray(obj.advice.risks)
+              ? obj.advice.risks.filter((item): item is string => typeof item === "string")
+              : [],
+            invalidation: str(obj.advice.invalidation) ?? "",
+          }
+        : null,
     holdings,
     industries,
     reportDate: str(obj.report_date),
@@ -322,15 +355,18 @@ export default function FundDetailPage() {
   const params = useParams<{ code: string }>();
   const code = decodeURIComponent(params.code ?? "");
 
-  const [loading, setLoading] = useState(true);
+  const cachedRaw = peekApiCache<FundDetailResponse>(
+    `/api/funds/${encodeURIComponent(code)}/detail`
+  );
+  const cachedDetail = cachedRaw ? normalizeFundDetail(cachedRaw, code) : null;
+  const [loading, setLoading] = useState(!cachedDetail);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null);
-  const [detail, setDetail] = useState<FundDetailView | null>(null);
+  const [detail, setDetail] = useState<FundDetailView | null>(cachedDetail);
 
   const load = useCallback(async () => {
     if (!code) return;
-    setLoading(true);
     setError(null);
     setRefreshMessage(null);
     try {
@@ -436,6 +472,61 @@ export default function FundDetailPage() {
 
           <WarningsBlock warnings={detail.warnings} />
 
+          {detail.advice && (
+            <Card className="overflow-hidden">
+              <div
+                className={`border-l-4 px-4 py-5 sm:px-5 ${
+                  detail.advice.action === "add"
+                    ? "border-l-rose-500 bg-rose-50/50"
+                    : detail.advice.action === "hold"
+                      ? "border-l-blue-500 bg-blue-50/40"
+                      : detail.advice.action === "watch"
+                        ? "border-l-slate-400 bg-slate-50"
+                        : "border-l-emerald-500 bg-emerald-50/50"
+                }`}
+              >
+                <div className="flex flex-wrap items-center gap-3">
+                  <div>
+                    <p className="text-xs font-medium text-slate-500">当前建议 · {detail.advice.horizon}</p>
+                    <h2 className="mt-1 text-xl font-semibold text-slate-900">{detail.advice.label}</h2>
+                  </div>
+                  {detail.advice.score !== null && (
+                    <span className="rounded-full bg-white px-2.5 py-1 text-xs font-medium text-slate-600 shadow-sm">
+                      趋势评分 {detail.advice.score}/100
+                    </span>
+                  )}
+                  <span className="rounded-full bg-white px-2.5 py-1 text-xs text-slate-500 shadow-sm">
+                    可信度 {detail.advice.confidence === "high" ? "较高" : detail.advice.confidence === "medium" ? "中等" : "较低"}
+                  </span>
+                </div>
+                <p className="mt-3 text-sm leading-relaxed text-slate-700">{detail.advice.summary}</p>
+                <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                  <div>
+                    <p className="text-xs font-semibold text-slate-700">为什么</p>
+                    <ul className="mt-2 space-y-1.5 text-sm text-slate-600">
+                      {detail.advice.reasons.map((reason) => <li key={reason}>• {reason}</li>)}
+                    </ul>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-slate-700">需要留意</p>
+                    {detail.advice.risks.length > 0 ? (
+                      <ul className="mt-2 space-y-1.5 text-sm text-amber-800">
+                        {detail.advice.risks.map((risk) => <li key={risk}>• {risk}</li>)}
+                      </ul>
+                    ) : (
+                      <p className="mt-2 text-sm text-slate-500">目前没有明显的额外风险提示。</p>
+                    )}
+                  </div>
+                </div>
+                {detail.advice.invalidation && (
+                  <p className="mt-4 border-t border-slate-200/70 pt-3 text-xs text-slate-400">
+                    {detail.advice.invalidation}
+                  </p>
+                )}
+              </div>
+            </Card>
+          )}
+
           {/* 概览 */}
           <Card className="px-4 py-5 sm:px-5">
             <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
@@ -486,7 +577,10 @@ export default function FundDetailPage() {
           <Card className="px-4 py-5 sm:px-5">
             <div className="mb-4">
               <h2 className="text-sm font-semibold text-slate-800">量化指标</h2>
-              <p className="mt-0.5 text-xs text-slate-400">基于历史净值的横截面因子打分，供研究参考</p>
+              <p className="mt-0.5 text-xs text-slate-400">
+                {detail.metricsAsOf ? `截至 ${fmtDate(detail.metricsAsOf)} · ` : ""}
+                {detail.metricsBasis ?? "基于历史净值的横截面因子打分，供研究参考"}
+              </p>
             </div>
             {detail.metrics.length > 0 ? (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">

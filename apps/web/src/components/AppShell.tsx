@@ -1,9 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { SyncStatusBar } from "@/components/SyncStatusBar";
+import { rememberPageScroll, restorePageScroll } from "@/lib/navigation-memory";
+import { api } from "@/lib/api";
 
 /* ---------- 图标（沿用原有线性 SVG 风格） ---------- */
 
@@ -398,6 +400,64 @@ function BrandMark({ compact = false }: { compact?: boolean }) {
 
 export function AppShell({ children }: { children: ReactNode }) {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const pathname = usePathname();
+  const router = useRouter();
+
+  useEffect(() => {
+    const cancelRestore = restorePageScroll(pathname);
+    // 不在路由卸载时再次保存：Next.js 可能已先把页面滚到顶部，
+    // 此时保存会用 0 覆盖 FundLink 点击时记录的真实位置。
+    return cancelRestore;
+  }, [pathname]);
+
+  useEffect(() => {
+    const save = () => rememberPageScroll(pathname);
+    window.addEventListener("pagehide", save);
+    return () => window.removeEventListener("pagehide", save);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!("scrollRestoration" in window.history)) return;
+    const previous = window.history.scrollRestoration;
+    window.history.scrollRestoration = "manual";
+    return () => {
+      window.history.scrollRestoration = previous;
+    };
+  }, []);
+
+  useEffect(() => {
+    // 本地工作台优先交互速度：浏览器空闲时预下载所有固定页面代码，
+    // 后续点击侧栏无需再等待对应 JavaScript 分包。
+    const prefetchRoutes = () => {
+      const routes = new Set(NAV_GROUPS.flatMap((group) => group.items.map((item) => item.href)));
+      routes.forEach((href) => router.prefetch(href));
+      // 数据预热严格限制并发。SQLite 连接池较小，一次并发十几个研究接口会
+      // 占满连接并让当前页面反而一直等待。因子榜、双动量、V2 信号等重计算
+      // 只在用户进入对应标签时加载，之后继续复用六小时本地缓存。
+      void (async () => {
+        const batches: Array<Array<() => Promise<unknown>>> = [
+          [api.portfolioSummary, api.positions, api.transactions],
+          [api.portfolioReturns, api.quantPortfolio],
+          [api.quantFunds, () => api.news("related"), () => api.news("market")],
+          [api.paperSummary, api.paperPositions, api.researchPortfolios],
+          [api.discoveryPools],
+        ];
+        for (const batch of batches) {
+          await Promise.allSettled(batch.map((request) => request()));
+        }
+      })();
+    };
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    if (idleWindow.requestIdleCallback) {
+      const id = idleWindow.requestIdleCallback(prefetchRoutes, { timeout: 2000 });
+      return () => idleWindow.cancelIdleCallback?.(id);
+    }
+    const timer = window.setTimeout(prefetchRoutes, 500);
+    return () => window.clearTimeout(timer);
+  }, [router]);
 
   return (
     <div className="flex min-h-screen">

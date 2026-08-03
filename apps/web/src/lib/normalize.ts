@@ -322,13 +322,15 @@ export interface QuantFundView {
   key: string;
   code: string;
   name: string;
-  annualizedReturn: unknown;
+  oneYearReturn: unknown;
   annualizedVolatility: unknown;
   maxDrawdown: unknown;
   sharpeRatio: unknown;
   winRate: unknown;
   returnRate: unknown;
   marketValue: unknown;
+  adviceLabel: string | null;
+  adviceAction: string | null;
 }
 
 export function normalizeQuantFunds(
@@ -339,13 +341,15 @@ export function normalizeQuantFunds(
     key: String(f.fund_code ?? f.code ?? i),
     code: f.fund_code ?? f.code ?? "—",
     name: f.fund_name ?? f.name ?? f.fund_code ?? f.code ?? "未命名基金",
-    annualizedReturn: f.annualized_return ?? f.return_250d ?? null,
+    oneYearReturn: f.return_1y ?? f.return_250d ?? f.annualized_return ?? null,
     annualizedVolatility: f.annualized_volatility ?? f.annual_volatility ?? null,
     maxDrawdown: f.max_drawdown ?? null,
     sharpeRatio: f.sharpe_ratio ?? f.sharpe ?? null,
     winRate: f.win_rate ?? null,
     returnRate: f.return_rate ?? f.return_60d ?? null,
     marketValue: f.market_value ?? null,
+    adviceLabel: f.advice?.label ?? null,
+    adviceAction: f.advice?.action ?? null,
   }));
 }
 

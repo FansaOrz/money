@@ -16,7 +16,6 @@ import argparse
 import fcntl
 import json
 import logging
-import time
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path

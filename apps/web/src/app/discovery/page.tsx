@@ -2,7 +2,7 @@
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, invalidateApiCache, peekApiCache } from "@/lib/api";
 import type {
   BacktestV2Result,
   ValidationResponse,
@@ -66,6 +66,24 @@ function fmtNumberOr(v: unknown, digits = 2): string {
   const n = toNumber(v);
   if (n === null) return "—";
   return n.toFixed(digits);
+}
+
+function simpleFundAction(fund: DiscoveryFactorView): { label: string; tone: string } {
+  if ((fund.return1m ?? 0) >= 0.10) {
+    return { label: "持有，别追高", tone: "bg-blue-50 text-blue-700" };
+  }
+  if (
+    (fund.momentum121 ?? 0) > 0 &&
+    (fund.return3m ?? 0) > 0 &&
+    (fund.sharpe ?? 0) >= 0.5 &&
+    (fund.maxDrawdown ?? -1) > -0.25
+  ) {
+    return { label: "可考虑加仓", tone: "bg-rose-50 text-rose-700" };
+  }
+  if ((fund.momentum121 ?? 0) < 0 && (fund.return3m ?? 0) < 0) {
+    return { label: "建议减仓", tone: "bg-emerald-50 text-emerald-700" };
+  }
+  return { label: "暂时观望", tone: "bg-slate-100 text-slate-600" };
 }
 
 function MiniStat({
@@ -650,6 +668,7 @@ function FactorsSection({
                 <th className="px-3 py-2.5 font-medium">#</th>
                 <th className="px-3 py-2.5 font-medium">代码 / 名称</th>
                 <th className="px-3 py-2.5 font-medium">市场</th>
+                <th className="px-3 py-2.5 font-medium">直白建议</th>
                 <th className="px-3 py-2.5 text-right font-medium">
                   <MetricLabel term="momentum-12-1">12-1 动量</MetricLabel>
                 </th>
@@ -688,6 +707,7 @@ function FactorsSection({
               {shown.map((f, i) => {
                 const held = heldSet.has(f.code);
                 const watched = watchlist.has(f.code);
+                const action = simpleFundAction(f);
                 return (
                   <tr key={f.key} className="border-t border-slate-100 hover:bg-slate-50/60">
                     <td className="px-3 py-2.5 tabular-nums text-slate-400">{f.rank ?? i + 1}</td>
@@ -708,6 +728,11 @@ function FactorsSection({
                       />
                     </td>
                     <td className="px-3 py-2.5 text-xs text-slate-500">{f.fundType}</td>
+                    <td className="px-3 py-2.5">
+                      <span className={`whitespace-nowrap rounded-full px-2 py-1 text-xs font-medium ${action.tone}`}>
+                        {action.label}
+                      </span>
+                    </td>
                     <td className={`px-3 py-2.5 text-right font-semibold tabular-nums ${signClass(f.momentum121)}`}>
                       {fmtPercent(f.momentum121)}
                     </td>
@@ -1664,31 +1689,62 @@ function DiscoveryPageContent() {
   const searchParams = useSearchParams();
   const stageParam = searchParams.get("stage") as DiscoveryStage | null;
   const initialStage = STAGE_TABS.some((item) => item.key === stageParam) ? stageParam! : "data";
+  const cachedPools = normalizePools(peekApiCache<never>("/api/discovery/pools"));
+  const requestedPoolId = searchParams.get("pool") ?? cachedPools[0]?.id ?? null;
+  const cachedDetailRaw = requestedPoolId
+    ? peekApiCache<never>(`/api/discovery/pools/${encodeURIComponent(requestedPoolId)}`)
+    : undefined;
+  const cachedFactorsRaw = requestedPoolId
+    ? peekApiCache<never>(
+        `/api/discovery/quant/factors?pool_id=${encodeURIComponent(requestedPoolId)}&limit=100&min_samples=120`
+      )
+    : undefined;
+  const cachedDualRaw = requestedPoolId
+    ? peekApiCache<never>(
+        `/api/discovery/quant/dual-momentum?pool_id=${encodeURIComponent(requestedPoolId)}`
+      )
+    : undefined;
+  const cachedSignalsRaw = requestedPoolId
+    ? peekApiCache<never>(
+        `/api/discovery/quant/signals-v2?pool_id=${encodeURIComponent(requestedPoolId)}`
+      )
+    : undefined;
+  const cachedDetail =
+    requestedPoolId && cachedDetailRaw
+      ? normalizePoolDetail(cachedDetailRaw, requestedPoolId)
+      : null;
+  const cachedFactors = cachedFactorsRaw ? normalizeDiscoveryFactors(cachedFactorsRaw) : null;
+  const cachedDual = cachedDualRaw ? normalizeDualMomentum(cachedDualRaw) : null;
+  const cachedSignals = cachedSignalsRaw ? normalizeDiscoverySignals(cachedSignalsRaw) : null;
   const [stage, setStage] = useState<DiscoveryStage>(initialStage);
   // 持仓代码（「已持有」标记）
   const [heldCodes, setHeldCodes] = useState<string[]>([]);
   // 自选（localStorage）
   const [watchlist, setWatchlist] = useState<string[]>([]);
   // 候选池
-  const [pools, setPools] = useState<DiscoveryPoolView[]>([]);
+  const [pools, setPools] = useState<DiscoveryPoolView[]>(cachedPools);
   const [poolsError, setPoolsError] = useState<string | null>(null);
-  const [poolsLoading, setPoolsLoading] = useState(true);
-  const [selectedPoolId, setSelectedPoolId] = useState<string | null>(null);
+  const [poolsLoading, setPoolsLoading] = useState(cachedPools.length === 0);
+  const [selectedPoolId, setSelectedPoolId] = useState<string | null>(requestedPoolId);
   // 池详情
-  const [detail, setDetail] = useState<DiscoveryPoolDetailView | null>(null);
+  const [detail, setDetail] = useState<DiscoveryPoolDetailView | null>(cachedDetail);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [coverageRefreshing, setCoverageRefreshing] = useState(false);
   // 池量化数据
-  const [factors, setFactors] = useState<DiscoveryFactorsView | null>(null);
+  const [factors, setFactors] = useState<DiscoveryFactorsView | null>(cachedFactors);
   const [factorsError, setFactorsError] = useState<string | null>(null);
-  const [dualMomentum, setDualMomentum] = useState<DiscoveryDualMomentumView | null>(null);
+  const [dualMomentum, setDualMomentum] = useState<DiscoveryDualMomentumView | null>(cachedDual);
   const [dmError, setDmError] = useState<string | null>(null);
-  const [signals, setSignals] = useState<DiscoverySignalsView | null>(null);
+  const [signals, setSignals] = useState<DiscoverySignalsView | null>(cachedSignals);
   const [signalsError, setSignalsError] = useState<string | null>(null);
   const [quantLoading, setQuantLoading] = useState(false);
   // 每个大步骤内部的小任务标签
   const [tab, setTab] = useState<DiscoveryTab>(() => {
+    const tabParam = searchParams.get("tab") as DiscoveryTab | null;
+    if (["factors", "dual", "risk", "signals", "backtest", "validation"].includes(tabParam ?? "")) {
+      return tabParam!;
+    }
     if (initialStage === "portfolio") return "signals";
     if (initialStage === "validate") return "backtest";
     return "factors";
@@ -1721,8 +1777,9 @@ function DiscoveryPageContent() {
     };
   }, []);
 
-  const loadPools = useCallback(async (preferId?: string | null) => {
-    setPoolsLoading(true);
+  const loadPools = useCallback(async (preferId?: string | null, force = false) => {
+    if (force) invalidateApiCache("/api/discovery/pools");
+    if (pools.length === 0) setPoolsLoading(true);
     setPoolsError(null);
     try {
       const raw = await api.discoveryPools();
@@ -1740,7 +1797,7 @@ function DiscoveryPageContent() {
     } finally {
       setPoolsLoading(false);
     }
-  }, [searchParams]);
+  }, [pools.length, searchParams]);
 
   useEffect(() => {
     loadPools();
@@ -1756,7 +1813,7 @@ function DiscoveryPageContent() {
       return;
     }
     const id = ++poolRequestId.current;
-    setDetailLoading(true);
+    if (!detail || detail.id !== selectedPoolId) setDetailLoading(true);
     setDetailError(null);
     api
       .discoveryPoolDetail(selectedPoolId)
@@ -1877,6 +1934,18 @@ function DiscoveryPageContent() {
     [router, searchParams, selectedPoolId, tab]
   );
 
+  const selectTab = useCallback(
+    (next: DiscoveryTab) => {
+      setTab(next);
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("tab", next);
+      params.set("stage", stage);
+      if (selectedPoolId) params.set("pool", selectedPoolId);
+      router.replace(`/discovery?${params.toString()}`, { scroll: false });
+    },
+    [router, searchParams, selectedPoolId, stage]
+  );
+
   const refreshCoverage = useCallback(async () => {
     if (!selectedPoolId) return;
     setCoverageRefreshing(true);
@@ -1932,7 +2001,7 @@ function DiscoveryPageContent() {
         action={
           <button
             type="button"
-            onClick={() => loadPools()}
+            onClick={() => loadPools(undefined, true)}
             disabled={poolsLoading}
             className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -1940,7 +2009,7 @@ function DiscoveryPageContent() {
           </button>
         }
       >
-        {poolsLoading ? (
+        {poolsLoading && pools.length === 0 ? (
           <Spinner label="正在加载候选池列表…" />
         ) : poolsError ? (
           <ErrorState message={poolsError} onRetry={() => loadPools()} />
@@ -1977,7 +2046,7 @@ function DiscoveryPageContent() {
                 </button>
               ))}
             </div>
-            {detailLoading ? (
+            {detailLoading && !detail ? (
               <Spinner label="正在加载候选池详情…" />
             ) : detailError ? (
               <ErrorState
@@ -2009,7 +2078,7 @@ function DiscoveryPageContent() {
               <button
                 key={t.key}
                 type="button"
-                onClick={() => setTab(t.key)}
+                onClick={() => selectTab(t.key)}
                 className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
                   tab === t.key
                     ? "bg-slate-900 text-white"

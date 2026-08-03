@@ -27,7 +27,6 @@ from app.services.quant import (
     _annual_volatility,
     _daily_returns,
     _max_drawdown,
-    _period_return,
     _sharpe,
 )
 from app.services import quant_stats as stats
@@ -135,15 +134,16 @@ def test_factor_board_values_match_reference(db_session: Session) -> None:
     assert item.sample_count == days
 
     # 参考序列：从库内重新装载（与服务同一数据口径，避免 6 位小数存储的舍入漂移）
-    from app.services.quant import _load_dual_nav_series
+    from app.services.quant import _calendar_period_return, _load_dual_nav_series
 
-    values = [v for _, v in _load_dual_nav_series(db_session, instrument.id).total_series]
+    series = _load_dual_nav_series(db_session, instrument.id).total_series
+    values = [v for _, v in series]
     assert len(values) == days
 
-    assert item.return_1m == pytest.approx(_period_return(values, 21))
-    assert item.return_3m == pytest.approx(_period_return(values, 63))
-    assert item.return_1y == pytest.approx(_period_return(values, 252))
-    assert item.return_3y == pytest.approx(_period_return(values, 756))
+    assert item.return_1m == pytest.approx(_calendar_period_return(series, months=1))
+    assert item.return_3m == pytest.approx(_calendar_period_return(series, months=3))
+    assert item.return_1y == pytest.approx(_calendar_period_return(series, months=12))
+    assert item.return_3y == pytest.approx(_calendar_period_return(series, months=36))
     assert item.momentum_12_1 == pytest.approx(risk.absolute_momentum_12_1(values))
 
     tail = values[-253:]

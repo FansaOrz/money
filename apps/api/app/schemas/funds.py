@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import Field
 
 from app.schemas.common import ConfiguredBaseModel, DecimalStr
+from app.schemas.quant import FundAdvice
 
 
 class FundProfileOut(ConfiguredBaseModel):
@@ -55,6 +56,9 @@ class FundDetailResponse(ConfiguredBaseModel):
     active: bool | None = None
     profile: FundProfileOut | None = None
     metrics: dict[str, Any] | None = None
+    metrics_as_of: str | None = None
+    metrics_basis: str | None = None
+    advice: FundAdvice | None = None
     holdings: list[FundDetailHolding] = Field(default_factory=list)
     industries: list[FundDetailIndustry] = Field(default_factory=list)
     report_date: str | None = None

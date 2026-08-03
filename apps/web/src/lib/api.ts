@@ -48,6 +48,7 @@ import type {
   StockQuote,
   StockFinancials,
   StockSignalsResponse,
+  StockTechnicalResponse,
   StockUniverseResponse,
   ResearchPortfoliosResponse,
   SyncStatusResponse,
@@ -59,6 +60,10 @@ import type {
 } from "./types";
 
 const BASE_URL = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/+$/, "");
+// v3：基金收益改为自然日窗口 + 分红再投资口径，淘汰旧的 250/252 点缓存。
+const CACHE_PREFIX = "money:api:v3:";
+const memoryCache = new Map<string, { expiresAt: number; value: unknown }>();
+const inFlight = new Map<string, Promise<unknown>>();
 
 export class ApiError extends Error {
   status?: number;
@@ -92,15 +97,106 @@ async function parseErrorBody(res: Response): Promise<string> {
   return `HTTP ${res.status}`;
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(resolveUrl(path), {
-    headers: { Accept: "application/json" },
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    throw new ApiError(await parseErrorBody(res), res.status);
+function cacheTtl(path: string): number {
+  if (path.startsWith("/api/sync/status")) return 15_000;
+  if (path.startsWith("/api/news")) return 60_000;
+  if (
+    path.startsWith("/api/quant/") ||
+    path.startsWith("/api/discovery/") ||
+    path.startsWith("/api/funds/")
+  ) {
+    return 6 * 60 * 60_000;
   }
-  return (await res.json()) as T;
+  return 30 * 60_000;
+}
+
+function readCache<T>(key: string): T | undefined {
+  const now = Date.now();
+  const memory = memoryCache.get(key);
+  if (memory) {
+    if (memory.expiresAt > now) return memory.value as T;
+    memoryCache.delete(key);
+  }
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = window.sessionStorage.getItem(`${CACHE_PREFIX}${key}`);
+    if (!raw) return undefined;
+    const cached = JSON.parse(raw) as { expiresAt: number; value: T };
+    if (cached.expiresAt <= now) {
+      window.sessionStorage.removeItem(`${CACHE_PREFIX}${key}`);
+      return undefined;
+    }
+    memoryCache.set(key, cached);
+    return cached.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 页面初始化时同步读取已有数据，避免先闪现整页 Loading。 */
+export function peekApiCache<T>(path: string): T | undefined {
+  return readCache<T>(path);
+}
+
+function writeCache<T>(key: string, value: T, ttl: number): void {
+  const entry = { expiresAt: Date.now() + ttl, value };
+  memoryCache.set(key, entry);
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(`${CACHE_PREFIX}${key}`, JSON.stringify(entry));
+  } catch {
+    // 浏览器存储空间不足时仍保留内存缓存，不影响正常请求。
+  }
+}
+
+export function clearApiCache(): void {
+  memoryCache.clear();
+  if (typeof window === "undefined") return;
+  for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+    const key = window.sessionStorage.key(index);
+    if (key?.startsWith(CACHE_PREFIX)) window.sessionStorage.removeItem(key);
+  }
+}
+
+/** 只清除某一类 GET 缓存，供用户主动点击“刷新”时绕过本地快照。 */
+export function invalidateApiCache(pathPrefix: string): void {
+  for (const key of memoryCache.keys()) {
+    if (key.startsWith(pathPrefix)) memoryCache.delete(key);
+  }
+  if (typeof window === "undefined") return;
+  for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+    const storageKey = window.sessionStorage.key(index);
+    if (!storageKey?.startsWith(CACHE_PREFIX)) continue;
+    const apiPath = storageKey.slice(CACHE_PREFIX.length);
+    if (apiPath.startsWith(pathPrefix)) window.sessionStorage.removeItem(storageKey);
+  }
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  const cached = readCache<T>(path);
+  if (cached !== undefined) return cached;
+
+  const pending = inFlight.get(path);
+  if (pending) return pending as Promise<T>;
+
+  const request = (async () => {
+    const res = await fetch(resolveUrl(path), {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      throw new ApiError(await parseErrorBody(res), res.status);
+    }
+    const value = (await res.json()) as T;
+    writeCache(path, value, cacheTtl(path));
+    return value;
+  })();
+  inFlight.set(path, request);
+  try {
+    return await request;
+  } finally {
+    inFlight.delete(path);
+  }
 }
 
 async function postJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -112,7 +208,17 @@ async function postJson<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     throw new ApiError(await parseErrorBody(res), res.status);
   }
-  return (await res.json()) as T;
+  const value = (await res.json()) as T;
+  if (
+    path.startsWith("/api/imports/") ||
+    path.includes("/sync/") ||
+    path.endsWith("/paper/run") ||
+    path.includes("/discovery/pools") ||
+    (path.startsWith("/api/funds/") && path.endsWith("/refresh"))
+  ) {
+    clearApiCache();
+  }
+  return value;
 }
 
 export const api = {
@@ -369,6 +475,9 @@ export const api = {
       `/api/stocks/${encodeURIComponent(code)}/history${qs ? `?${qs}` : ""}`
     );
   },
+  /* 单只股票白话技术趋势摘要 */
+  stockTechnical: (code: string) =>
+    getJson<StockTechnicalResponse>(`/api/stocks/${encodeURIComponent(code)}/technical`),
   /* 单只股票财务与估值 */
   stockFinancials: (code: string) =>
     getJson<StockFinancials>(`/api/stocks/${encodeURIComponent(code)}/financials`),

@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { api, ApiError } from "@/lib/api";
-import type { PortfolioSummary, Position } from "@/lib/types";
+import { api, ApiError, peekApiCache } from "@/lib/api";
+import type { PortfolioReturnsResponse, PortfolioSummary, Position } from "@/lib/types";
 import {
   fmtDate,
   fmtMoney,
@@ -94,14 +94,19 @@ function ReturnCard({ view }: { view: ReturnWindowView }) {
 }
 
 export default function DashboardPage() {
-  const [summary, setSummary] = useState<SummaryView | null>(null);
-  const [positions, setPositions] = useState<PositionView[]>([]);
-  const [returns, setReturns] = useState<ReturnWindowView[] | null>(null);
-  const [loading, setLoading] = useState(true);
+  const cachedSummary = normalizeSummary(
+    peekApiCache<PortfolioSummary>("/api/portfolio/summary") ?? null
+  );
+  const cachedPositions = normalizePositions(peekApiCache<Position[]>("/api/positions"));
+  const cachedReturnsRaw = peekApiCache<PortfolioReturnsResponse>("/api/portfolio/returns");
+  const cachedReturns = cachedReturnsRaw ? normalizePortfolioReturns(cachedReturnsRaw) : null;
+  const [summary, setSummary] = useState<SummaryView | null>(cachedSummary);
+  const [positions, setPositions] = useState<PositionView[]>(cachedPositions);
+  const [returns, setReturns] = useState<ReturnWindowView[] | null>(cachedReturns);
+  const [loading, setLoading] = useState(!cachedSummary && cachedPositions.length === 0);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    setLoading(true);
     setError(null);
     try {
       const [summaryRaw, positionsRaw, returnsRaw] = await Promise.allSettled([

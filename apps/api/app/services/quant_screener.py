@@ -25,7 +25,7 @@ from datetime import date
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import FundNav, IndexQuote, Instrument, MarketIndex, Position
+from app.models import IndexQuote, Instrument, MarketIndex, Position
 from app.schemas.quant import ScreenerItem, ScreenerRequest, ScreenerResponse
 from app.services import quant_factors as factors
 from app.services import quant_risk as risk

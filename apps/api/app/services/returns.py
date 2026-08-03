@@ -3,10 +3,10 @@
 口径说明：
 - 按当前份额估算：收益金额 = shares * (unit_nav_end - unit_nav_start)，
   即单位净值价差口径（不含现金分红，分红以 REINVEST 流水另行入账）；
-- 收益率为总收益口径：优先累计净值端点比（accumulated_end / accumulated_start - 1，
-  含分红），任一端累计净值缺失时回退为单位净值端点比（不含分红）；
-- 注意金额与收益率是两个不同口径：金额按单位净值价差，收益率按累计净值含分红，
-  二者差异即区间内每股分红 × 份额（见 rate_basis 字段区分）；
+- 收益率为总收益口径：由单位净值与累计净值识别现金分红，并按除息日净值
+  再投资构造复权序列；累计净值缺失区间回退单位净值；
+- 注意金额与收益率是两个不同口径：金额按单位净值价差，收益率按分红再投资
+  总收益；区间有分红时两者会不同（见 rate_basis 字段区分）；
 - 终点为该基金最新一条净值；起点为 <= 目标日期的最后一条净值，
   实际使用的端点日期随结果返回；
 - 窗口内存在 BUY/SELL/REINVEST 流水时标记为 approximate（份额在窗口内变动，
@@ -146,17 +146,27 @@ def _has_flows(db: Session, instrument_id: int, start: date, end: date) -> bool:
     return bool(count)
 
 
-def _return_rate(start: _NavPoint, end: _NavPoint) -> tuple[Decimal | None, str | None]:
-    """收益率与其口径：优先累计净值端点比，缺失时回退单位净值。"""
-    if (
-        start.accumulated_nav is not None
-        and end.accumulated_nav is not None
-        and start.accumulated_nav != 0
-    ):
-        return end.accumulated_nav / start.accumulated_nav - 1, "accumulated"
-    if start.unit_nav != 0:
-        return end.unit_nav / start.unit_nav - 1, "unit"
-    return None, None
+def _return_rate(
+    db: Session,
+    instrument_id: int,
+    start: _NavPoint,
+    end: _NavPoint,
+) -> tuple[Decimal | None, str | None]:
+    """收益率与其口径：现金分红再投资总收益，缺测区间回退单位净值。"""
+    from app.services.quant import _load_dual_nav_series
+
+    pair = _load_dual_nav_series(
+        db,
+        instrument_id,
+        start=start.nav_date,
+        end=end.nav_date,
+        limit=2000,
+    )
+    if len(pair.total_series) < 2 or pair.total_values[0] <= 0:
+        return None, None
+    value = pair.total_values[-1] / pair.total_values[0] - 1.0
+    basis = "total_return_with_unit_fallback" if pair.unit_fallback else "dividend_reinvested"
+    return Decimal(str(value)), basis
 
 
 def _fund_return_item(
@@ -215,7 +225,7 @@ def _fund_return_item(
         )
 
     return_amount = shares * (end.unit_nav - start.unit_nav)
-    rate, basis = _return_rate(start, end)
+    rate, basis = _return_rate(db, instrument.id, start, end)
     status = "approximate" if has_flows else "available"
 
     stale_reason = None

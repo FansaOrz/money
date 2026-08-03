@@ -104,7 +104,7 @@ def test_returns_all_windows(client: TestClient, db_session: Session) -> None:
     item = one_day["items"][0]
     assert item["instrument_code"] == "110022"
     assert item["status"] == "available"
-    assert item["rate_basis"] == "accumulated"
+    assert item["rate_basis"] == "dividend_reinvested"
     assert item["start_date"] == (END_DATE - timedelta(days=1)).isoformat()
     assert item["end_date"] == END_DATE.isoformat()
     assert item["has_flows"] is False
@@ -133,7 +133,7 @@ def test_returns_single_window_query(client: TestClient, db_session: Session) ->
     window = data["windows"]["1w"]
     item = window["items"][0]
     # 无累计净值时回退单位净值比
-    assert item["rate_basis"] == "unit"
+    assert item["rate_basis"] == "total_return_with_unit_fallback"
     assert float(item["return_rate"]) == pytest.approx(0.05, rel=1e-9)
     # 金额 = 2000 * (1.05 - 1.0) = 100
     assert float(item["return_amount"]) == pytest.approx(100)

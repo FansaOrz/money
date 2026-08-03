@@ -157,6 +157,7 @@ export interface QuantFundMetrics {
   return_20d?: number | string | null;
   return_60d?: number | string | null;
   return_250d?: number | string | null;
+  return_1y?: number | string | null;
   sharpe?: number | string | null;
   trend_signal?: string | null;
   annualized_volatility?: number | string | null;
@@ -165,6 +166,7 @@ export interface QuantFundMetrics {
   win_rate?: number | string | null;
   return_rate?: number | string | null;
   market_value?: number | string | null;
+  advice?: FundAdvice | null;
   [key: string]: unknown;
 }
 
@@ -940,6 +942,18 @@ export interface FundDetailIndustry {
   [key: string]: unknown;
 }
 
+export interface FundAdvice {
+  action?: "add" | "hold" | "watch" | "reduce" | "reduce_more" | null;
+  label?: string | null;
+  score?: number | string | null;
+  confidence?: "high" | "medium" | "low" | null;
+  horizon?: string | null;
+  summary?: string | null;
+  reasons?: string[] | null;
+  risks?: string[] | null;
+  invalidation?: string | null;
+}
+
 /** 基金详情聚合响应（字段宽松可选，兼容后端结构差异） */
 export interface FundDetailResponse {
   code?: string | null;
@@ -954,6 +968,9 @@ export interface FundDetailResponse {
   active?: boolean | null;
   profile?: FundProfile | null;
   metrics?: Record<string, unknown> | null;
+  metrics_as_of?: string | null;
+  metrics_basis?: string | null;
+  advice?: FundAdvice | null;
   holdings?: FundDetailHolding[] | null;
   industries?: FundDetailIndustry[] | null;
   report_date?: string | null;
@@ -1550,6 +1567,44 @@ export interface StockSignalsResponse {
   available_at?: string | null;
   warnings?: string[] | null;
   [key: string]: unknown;
+}
+
+/** 白话技术趋势摘要（GET /api/stocks/{code}/technical） */
+export interface StockTechnicalResponse {
+  code: string;
+  as_of?: string | null;
+  sufficient: boolean;
+  sample_size: number;
+  trend: "strong_bullish" | "bullish" | "neutral" | "bearish" | "strong_bearish" | "insufficient";
+  score: number;
+  summary: string;
+  indicators: {
+    close?: number | null;
+    ma5?: number | null;
+    ma10?: number | null;
+    ma20?: number | null;
+    ma60?: number | null;
+    macd_dif?: number | null;
+    macd_dea?: number | null;
+    macd_histogram?: number | null;
+    rsi6?: number | null;
+    rsi12?: number | null;
+    rsi24?: number | null;
+    kdj_k?: number | null;
+    kdj_d?: number | null;
+    kdj_j?: number | null;
+    boll_upper?: number | null;
+    boll_middle?: number | null;
+    boll_lower?: number | null;
+    atr14?: number | null;
+    atr_pct?: number | null;
+    support20?: number | null;
+    resistance20?: number | null;
+    volume_ratio?: number | null;
+  };
+  signals: string[];
+  risks: string[];
+  methodology: string;
 }
 
 /** 股票研究回测请求体（POST /api/stocks/research/backtest） */

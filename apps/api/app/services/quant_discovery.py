@@ -51,22 +51,22 @@ from app.services import quant_validation as validation_service
 from app.services.quant import (
     QuantError,
     _annual_volatility,
+    _calendar_period_return,
     _daily_returns,
     _load_dual_nav_series,
     _max_drawdown,
-    _period_return,
     _sharpe,
 )
 
-# 读取净值的最大条数（覆盖 3 年收益 756 个交易日 + 冗余）
-NAV_LOAD_LIMIT = 2000
+# 读取净值的最大条数（覆盖 3 年收益 756 个交易日 + 1 个起点）
+NAV_LOAD_LIMIT = 757
 
-# 因子榜展示用的收益窗口（交易日）：1 个月 / 3 个月 / 1 年 / 3 年
-RETURN_WINDOWS: dict[str, int] = {
-    "return_1m": 21,
-    "return_3m": 63,
-    "return_1y": 252,
-    "return_3y": 756,
+# 因子榜展示用自然月窗口，与主流基金平台“近 N 月/年”的日期口径一致。
+RETURN_MONTHS: dict[str, int] = {
+    "return_1m": 1,
+    "return_3m": 3,
+    "return_1y": 12,
+    "return_3y": 36,
 }
 
 SORTABLE_FACTORS = frozenset(
@@ -87,11 +87,11 @@ SORTABLE_FACTORS = frozenset(
 )
 
 METHODOLOGY_FACTORS = (
-    "基金发现因子榜：候选池成员净值取连续总收益口径（优先累计净值，缺测区间"
-    "按单位净值衔接比率拼接，含分红）。收益为区间收益：1m=21、3m=63、1y=252、"
-    "3y=756 个交易日；波动/夏普/索提诺基于 window（默认 252）个交易日的日收益"
-    "年化（252 口径，无风险利率 2%，索提诺以日无风险利率为最低可接受收益、"
-    "按下行偏差折算）；最大回撤为 window 内峰值回撤（负数小数）；"
+    "基金发现因子榜：使用现金分红再投资后的连续总收益指数；累计净值缺失区间"
+    "回退单位净值。收益区间按最新净值日向前推 1/3/12/36 个自然月，起点取"
+    "目标日期当日或之前最近净值。波动/夏普/索提诺基于 window（默认 252）个"
+    "净值收益年化（252 口径，无风险利率 2%，索提诺以日无风险利率为最低可接受"
+    "收益、按下行偏差折算）；最大回撤为 window 内峰值回撤（负数小数）；"
     "CVaR95 为 window 内最差 5% 日收益均值；Calmar = 年化收益 / |最大回撤|；"
     "12-1 绝对动量 = t-21 收盘 / t-252 前一日收盘 - 1（跳过最近 21 个交易日）；"
     "同类分位为同一市场层（A股/港股/美股/黄金/债券/货币/海外）内按 12-1 动量的"
@@ -351,10 +351,10 @@ def compute_member_factors(
         market_label=risk.market_label(market),
         family=risk.fund_family(name),
         sample_count=len(series),
-        return_1m=_period_return(values, RETURN_WINDOWS["return_1m"]),
-        return_3m=_period_return(values, RETURN_WINDOWS["return_3m"]),
-        return_1y=_period_return(values, RETURN_WINDOWS["return_1y"]),
-        return_3y=_period_return(values, RETURN_WINDOWS["return_3y"]),
+        return_1m=_calendar_period_return(series, months=RETURN_MONTHS["return_1m"]),
+        return_3m=_calendar_period_return(series, months=RETURN_MONTHS["return_3m"]),
+        return_1y=_calendar_period_return(series, months=RETURN_MONTHS["return_1y"]),
+        return_3y=_calendar_period_return(series, months=RETURN_MONTHS["return_3y"]),
         annual_volatility=_annual_volatility(returns),
         max_drawdown=max_dd,
         sharpe=_sharpe(returns),
@@ -397,6 +397,13 @@ def factor_leaderboard(db: Session, query: FactorBoardQuery) -> FactorBoardRespo
     instruments = [by_code[code] for code in codes if code in by_code]
     if not instruments:
         raise QuantError("指定的候选基金均未找到，请检查代码")
+    nav_counts = dict(
+        db.execute(
+            select(FundNav.instrument_id, func.count(FundNav.id))
+            .where(FundNav.instrument_id.in_([instrument.id for instrument in instruments]))
+            .group_by(FundNav.instrument_id)
+        ).all()
+    )
 
     items: list[FactorBoardItem] = []
     excluded = 0
@@ -410,9 +417,10 @@ def factor_leaderboard(db: Session, query: FactorBoardQuery) -> FactorBoardRespo
                     f"{instrument.code} {instrument.name}（{len(series)} 条）"
                 )
             continue
-        items.append(
-            compute_member_factors(instrument.code, instrument.name, series, query.window)
-        )
+        item = compute_member_factors(instrument.code, instrument.name, series, query.window)
+        # 指标窗口最多需要最近 757 个点，但样本数仍展示本地实际覆盖量。
+        item.sample_count = nav_counts.get(instrument.id, len(series))
+        items.append(item)
 
     if excluded:
         examples = "；".join(insufficient_examples)
@@ -503,7 +511,9 @@ def dual_momentum(db: Session, query: DualMomentumQuery) -> DualMomentumResponse
     insufficient = 0
     insufficient_examples: list[str] = []
     for instrument in instruments:
-        series = _load_dual_nav_series(db, instrument.id, limit=NAV_LOAD_LIMIT).total_series
+        series = _load_dual_nav_series(
+            db, instrument.id, limit=risk.MIN_MOMENTUM_SAMPLES
+        ).total_series
         if len(series) < min_samples:
             insufficient += 1
             if len(insufficient_examples) < 5:

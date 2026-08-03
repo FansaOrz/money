@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, peekApiCache } from "@/lib/api";
 import type { Transaction } from "@/lib/types";
 import {
   fmtDate,
@@ -50,13 +50,13 @@ function classify(type: string): FlowType {
 }
 
 export default function TransactionsPage() {
-  const [transactions, setTransactions] = useState<TransactionView[]>([]);
-  const [loading, setLoading] = useState(true);
+  const cachedTransactions = normalizeTransactions(peekApiCache<Transaction[]>("/api/transactions"));
+  const [transactions, setTransactions] = useState<TransactionView[]>(cachedTransactions);
+  const [loading, setLoading] = useState(cachedTransactions.length === 0);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FlowType | "all">("all");
 
   const load = useCallback(async () => {
-    setLoading(true);
     setError(null);
     try {
       const raw = await api.transactions();

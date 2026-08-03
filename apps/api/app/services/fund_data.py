@@ -17,11 +17,12 @@ import json
 import logging
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -47,6 +48,7 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = 0.5
 # 5 年约 61 个月，按每月 ~21 个交易日估算的分页上限，防止 TotalCount 异常时死循环
 MAX_PAGES = 100
+EASTMONEY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _to_decimal(value: str | None) -> Decimal | None:
@@ -152,7 +154,9 @@ def fetch_nav_history_fast(
             continue
         try:
             timestamp = int(item.get("x"))
-            nav_date = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).date()
+            # pingzhongdata 的时间戳表示北京时间 00:00。按 UTC 取 date 会退到
+            # 前一天 16:00，把周一净值错误写到周日，并与分页源形成重复记录。
+            nav_date = datetime.fromtimestamp(timestamp / 1000, tz=EASTMONEY_TIMEZONE).date()
         except (TypeError, ValueError, OSError):
             continue
         if nav_date < cutoff or (end_date is not None and nav_date >= end_date):

@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
 from app.main import create_tables

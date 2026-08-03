@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import date, datetime, timedelta
 from io import StringIO
 from typing import Any
@@ -28,7 +27,7 @@ from app.schemas.funds import (
     FundDetailResponse,
     FundProfileOut,
 )
-from app.services import fund_holdings, quant_discovery
+from app.services import fund_holdings, quant, quant_discovery
 from app.services.fund_data import backfill_fund_nav_history
 from app.services.quant import QuantError
 
@@ -255,6 +254,8 @@ def build_detail(db: Session, code: str, *, refresh: bool = False) -> FundDetail
         industry_rows = []
 
     metrics = None
+    metrics_as_of = None
+    advice = None
     if instrument is not None:
         nav_count = db.scalar(
             select(func.count(FundNav.id)).where(FundNav.instrument_id == instrument.id)
@@ -271,8 +272,13 @@ def build_detail(db: Session, code: str, *, refresh: bool = False) -> FundDetail
             FactorBoardQuery(codes=[code], min_samples=2, limit=1, window=252),
         )
         metrics = response.items[0].model_dump() if response.items else None
+        metrics_as_of = response.as_of
     except QuantError as exc:
         warnings.append(f"量化指标暂不可用：{exc}")
+    try:
+        advice = quant.compute_fund_indicators(db, code).advice
+    except QuantError as exc:
+        warnings.append(f"趋势建议暂不可用：{exc}")
 
     profile_out = FundProfileOut(
         code=profile.code,
@@ -305,6 +311,9 @@ def build_detail(db: Session, code: str, *, refresh: bool = False) -> FundDetail
         active=catalog.active if catalog else None,
         profile=profile_out,
         metrics=metrics,
+        metrics_as_of=metrics_as_of,
+        metrics_basis="近1月/3月/1年/3年按自然日期计算，包含现金分红再投资收益",
+        advice=advice,
         holdings=[
             FundDetailHolding(
                 rank=row.rank,

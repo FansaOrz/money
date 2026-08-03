@@ -16,6 +16,18 @@ from app.schemas.common import ConfiguredBaseModel, DecimalStr
 # ---------------------------------------------------------------------------
 
 
+class FundAdvice(ConfiguredBaseModel):
+    action: Literal["add", "hold", "watch", "reduce", "reduce_more"]
+    label: str
+    score: int = Field(ge=0, le=100)
+    confidence: Literal["high", "medium", "low"]
+    horizon: str
+    summary: str
+    reasons: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    invalidation: str
+
+
 class FundIndicators(ConfiguredBaseModel):
     """单基金量化指标（响应）。
 
@@ -38,6 +50,9 @@ class FundIndicators(ConfiguredBaseModel):
     return_20d: float | None = Field(default=None, description="近20个交易日收益率（小数）")
     return_60d: float | None = Field(default=None, description="近60个交易日收益率（小数）")
     return_250d: float | None = Field(default=None, description="近250个交易日收益率（小数）")
+    return_1y: float | None = Field(
+        default=None, description="按最新净值日向前推一个自然年的分红再投资总收益率"
+    )
     annual_volatility: float | None = Field(default=None, description="年化波动率（日收益标准差×√252）")
     max_drawdown: float | None = Field(default=None, description="区间最大回撤（负数小数）")
     sharpe: float | None = Field(default=None, description="夏普比率（年化，默认无风险利率2%）")
@@ -54,6 +69,7 @@ class FundIndicators(ConfiguredBaseModel):
 
     trend_signal: str = Field(description="趋势信号：strong_up/up/neutral/down/strong_down")
     trend_reasons: list[str] = Field(default_factory=list, description="信号的可解释理由")
+    advice: FundAdvice | None = None
 
 
 # ---------------------------------------------------------------------------

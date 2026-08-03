@@ -16,7 +16,6 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     IndexConstituent,
-    IndexMembershipEvent,
     StockDailyBar,
     StockFinancialIndicator,
     StockIndustry,
@@ -474,15 +473,15 @@ def test_disclosure_market_period_snapshot_fetch(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """接口适配：每个 (market 分区, period) 只抓一次全市场快照，按 code 分配。"""
-    stock_data.sync_stock_master(db_session)
     calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        ak_fetch, "fetch_stock_code_name", lambda: _master_frame()
+    )
+    stock_data.sync_stock_master(db_session)
     monkeypatch.setattr(
         ak_fetch,
         "fetch_report_disclosure",
         lambda market, period: calls.append((market, period)) or _disclosure_frame(market),
-    )
-    monkeypatch.setattr(
-        ak_fetch, "fetch_stock_code_name", lambda: _master_frame()
     )
     result = stock_fundamentals.sync_report_disclosure(db_session, None, ["20231231"])
     assert result["status"] == "success"
@@ -510,6 +509,9 @@ def test_disclosure_partial_when_one_market_fails(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """单分区抓取失败 -> partial，失败摘要落 stock_sync_state.detail。"""
+    monkeypatch.setattr(
+        ak_fetch, "fetch_stock_code_name", lambda: _master_frame()
+    )
     stock_data.sync_stock_master(db_session)
 
     def flaky(market: str, period: str) -> pd.DataFrame | None:

@@ -24,7 +24,6 @@ from app.services.index_data import (
     ensure_indices,
     parse_index_frame,
     sync_index_history,
-    upsert_quotes,
 )
 
 

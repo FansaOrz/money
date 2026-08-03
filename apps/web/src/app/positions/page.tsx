@@ -3,8 +3,8 @@
 import { Fragment, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { api, ApiError } from "@/lib/api";
-import type { Position } from "@/lib/types";
+import { api, ApiError, peekApiCache } from "@/lib/api";
+import type { PortfolioReturnsResponse, Position } from "@/lib/types";
 import {
   fmtDate,
   fmtMoney,
@@ -134,17 +134,19 @@ function HoldingsView() {
   const rowRefs = useRef<Map<string, HTMLTableRowElement>>(new Map());
   const didScrollRef = useRef(false);
 
-  const [positions, setPositions] = useState<PositionView[]>([]);
+  const cachedPositions = normalizePositions(peekApiCache<Position[]>("/api/positions"));
+  const cachedReturnsRaw = peekApiCache<PortfolioReturnsResponse>("/api/portfolio/returns");
+  const cachedReturns = cachedReturnsRaw ? normalizePortfolioReturns(cachedReturnsRaw) : null;
+  const [positions, setPositions] = useState<PositionView[]>(cachedPositions);
   const [windowKey, setWindowKey] = useState<ReturnWindowKey>("1d");
-  const [returns, setReturns] = useState<ReturnWindowView[] | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [returns, setReturns] = useState<ReturnWindowView[] | null>(cachedReturns);
+  const [loading, setLoading] = useState(cachedPositions.length === 0);
   const [error, setError] = useState<string | null>(null);
   const [sort, setSort] = useState<SortState>({ key: "marketValue", direction: "desc" });
   // 展开状态按基金代码保存，排序/刷新后保持不变
   const [expandedCodes, setExpandedCodes] = useState<Set<string>>(() => new Set());
 
   const load = useCallback(async () => {
-    setLoading(true);
     setError(null);
     try {
       const [positionsRaw, returnsRaw] = await Promise.allSettled([

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, peekApiCache } from "@/lib/api";
 import {
   fmtDate,
   fmtMoney,
@@ -1856,13 +1856,18 @@ function ValidationPanel() {
 /* ---------- 量化分析主页面 ---------- */
 
 export default function QuantPage() {
-  const [portfolio, setPortfolio] = useState<QuantPortfolioView | null>(null);
-  const [funds, setFunds] = useState<QuantFundView[]>([]);
-  const [loading, setLoading] = useState(true);
+  const cachedPortfolio = normalizeQuantPortfolio(
+    peekApiCache<Parameters<typeof normalizeQuantPortfolio>[0]>("/api/quant/portfolio")
+  );
+  const cachedFunds = normalizeQuantFunds(
+    peekApiCache<Parameters<typeof normalizeQuantFunds>[0]>("/api/quant/funds")
+  );
+  const [portfolio, setPortfolio] = useState<QuantPortfolioView | null>(cachedPortfolio);
+  const [funds, setFunds] = useState<QuantFundView[]>(cachedFunds);
+  const [loading, setLoading] = useState(!cachedPortfolio && cachedFunds.length === 0);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    setLoading(true);
     setError(null);
     try {
       const [portfolioRaw, fundsRaw] = await Promise.allSettled([
@@ -1871,9 +1876,12 @@ export default function QuantPage() {
       ]);
       if (portfolioRaw.status === "fulfilled") {
         setPortfolio(normalizeQuantPortfolio(portfolioRaw.value));
+        setLoading(false);
       }
       if (fundsRaw.status === "fulfilled") {
         setFunds(normalizeQuantFunds(fundsRaw.value));
+        // 基金列表通常比组合汇总更早返回，先展示可用内容，不必等全部请求。
+        setLoading(false);
       }
       if (portfolioRaw.status === "rejected" && fundsRaw.status === "rejected") {
         const reason = portfolioRaw.reason;
@@ -1996,7 +2004,8 @@ export default function QuantPage() {
                   <thead>
                     <tr className="border-t border-slate-100 bg-slate-50 text-left text-xs text-slate-500">
                       <th className="px-4 py-2.5 font-medium sm:px-5">基金</th>
-                      <th className="px-4 py-2.5 text-right font-medium"><MetricLabel term="annualized-return">年化收益</MetricLabel></th>
+                      <th className="px-4 py-2.5 font-medium">当前建议</th>
+                      <th className="px-4 py-2.5 text-right font-medium"><MetricLabel term="total-return">近一年收益（含分红）</MetricLabel></th>
                       <th className="px-4 py-2.5 text-right font-medium"><MetricLabel term="annual-volatility">年化波动率</MetricLabel></th>
                       <th className="px-4 py-2.5 text-right font-medium"><MetricLabel term="max-drawdown">最大回撤</MetricLabel></th>
                       <th className="px-4 py-2.5 text-right font-medium"><MetricLabel term="sharpe-ratio">夏普比率</MetricLabel></th>
@@ -2012,8 +2021,25 @@ export default function QuantPage() {
                           <FundLink code={f.code} name={f.name} className="block font-medium text-slate-800 hover:text-blue-700 hover:underline" />
                           <p className="text-xs text-slate-400">{f.code}</p>
                         </td>
-                        <td className={`px-4 py-3 text-right tabular-nums ${signClass(f.annualizedReturn)}`}>
-                          {fmtPercent(f.annualizedReturn)}
+                        <td className="px-4 py-3">
+                          {f.adviceLabel ? (
+                            <span
+                              className={`rounded-full px-2 py-1 text-xs font-medium ${
+                                f.adviceAction === "add"
+                                  ? "bg-rose-50 text-rose-700"
+                                  : f.adviceAction === "hold"
+                                    ? "bg-blue-50 text-blue-700"
+                                    : f.adviceAction === "watch"
+                                      ? "bg-slate-100 text-slate-600"
+                                      : "bg-emerald-50 text-emerald-700"
+                              }`}
+                            >
+                              {f.adviceLabel}
+                            </span>
+                          ) : "—"}
+                        </td>
+                        <td className={`px-4 py-3 text-right tabular-nums ${signClass(f.oneYearReturn)}`}>
+                          {fmtPercent(f.oneYearReturn)}
                         </td>
                         <td className="px-4 py-3 text-right tabular-nums text-slate-600">
                           {fmtPercent(f.annualizedVolatility)}

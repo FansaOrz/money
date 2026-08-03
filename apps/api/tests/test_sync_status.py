@@ -14,7 +14,7 @@ from app.services.sync_status import (
     get_sync_status,
     track_sync_run,
 )
-from app.timezone import CN_TZ, to_cn
+from app.timezone import CN_TZ
 
 
 def test_track_sync_run_success(db_session: Session) -> None:

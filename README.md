@@ -17,13 +17,16 @@ Money 是一个面向个人使用的本地投资管理与研究系统。它从�
 
 - 从全市场基金目录构建候选池
 - 基金筛选、因子排名、双动量与风险分析
+- 将均线、动量、回撤等指标翻译成白话趋势和“加仓 / 持有 / 观望 / 减仓”建议
 - 单基金及组合量化指标、历史策略回测
 - 研究信号、候选池快照和研究组合
+- 本地缓存、页面预热及返回位置记忆，减少重复加载和页面跳转等待
 
 ### 股票研究
 
 - A 股股票池、行业和关键词筛选
 - 个股行情、财务估值、研究因子和信号
+- 面向非专业用户的白话趋势解读，专业技术指标默认折叠
 - Point-in-time 数据口径与研究质量检查
 - DuckDB + 按年份分区的 Parquet 研究数据仓库
 
@@ -171,7 +174,8 @@ python -m app.services.sync_backfill_job --batch-size 20 --batch 0
 | `MONEY_RESEARCH_DATA_DIR` | `./data/research` | Parquet 研究数据目录 |
 | `MONEY_RESEARCH_DB` | `./data/research/research.duckdb` | DuckDB 文件路径 |
 | `MONEY_RESEARCH_SYNC_BATCH_SIZE` | `200` | A 股日线单批同步数量 |
-| `NEXT_PUBLIC_API_URL` | 视启动方式而定 | Web 请求的 API 地址 |
+| `NEXT_PUBLIC_API_URL` | 空 | 浏览器 API 地址；服务器部署应留空，使用同源代理 |
+| `API_PROXY_URL` | `http://127.0.0.1:8001` | Next.js 服务端代理到 FastAPI 的地址 |
 
 本机 `start.sh` 会显式把主数据库设为项目根目录下的 `data/money.db`。如果手动从 `apps/api` 启动 API，建议同时显式设置数据库和研究仓库路径：
 
@@ -187,7 +191,7 @@ uvicorn app.main:app --reload --port 8001
 
 ```bash
 cd apps/web
-NEXT_PUBLIC_API_URL=http://127.0.0.1:8001 npm run dev
+NEXT_PUBLIC_API_URL= API_PROXY_URL=http://127.0.0.1:8001 npm run dev
 ```
 
 ## Docker Compose
@@ -203,7 +207,7 @@ make down
 
 Docker 模式的 API 端口为 `8000`，Web 端口为 `3000`。
 
-> 当前后端只读取带 `MONEY_` 前缀的配置，而现有 Compose 文件中的部分变量仍使用无前缀名称；研究数据目录也未挂载持久卷。因此 Compose 更适合开发验证，正式使用前应统一环境变量名称并补充数据卷。
+Compose 已为 PostgreSQL 和研究数据仓库配置持久卷，并通过 API 健康检查控制 Web 启动顺序。
 
 ## 验证
 
@@ -212,13 +216,6 @@ Docker 模式的 API 端口为 `8000`，Web 端口为 `3000`。
 ```bash
 cd apps/api
 python -m pytest
-```
-
-如需运行 Ruff，请先安装它（当前未包含在项目的 dev 依赖中）：
-
-```bash
-python -m pip install ruff
-python -m ruff check apps/api
 ```
 
 前端检查：
@@ -235,7 +232,7 @@ npm run build
 make test
 ```
 
-当前 `Makefile` 的 `lint` 目标仍调用前端未定义的 `npm run lint`，请暂时使用 `npm run typecheck`。
+`make lint` 会依次运行后端 Ruff 和前端 TypeScript 类型检查；GitHub Actions 也会在推送和 Pull Request 时执行后端测试及前端构建。
 
 ## 隐私与数据安全
 

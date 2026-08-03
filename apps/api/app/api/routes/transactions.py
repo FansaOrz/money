@@ -1,6 +1,6 @@
 """交易流水查询接口。"""
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 from fastapi import APIRouter, Depends, Query
 

@@ -26,6 +26,7 @@ import {
 import { Card, EmptyState, ErrorState, PageHeader, Spinner } from "@/components/ui";
 import { PriceChart } from "@/components/PriceChart";
 import { WatchlistButton } from "@/components/WatchlistButton";
+import type { StockTechnicalResponse } from "@/lib/types";
 
 const API_DOWN_HINT =
   "股票研究接口暂不可用。该功能依赖后端 /api/stocks/* 接口，当前后端尚未上线该模块。";
@@ -61,6 +62,22 @@ function FinancialMetricValue({ value, format }: { value: number | null; format:
   return <span className="text-slate-800">{value.toFixed(2)}</span>;
 }
 
+const TREND_META: Record<
+  StockTechnicalResponse["trend"],
+  { label: string; tone: string; bar: string }
+> = {
+  strong_bullish: { label: "明显偏强", tone: "text-rose-700 bg-rose-50 border-rose-200", bar: "bg-rose-500" },
+  bullish: { label: "走势偏强", tone: "text-orange-700 bg-orange-50 border-orange-200", bar: "bg-orange-400" },
+  neutral: { label: "震荡整理", tone: "text-slate-700 bg-slate-50 border-slate-200", bar: "bg-slate-400" },
+  bearish: { label: "走势偏弱", tone: "text-teal-700 bg-teal-50 border-teal-200", bar: "bg-teal-400" },
+  strong_bearish: { label: "明显偏弱", tone: "text-emerald-700 bg-emerald-50 border-emerald-200", bar: "bg-emerald-500" },
+  insufficient: { label: "数据不足", tone: "text-slate-500 bg-slate-50 border-slate-200", bar: "bg-slate-300" },
+};
+
+function indicatorValue(value: number | null | undefined, digits = 2): string {
+  return value === null || value === undefined ? "—" : value.toFixed(digits);
+}
+
 export default function StockDetailPage() {
   const params = useParams<{ code: string }>();
   const code = decodeURIComponent(params.code ?? "");
@@ -75,6 +92,7 @@ export default function StockDetailPage() {
   const [financials, setFinancials] = useState<StockFinancialsView | null>(null);
   const [factors, setFactors] = useState<StockFactorsView | null>(null);
   const [signals, setSignals] = useState<StockSignalsView | null>(null);
+  const [technical, setTechnical] = useState<StockTechnicalResponse | null>(null);
 
   const load = useCallback(async () => {
     if (!code) return;
@@ -82,7 +100,7 @@ export default function StockDetailPage() {
     setError(null);
     setPartial([]);
     try {
-      const [detailRes, quoteRes, historyRes, financialsRes, factorsRes, signalsRes] =
+      const [detailRes, quoteRes, historyRes, financialsRes, factorsRes, signalsRes, technicalRes] =
         await Promise.allSettled([
           api.stockDetail(code),
           api.stockQuote(code),
@@ -90,6 +108,7 @@ export default function StockDetailPage() {
           api.stockFinancials(code),
           api.stockFactors({ search: code, limit: 5 }),
           api.stockSignals({ code, limit: 20 }),
+          api.stockTechnical(code),
         ]);
 
       const failed: string[] = [];
@@ -123,10 +142,15 @@ export default function StockDetailPage() {
       } else {
         failed.push("信号");
       }
+      if (technicalRes.status === "fulfilled") {
+        setTechnical(technicalRes.value);
+      } else {
+        failed.push("趋势解读");
+      }
 
       setPartial(failed);
 
-      const allRejected = [detailRes, quoteRes, historyRes, financialsRes, factorsRes, signalsRes].every(
+      const allRejected = [detailRes, quoteRes, historyRes, financialsRes, factorsRes, signalsRes, technicalRes].every(
         (r) => r.status === "rejected"
       );
       if (allRejected) {
@@ -241,6 +265,101 @@ export default function StockDetailPage() {
               <p className="mb-5 text-xs text-slate-400">行情快照接口暂未返回数据。</p>
             )}
             <PriceChart points={displayHistory} gradientId={`stock-${code}`} />
+          </Card>
+
+          {/* 面向非专业用户的白话趋势解读 */}
+          <Card className="px-4 py-5 sm:px-5">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-800">现在是什么趋势？</h2>
+                <p className="mt-1 text-xs text-slate-500">把最近价格和成交量变化翻译成白话，仅用于观察趋势</p>
+              </div>
+              {technical?.as_of && <p className="text-xs text-slate-400">数据截至 {fmtDate(technical.as_of)}</p>}
+            </div>
+            {technical ? (
+              <div className="space-y-5">
+                <div className={`rounded-xl border p-4 ${TREND_META[technical.trend].tone}`}>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span className="text-xl font-semibold">{TREND_META[technical.trend].label}</span>
+                    {technical.sufficient && (
+                      <span className="rounded-full bg-white/70 px-2 py-0.5 text-xs">
+                        {technical.score > 0 ? "偏强信号" : technical.score < 0 ? "偏弱信号" : "强弱平衡"}{" "}
+                        {Math.abs(technical.score)} 项
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-2 text-sm leading-relaxed">{technical.summary}</p>
+                  <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/70">
+                    <div
+                      className={`h-full rounded-full ${TREND_META[technical.trend].bar}`}
+                      style={{ width: `${technical.sufficient ? Math.max(12, Math.abs(technical.score) * 20) : 0}%` }}
+                    />
+                  </div>
+                </div>
+
+                {technical.signals.length > 0 && (
+                  <div>
+                    <h3 className="text-xs font-semibold text-slate-700">为什么这样判断</h3>
+                    <ul className="mt-2 grid gap-2 sm:grid-cols-2">
+                      {technical.signals.slice(0, 4).map((item) => (
+                        <li key={item} className="rounded-lg bg-slate-50 px-3 py-2 text-sm leading-relaxed text-slate-700">
+                          {item}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div>
+                  <h3 className="text-xs font-semibold text-slate-700">需要留意</h3>
+                  {technical.risks.length > 0 ? (
+                    <ul className="mt-2 space-y-2">
+                      {technical.risks.map((item) => (
+                        <li key={item} className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                          {item}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-600">
+                      暂未发现明显的短期过热或高波动提示，但趋势仍可能随市场变化。
+                    </p>
+                  )}
+                </div>
+
+                <details className="rounded-lg border border-slate-200">
+                  <summary className="cursor-pointer px-3 py-2.5 text-xs font-medium text-slate-600">
+                    查看专业指标（可选）
+                  </summary>
+                  <div className="grid grid-cols-2 gap-2 border-t border-slate-100 p-3 text-xs sm:grid-cols-4">
+                    {[
+                      ["5 日均价", technical.indicators.ma5],
+                      ["20 日均价", technical.indicators.ma20],
+                      ["RSI 强弱值", technical.indicators.rsi12],
+                      ["近期波动幅度", technical.indicators.atr_pct, "percent"],
+                      ["20 日支撑参考", technical.indicators.support20],
+                      ["20 日压力参考", technical.indicators.resistance20],
+                      ["MACD 动力差", technical.indicators.macd_histogram],
+                      ["近期量能倍数", technical.indicators.volume_ratio],
+                    ].map(([label, value, kind]) => (
+                      <div key={String(label)} className="rounded-md bg-slate-50 px-2.5 py-2">
+                        <p className="text-slate-500">{label}</p>
+                        <p className="mt-0.5 font-semibold tabular-nums text-slate-800">
+                          {kind === "percent" && typeof value === "number"
+                            ? fmtPercent(value)
+                            : indicatorValue(typeof value === "number" ? value : null)}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="border-t border-slate-100 px-3 py-2 text-xs leading-relaxed text-slate-400">
+                    {technical.methodology}
+                  </p>
+                </details>
+              </div>
+            ) : (
+              <EmptyState title="暂无趋势解读" hint="需要至少 30 条有效日线数据才能判断。" />
+            )}
           </Card>
 
           {/* 财务估值 */}

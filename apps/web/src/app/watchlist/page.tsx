@@ -20,7 +20,7 @@ import { Card, EmptyState, PageHeader } from "@/components/ui";
 import { FundLink } from "@/components/FundLink";
 
 interface FundEnrich {
-  annualizedReturn: number | null;
+  oneYearReturn: number | null;
   sharpe: number | null;
   maxDrawdown: number | null;
 }
@@ -57,7 +57,7 @@ export default function WatchlistPage() {
         const map = new Map<string, FundEnrich>();
         views.forEach((f) => {
           map.set(f.code, {
-            annualizedReturn: toNumber(f.annualizedReturn),
+            oneYearReturn: toNumber(f.oneYearReturn),
             sharpe: toNumber(f.sharpeRatio),
             maxDrawdown: toNumber(f.maxDrawdown),
           });
@@ -220,7 +220,7 @@ export default function WatchlistPage() {
                   <thead>
                     <tr className="border-t border-slate-100 bg-slate-50 text-left text-xs text-slate-500">
                       <th className="px-4 py-2.5 font-medium sm:px-5">基金</th>
-                      <th className="px-4 py-2.5 text-right font-medium">年化收益</th>
+                      <th className="px-4 py-2.5 text-right font-medium">近一年收益（含分红）</th>
                       <th className="px-4 py-2.5 text-right font-medium">夏普</th>
                       <th className="px-4 py-2.5 text-right font-medium">最大回撤</th>
                       <th className="px-4 py-2.5 font-medium">加入时间</th>
@@ -236,10 +236,10 @@ export default function WatchlistPage() {
                             <FundLink code={it.code} name={it.name} />
                             <p className="text-xs text-slate-400">{it.code}</p>
                           </td>
-                          <td className={`px-4 py-3 text-right tabular-nums ${signClass(enrich?.annualizedReturn)}`}>
-                            {enrich?.annualizedReturn === null || enrich?.annualizedReturn === undefined
+                          <td className={`px-4 py-3 text-right tabular-nums ${signClass(enrich?.oneYearReturn)}`}>
+                            {enrich?.oneYearReturn === null || enrich?.oneYearReturn === undefined
                               ? "—"
-                              : fmtPercent(enrich.annualizedReturn)}
+                              : fmtPercent(enrich.oneYearReturn)}
                           </td>
                           <td className="px-4 py-3 text-right tabular-nums text-slate-600">
                             {enrich?.sharpe === null || enrich?.sharpe === undefined

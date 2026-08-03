@@ -103,6 +103,22 @@ class TestFetchNavHistoryFast:
         assert rows[0]["accumulated_nav"] == Decimal("1.3")
         assert rows[0]["source"] == "eastmoney_fast"
 
+    def test_uses_eastmoney_china_calendar_date(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """东财北京时间零点不能按 UTC date 解析成前一天。"""
+        # 2026-07-27 00:00:00 Asia/Shanghai = 2026-07-26 16:00:00 UTC
+        timestamp = 1785081600000
+        text = (
+            "var Data_netWorthTrend = "
+            f'[{{"x":{timestamp},"y":2.7901,"equityReturn":0.65}}];'
+            f"var Data_ACWorthTrend = [[{timestamp},3.0237]];"
+        )
+        monkeypatch.setattr(fund_data, "_request_text_with_retry", lambda *a, **k: text)
+        rows, error = fetch_nav_history_fast("008401", days=3650)
+        assert error is None
+        assert rows[0]["nav_date"] == date(2026, 7, 27)
+
     def test_reports_missing_trend(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             fund_data,

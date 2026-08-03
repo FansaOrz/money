@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib
 import math
+from calendar import monthrange
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from statistics import fmean
@@ -43,6 +44,7 @@ from app.schemas.quant import (
     SignalListResponse,
     TradeSignal,
 )
+from app.services.fund_advice import build_fund_advice
 
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_RISK_FREE_RATE = 0.02
@@ -104,8 +106,9 @@ def _load_nav_series(
 class NavSeriesPair:
     """同一基金日历对齐的双净值序列。
 
-    - total_series：连续总收益口径（累计净值），单位净值兜底的区间已按
-      衔接比率缩放拼接，任意相邻点的比值都是真实总收益，不存在单位切换；
+    - total_series：分红再投资总收益指数。根据“累计净值－单位净值”的
+      增量识别每份分红，再按除息日单位净值复投；不能直接用累计净值端点比，
+      因为累计净值是历史分红的简单累加，并非复权价格；
     - unit_series：单位净值（交易成交价口径），缺失累计净值的日子回退为
       当日总收益指数值（该日单位/累计本就一致，单位不受缩放影响）。
     """
@@ -146,11 +149,10 @@ def _load_dual_nav_series(
     最后反转为升序 —— limit 截断保留的是区间内最新的样本（窗口语义），
     而不是最早 limit 条（否则长历史 + 小窗口会错过最近行情）。
 
-    总收益序列构造规则（禁止逐点二选一导致的单位混用）：
-    - 累计净值存在时直接使用（含分红，本身是连续总收益口径）；
-    - 累计净值缺失的连续区间用单位净值兜底，并在区间衔接处按比率缩放，
-      使拼接点的日收益连续（收益 = unit[i]/unit[i-1] 或 acc[i]/acc[i-1]），
-      整个序列可视为以最新累计净值为基准回溯构造的总收益指数。
+    总收益序列构造规则：
+    - 相邻两日“累计净值－单位净值”的正增量视为当日每份现金分红；
+    - 当日总收益因子 =（当日单位净值 + 当日分红）/ 前一日单位净值；
+    - 累计净值缺失时只能按单位净值收益兜底，并标记 unit_fallback。
     """
     stmt = select(FundNav.nav_date, FundNav.accumulated_nav, FundNav.unit_nav).where(
         FundNav.instrument_id == instrument_id
@@ -173,20 +175,24 @@ def _load_dual_nav_series(
 
     n = len(points)
     total_values: list[float] = [0.0] * n
-    unit_fallback = False
-    # 自后向前拼接：已知累计净值的点原样保留；缺测点按「后一日总收益值 ×
-    # 当日/次日单位净值比」回溯，保证相邻点比值等于该日真实总收益。
-    for i in range(n - 1, -1, -1):
+    unit_fallback = any(acc is None for _day, _unit, acc in points)
+    if n:
+        # 起点与单位净值同尺度，后续逐日复权；这样回测按单位净值买入的份额
+        # 可以直接乘总收益指数估值。
+        total_values[0] = points[0][1]
+    for i in range(1, n):
+        _prev_day, prev_unit, prev_acc = points[i - 1]
         _day, unit, acc = points[i]
-        if acc is not None:
-            total_values[i] = acc
-        elif i + 1 < n and points[i + 1][1] > 0 and total_values[i + 1] > 0:
-            total_values[i] = total_values[i + 1] * unit / points[i + 1][1]
-            unit_fallback = True
-        else:
-            # 序列末尾缺测（无后续锚点）：单位净值即总收益口径
-            total_values[i] = unit
-            unit_fallback = True
+        distribution = 0.0
+        if prev_acc is not None and acc is not None:
+            previous_paid = prev_acc - prev_unit
+            current_paid = acc - unit
+            # 净值只保留 4～6 位小数，允许极小舍入误差；只有明显正增量才
+            # 视为现金分红，防止舍入噪声被误复投。
+            increase = current_paid - previous_paid
+            if increase > 0.00005:
+                distribution = increase
+        total_values[i] = total_values[i - 1] * (unit + distribution) / prev_unit
 
     total_series = [(points[i][0], total_values[i]) for i in range(n)]
     # 成交价一律用单位净值；单位净值必然存在（见上方过滤）
@@ -211,6 +217,35 @@ def _period_return(values: list[float], window: int) -> float | None:
     if base <= 0:
         return None
     return values[-1] / base - 1.0
+
+
+def _shift_months(day: date, months: int) -> date:
+    """把日期向前移动 months 个月，月末日期自动收敛到目标月末。"""
+    absolute_month = day.year * 12 + day.month - 1 - months
+    year, month_zero = divmod(absolute_month, 12)
+    month = month_zero + 1
+    return date(year, month, min(day.day, monthrange(year, month)[1]))
+
+
+def _calendar_period_return(
+    series: list[tuple[date, float]],
+    *,
+    months: int,
+) -> float | None:
+    """按自然月区间计算收益，起点取目标日期当日或之前最近一个净值日。"""
+    if len(series) < 2:
+        return None
+    end_date, end_value = series[-1]
+    target = _shift_months(end_date, months)
+    start_value: float | None = None
+    for nav_date, value in series:
+        if nav_date > target:
+            break
+        if value > 0:
+            start_value = value
+    if start_value is None or start_value <= 0:
+        return None
+    return end_value / start_value - 1.0
 
 
 def _annual_volatility(returns: list[float]) -> float | None:
@@ -392,6 +427,11 @@ def compute_fund_indicators(db: Session, code: str) -> FundIndicators:
     ma60 = _moving_average(values, 60)
     dif, dea, hist = _macd_series(values)
     trend, reasons = _trend_signal(values, ma20, ma60, dif, dea)
+    return_20d = _period_return(values, 20)
+    return_60d = _period_return(values, 60)
+    annual_volatility = _annual_volatility(returns)
+    max_drawdown = _max_drawdown(values)
+    sharpe = _sharpe(returns)
 
     return FundIndicators(
         code=instrument.code,
@@ -399,12 +439,13 @@ def compute_fund_indicators(db: Session, code: str) -> FundIndicators:
         start_date=dates[0].isoformat(),
         end_date=dates[-1].isoformat(),
         sample_count=len(series),
-        return_20d=_period_return(values, 20),
-        return_60d=_period_return(values, 60),
+        return_20d=return_20d,
+        return_60d=return_60d,
         return_250d=_period_return(values, 250),
-        annual_volatility=_annual_volatility(returns),
-        max_drawdown=_max_drawdown(values),
-        sharpe=_sharpe(returns),
+        return_1y=_calendar_period_return(series, months=12),
+        annual_volatility=annual_volatility,
+        max_drawdown=max_drawdown,
+        sharpe=sharpe,
         win_rate=_win_rate(returns),
         ma20=ma20[-1],
         ma60=ma60[-1],
@@ -413,6 +454,15 @@ def compute_fund_indicators(db: Session, code: str) -> FundIndicators:
         macd_hist=hist[-1] if hist else None,
         trend_signal=trend,
         trend_reasons=reasons,
+        advice=build_fund_advice(
+            sample_count=len(series),
+            trend_signal=trend,
+            return_20d=return_20d,
+            return_60d=return_60d,
+            annual_volatility=annual_volatility,
+            max_drawdown=max_drawdown,
+            sharpe=sharpe,
+        ),
     )
 
 

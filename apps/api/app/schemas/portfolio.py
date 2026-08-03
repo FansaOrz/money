@@ -78,7 +78,7 @@ class FundReturnItem(ConfiguredBaseModel):
     shares: DecimalStr = Field(description="当前持有份额")
     # 收益金额 = shares * (unit_nav_end - unit_nav_start)，无数据时为 None
     return_amount: DecimalStr | None
-    # 收益率（小数）：优先累计净值端点比，缺失时回退单位净值端点比
+    # 收益率（小数）：现金分红再投资总收益，累计净值缺失区间回退单位净值
     return_rate: DecimalStr | None
     # 实际使用的净值端点（起点取 <= 目标日期的最后一条，终点取最新一条）
     start_date: str | None = Field(description="实际起点净值日期")
@@ -87,7 +87,10 @@ class FundReturnItem(ConfiguredBaseModel):
     end_nav: DecimalStr | None = None
     rate_basis: str | None = Field(
         default=None,
-        description="收益率口径：accumulated（含分红总收益）/ unit（单位净值价差，不含分红）",
+        description=(
+            "收益率口径：dividend_reinvested（分红再投资）/"
+            "total_return_with_unit_fallback（部分区间回退单位净值）"
+        ),
     )
     # available：两端均有净值；stale：一端或两端缺失；approximate：窗口内有份额变动
     status: str = Field(description="available / stale / approximate")

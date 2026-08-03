@@ -38,23 +38,29 @@ fi
   cd "$API_DIR"
   start_process "后端 API" "$DATA_DIR/api.pid" "$DATA_DIR/api.log" \
     env MONEY_DATABASE_URL="sqlite:///$DATA_DIR/money.db" \
+        MONEY_RESEARCH_DATA_DIR="$DATA_DIR/research" \
+        MONEY_RESEARCH_DB="$DATA_DIR/research/research.duckdb" \
         MONEY_CORS_ORIGINS='["http://localhost:3000","http://127.0.0.1:3000"]' \
         uvicorn app.main:app --host 0.0.0.0 --port 8001
 )
 
 if [[ ! -d "$WEB_DIR/.next" ]]; then
   echo "正在构建前端..."
-  (cd "$WEB_DIR" && NEXT_PUBLIC_API_URL=http://127.0.0.1:8001 npm run build)
+  # 浏览器统一请求同源 /api，再由 Next.js 服务端代理到 8001。
+  # 不能把 127.0.0.1:8001 编进客户端，否则远程访问者会请求自己电脑。
+  (cd "$WEB_DIR" && NEXT_PUBLIC_API_URL= API_PROXY_URL=http://127.0.0.1:8001 npm run build)
 fi
 
 start_process "前端 Web" "$DATA_DIR/web.pid" "$DATA_DIR/web.log" \
-  env NEXT_PUBLIC_API_URL=http://127.0.0.1:8001 \
+  env API_PROXY_URL=http://127.0.0.1:8001 \
       npm --prefix "$WEB_DIR" run start -- -p 3000
 
 (
   cd "$API_DIR"
   start_process "每日调度器" "$DATA_DIR/scheduler.pid" "$DATA_DIR/scheduler.log" \
     env MONEY_DATABASE_URL="sqlite:///$DATA_DIR/money.db" \
+        MONEY_RESEARCH_DATA_DIR="$DATA_DIR/research" \
+        MONEY_RESEARCH_DB="$DATA_DIR/research/research.duckdb" \
         python -m app.services.scheduler
 )
 

@@ -132,6 +132,47 @@ class StockDailyResponse(ConfiguredBaseModel):
     total: int = 0
 
 
+class StockTechnicalIndicators(ConfiguredBaseModel):
+    close: float | None = None
+    ma5: float | None = None
+    ma10: float | None = None
+    ma20: float | None = None
+    ma60: float | None = None
+    macd_dif: float | None = None
+    macd_dea: float | None = None
+    macd_histogram: float | None = None
+    rsi6: float | None = None
+    rsi12: float | None = None
+    rsi24: float | None = None
+    kdj_k: float | None = None
+    kdj_d: float | None = None
+    kdj_j: float | None = None
+    boll_upper: float | None = None
+    boll_middle: float | None = None
+    boll_lower: float | None = None
+    atr14: float | None = None
+    atr_pct: float | None = None
+    support20: float | None = None
+    resistance20: float | None = None
+    volume_ratio: float | None = None
+
+
+class StockTechnicalResponse(ConfiguredBaseModel):
+    code: str
+    as_of: date | None = None
+    sufficient: bool = False
+    sample_size: int = 0
+    trend: str = Field(
+        description="strong_bullish | bullish | neutral | bearish | strong_bearish | insufficient"
+    )
+    score: int = Field(ge=-5, le=5)
+    summary: str = ""
+    indicators: StockTechnicalIndicators = Field(default_factory=StockTechnicalIndicators)
+    signals: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    methodology: str = ""
+
+
 class StockMasterOut(ConfiguredBaseModel):
     code: str
     name: str
