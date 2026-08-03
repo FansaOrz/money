@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+API_DIR="$ROOT_DIR/apps/api"
+WEB_DIR="$ROOT_DIR/apps/web"
+DATA_DIR="$ROOT_DIR/data"
+NODE_BIN="/usr/local/nvm/versions/node/v20.20.2/bin"
+
+mkdir -p "$DATA_DIR"
+
+if [[ -d "$NODE_BIN" ]]; then
+  export PATH="$NODE_BIN:$PATH"
+fi
+
+start_process() {
+  local name="$1"
+  local pid_file="$2"
+  local log_file="$3"
+  shift 3
+
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    echo "$name 已在运行（PID $(cat "$pid_file")）"
+    return
+  fi
+
+  nohup "$@" >"$log_file" 2>&1 &
+  echo $! >"$pid_file"
+  echo "$name 已启动（PID $(cat "$pid_file")）"
+}
+
+if [[ ! -f "$DATA_DIR/money.db" ]]; then
+  echo "未发现数据库，正在初始化并导入 PDF..."
+  (cd "$API_DIR" && python -m app.services.bootstrap)
+fi
+
+(
+  cd "$API_DIR"
+  start_process "后端 API" "$DATA_DIR/api.pid" "$DATA_DIR/api.log" \
+    env MONEY_DATABASE_URL="sqlite:///$DATA_DIR/money.db" \
+        MONEY_CORS_ORIGINS='["http://localhost:3000","http://127.0.0.1:3000"]' \
+        uvicorn app.main:app --host 0.0.0.0 --port 8001
+)
+
+if [[ ! -d "$WEB_DIR/.next" ]]; then
+  echo "正在构建前端..."
+  (cd "$WEB_DIR" && NEXT_PUBLIC_API_URL=http://127.0.0.1:8001 npm run build)
+fi
+
+start_process "前端 Web" "$DATA_DIR/web.pid" "$DATA_DIR/web.log" \
+  env NEXT_PUBLIC_API_URL=http://127.0.0.1:8001 \
+      npm --prefix "$WEB_DIR" run start -- -p 3000
+
+(
+  cd "$API_DIR"
+  start_process "每日调度器" "$DATA_DIR/scheduler.pid" "$DATA_DIR/scheduler.log" \
+    env MONEY_DATABASE_URL="sqlite:///$DATA_DIR/money.db" \
+        python -m app.services.scheduler
+)
+
+# 净值同步只保留常驻调度器一个触发源（20:30 由 scheduler 触发），
+# 不再注册 crontab，避免 cron 与调度器双触发同一任务；
+# 若历史上配置过 sync_navs.sh 的 cron 项，这里顺带清理。
+if command -v crontab >/dev/null 2>&1; then
+  if crontab -l 2>/dev/null | grep -q "$ROOT_DIR/sync_navs.sh"; then
+    (crontab -l 2>/dev/null | grep -v "$ROOT_DIR/sync_navs.sh" || true) | crontab -
+    echo "已移除 sync_navs.sh 的 crontab 项（净值同步统一由常驻调度器触发）"
+  fi
+fi
+echo "常驻调度器已配置：17:30 市场指数、20:30 基金净值、07:30 美股指数、17:05 A股日线"
+
+echo
+echo "Web:   http://localhost:3000"
+echo "API:   http://localhost:8001"
+echo "日志:  $DATA_DIR/api.log, $DATA_DIR/web.log"

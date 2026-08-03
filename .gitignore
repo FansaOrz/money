@@ -1,0 +1,123 @@
+# ---------------------------------------------------------------------------
+# 本地配置与密钥
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# AI / 编辑器本机配置
+.claude/
+.cursor/
+.vscode/
+.idea/
+*.code-workspace
+
+# ---------------------------------------------------------------------------
+# 运行数据与用户文件
+# ---------------------------------------------------------------------------
+# SQLite、DuckDB、Parquet 研究仓库，以及日志、PID、任务锁均由程序生成。
+data/
+tmp/
+uploads/
+
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.duckdb
+*.duckdb.wal
+*.parquet
+
+*.log
+*.pid
+*.pid.lock
+
+# 用户导入文件可能包含个人身份、账户和交易信息
+*.pdf
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+ENV/
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Python 构建与打包产物
+build/
+dist/
+wheelhouse/
+MANIFEST
+
+# ---------------------------------------------------------------------------
+# Node.js / Next.js
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+coverage/
+
+.npm/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnpm-store/
+.turbo/
+.swc/
+
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------------------------------------------------------------------------
+# 临时文件、系统文件与 IDE 备份
+# ---------------------------------------------------------------------------
+.cache/
+.tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------------------
+# 本地容器覆盖配置
+# ---------------------------------------------------------------------------
+docker-compose.override.yml
+compose.override.yml

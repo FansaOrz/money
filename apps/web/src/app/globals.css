@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-slate-100 text-slate-900 antialiased;
+}
+
+/* 细滚动条，避免表格横向滚动条过于突兀 */
+*::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-slate-300;
+}
+
+/* 研究类宽表友好：页面容器更宽时允许表格横向滚动而不撑破布局 */
+main {
+  min-width: 0;
+}
+
+/* 侧栏折叠/展开动画保持轻量，仅依赖过渡 */
+nav button[aria-expanded] svg {
+  transition: transform 0.15s ease;
+}
