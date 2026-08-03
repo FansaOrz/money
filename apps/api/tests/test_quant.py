@@ -824,9 +824,10 @@ from datetime import datetime  # noqa: E402
 from app.models import (  # noqa: E402
     FundHolding,
     FundIndustryAllocation,
+    FundNewsImpact,
     IndexQuote,
     MarketIndex,
-    NewsItem,
+    NewsEvent,
 )
 from app.services.quant import comprehensive_research_signals  # noqa: E402
 from app.schemas.quant import SignalFilters  # noqa: E402
@@ -976,28 +977,46 @@ def test_signals_industry_exposure(client: TestClient, db_session: Session) -> N
 
 
 def test_signals_news_events(client: TestClient, db_session: Session) -> None:
-    """近 7 天关联某基金 ≥3 条资讯时产生 news 信号。"""
+    """近 7 天存在已去重、已分析的基金事件时产生 news 信号。"""
     instrument = _seed_instrument_with_navs(db_session, days=60)
     _seed_position(db_session, instrument, "10000.00")
     now = datetime.now()
-    for i in range(4):
+    for i in range(2):
+        event = NewsEvent(
+            canonical_key=f"event-{i}",
+            title=f"已分析基金事件{i}",
+            latest_published_at=now,
+            direction="positive",
+            impact_level="medium",
+            impact_score=45,
+            horizon_days=7,
+            confidence=0.6,
+            source_quality=0.8,
+            plain_summary="测试事件",
+            expires_at=now + timedelta(days=7),
+        )
+        db_session.add(event)
+        db_session.flush()
         db_session.add(
-            NewsItem(
-                source="test",
-                title=f"基金新闻{i}",
-                related_codes="110022",
-                published_at=now,
-                content_hash=f"hash-{i}",
+            FundNewsImpact(
+                event_id=event.id,
+                instrument_id=instrument.id,
+                relation_type="direct_fund",
+                relevance_score=1,
+                exposure_ratio=1,
+                signed_score=10,
+                reason="新闻直接提到该基金",
             )
         )
     db_session.commit()
 
     data = client.get("/api/quant/signals").json()
     news = [s for s in data["signals"] if s["category"] == "news"]
-    assert news, "4 条近期相关资讯应产生 news 信号"
+    assert news, "已分析且映射到基金的近期事件应产生 news 信号"
     assert news[0]["related_codes"] == ["110022"]
-    assert news[0]["evidence"]["news_count"] == 4
-    assert news[0]["source"] == "news_items"
+    assert news[0]["evidence"]["event_count"] == 2
+    assert news[0]["evidence"]["signed_impact_score"] == pytest.approx(20)
+    assert news[0]["source"] == "fund_news_impacts"
 
 
 def test_signals_market_index(client: TestClient, db_session: Session) -> None:

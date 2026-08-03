@@ -954,6 +954,35 @@ export interface FundAdvice {
   invalidation?: string | null;
 }
 
+export interface FundNewsEvent {
+  id?: number | string | null;
+  title?: string | null;
+  summary?: string | null;
+  direction?: "positive" | "neutral" | "negative" | string | null;
+  impact_level?: "low" | "medium" | "high" | string | null;
+  relation_type?: string | null;
+  reason?: string | null;
+  score?: number | string | null;
+  published_at?: string | null;
+  source_count?: number | string | null;
+  analysis_method?: string | null;
+}
+
+export interface FundAnalysisSummary {
+  quant_score?: number | string | null;
+  news_score?: number | string | null;
+  combined_score?: number | string | null;
+  quant_view?: string | null;
+  news_view?: string | null;
+  portfolio_view?: string | null;
+  conclusion?: string | null;
+  conflict_note?: string | null;
+  as_of?: string | null;
+  news_event_count?: number | string | null;
+  news_analysis_method?: string | null;
+  key_events?: FundNewsEvent[] | null;
+}
+
 /** 基金详情聚合响应（字段宽松可选，兼容后端结构差异） */
 export interface FundDetailResponse {
   code?: string | null;
@@ -971,6 +1000,7 @@ export interface FundDetailResponse {
   metrics_as_of?: string | null;
   metrics_basis?: string | null;
   advice?: FundAdvice | null;
+  analysis?: FundAnalysisSummary | null;
   holdings?: FundDetailHolding[] | null;
   industries?: FundDetailIndustry[] | null;
   report_date?: string | null;

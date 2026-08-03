@@ -1,5 +1,6 @@
 """基金详情接口 Schema。"""
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import Field
@@ -46,6 +47,37 @@ class FundDetailIndustry(ConfiguredBaseModel):
     report_date: str
 
 
+class FundNewsEventOut(ConfiguredBaseModel):
+    id: int
+    title: str
+    summary: str
+    direction: str
+    impact_level: str
+    relation_type: str
+    reason: str
+    score: float
+    published_at: datetime | None = None
+    source_count: int
+    analysis_method: str
+
+
+class FundAnalysisSummary(ConfiguredBaseModel):
+    """量化、新闻和个人持仓约束合成后的直白说明。"""
+
+    quant_score: int
+    news_score: float
+    combined_score: int
+    quant_view: str
+    news_view: str
+    portfolio_view: str
+    conclusion: str
+    conflict_note: str | None = None
+    as_of: datetime | None = None
+    news_event_count: int = 0
+    news_analysis_method: str
+    key_events: list[FundNewsEventOut] = Field(default_factory=list)
+
+
 class FundDetailResponse(ConfiguredBaseModel):
     code: str
     name: str
@@ -59,6 +91,7 @@ class FundDetailResponse(ConfiguredBaseModel):
     metrics_as_of: str | None = None
     metrics_basis: str | None = None
     advice: FundAdvice | None = None
+    analysis: FundAnalysisSummary | None = None
     holdings: list[FundDetailHolding] = Field(default_factory=list)
     industries: list[FundDetailIndustry] = Field(default_factory=list)
     report_date: str | None = None

@@ -18,6 +18,8 @@ Money 是一个面向个人使用的本地投资管理与研究系统。它从�
 - 从全市场基金目录构建候选池
 - 基金筛选、因子排名、双动量与风险分析
 - 将均线、动量、回撤等指标翻译成白话趋势和“加仓 / 持有 / 观望 / 减仓”建议
+- 后台聚合重复新闻，按基金自身、跟踪市场、行业和重仓股计算消息影响
+- 将历史趋势、新闻环境和个人持仓占比合成为直白建议；页面不实时调用大模型
 - 单基金及组合量化指标、历史策略回测
 - 研究信号、候选池快照和研究组合
 - 本地缓存、页面预热及返回位置记忆，减少重复加载和页面跳转等待
@@ -165,6 +167,9 @@ python -m app.services.sync_backfill_job --batch-size 20 --batch 0
 
 后端配置使用 `MONEY_` 环境变量前缀：
 
+本机通过 `start.sh` 运行时，可把这些配置写入 `apps/api/.env`；根目录
+`.env` 主要供 Docker Compose 使用。真实 API Key 不要提交到 Git。
+
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `MONEY_DATABASE_URL` | `sqlite:///./money.db` | SQLAlchemy 数据库连接串 |
@@ -174,6 +179,14 @@ python -m app.services.sync_backfill_job --batch-size 20 --batch 0
 | `MONEY_RESEARCH_DATA_DIR` | `./data/research` | Parquet 研究数据目录 |
 | `MONEY_RESEARCH_DB` | `./data/research/research.duckdb` | DuckDB 文件路径 |
 | `MONEY_RESEARCH_SYNC_BATCH_SIZE` | `200` | A 股日线单批同步数量 |
+| `MONEY_NEWS_ANALYSIS_ENABLED` | `true` | 后台聚合并分析新资讯 |
+| `MONEY_NEWS_ANALYSIS_LOOKBACK_DAYS` | `30` | 新闻事件分析回看天数 |
+| `MONEY_NEWS_ANALYSIS_BATCH_SIZE` | `100` | 每轮最多处理的新资讯数 |
+| `MONEY_NEWS_LLM_ENABLED` | `false` | 是否使用 OpenAI-compatible 模型分析新闻 |
+| `MONEY_NEWS_LLM_BASE_URL` | OpenAI API 地址 | 模型服务的 `/v1` 根地址，也可填写兼容服务 |
+| `MONEY_NEWS_LLM_API_KEY` | 空 | 模型服务密钥；不要提交真实密钥 |
+| `MONEY_NEWS_LLM_MODEL` | 空 | 新闻分析使用的模型名；留空时使用规则初判 |
+| `MONEY_NEWS_LLM_TIMEOUT_SECONDS` | `30` | 后台单次模型请求超时秒数 |
 | `NEXT_PUBLIC_API_URL` | 空 | 浏览器 API 地址；服务器部署应留空，使用同源代理 |
 | `API_PROXY_URL` | `http://127.0.0.1:8001` | Next.js 服务端代理到 FastAPI 的地址 |
 
@@ -192,6 +205,14 @@ uvicorn app.main:app --reload --port 8001
 ```bash
 cd apps/web
 NEXT_PUBLIC_API_URL= API_PROXY_URL=http://127.0.0.1:8001 npm run dev
+```
+
+新闻分析由调度器在每小时资讯同步后执行。不开启大模型时系统仍会用保守规则生成
+“规则初判”，并降低建议可信度；开启后，模型只负责把新闻整理成固定 JSON，
+最终评分、基金持仓映射和加减仓约束仍由本地程序计算。也可手动触发：
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/news/analyze
 ```
 
 ## Docker Compose

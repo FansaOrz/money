@@ -252,6 +252,7 @@ def _sync_stock_daily() -> None:
 def _sync_news() -> None:
     try:
         from app.services.news import sync_news
+        from app.services.fund_news_analysis import analyze_pending_news
     except ImportError:
         return
     db = SessionLocal()
@@ -260,6 +261,8 @@ def _sync_news() -> None:
             result = sync_news(db)
             record(**_extract_stats(result))
         logger.info("资讯同步完成：%s", result)
+        analysis = analyze_pending_news(db)
+        logger.info("资讯事件分析完成：%s", analysis)
     except Exception:
         logger.exception("资讯同步失败")
         db.rollback()

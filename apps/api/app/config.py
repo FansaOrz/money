@@ -6,7 +6,7 @@
 
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +44,18 @@ class Settings(BaseSettings):
     research_db: str = "./data/research/research.duckdb"
     # 同步日线时每次批量处理的股票数量，避免长时间占用网络
     research_sync_batch_size: int = 200
+
+    # 新闻事件分析在后台调度器中执行，页面请求只读取本地结果。
+    news_analysis_enabled: bool = True
+    news_analysis_lookback_days: int = 30
+    news_analysis_batch_size: int = 100
+
+    # 可选 OpenAI-compatible 大模型。未开启或调用失败时自动使用保守规则分析。
+    news_llm_enabled: bool = False
+    news_llm_base_url: str = "https://api.openai.com/v1"
+    news_llm_api_key: SecretStr | None = None
+    news_llm_model: str = ""
+    news_llm_timeout_seconds: int = 30
 
     @field_validator("cors_origins", mode="before")
     @classmethod

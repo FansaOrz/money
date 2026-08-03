@@ -27,7 +27,7 @@ from app.schemas.funds import (
     FundDetailResponse,
     FundProfileOut,
 )
-from app.services import fund_holdings, quant, quant_discovery
+from app.services import fund_holdings, fund_news_analysis, quant, quant_discovery
 from app.services.fund_data import backfill_fund_nav_history
 from app.services.quant import QuantError
 
@@ -256,6 +256,7 @@ def build_detail(db: Session, code: str, *, refresh: bool = False) -> FundDetail
     metrics = None
     metrics_as_of = None
     advice = None
+    analysis = None
     if instrument is not None:
         nav_count = db.scalar(
             select(func.count(FundNav.id)).where(FundNav.instrument_id == instrument.id)
@@ -276,7 +277,13 @@ def build_detail(db: Session, code: str, *, refresh: bool = False) -> FundDetail
     except QuantError as exc:
         warnings.append(f"量化指标暂不可用：{exc}")
     try:
-        advice = quant.compute_fund_indicators(db, code).advice
+        base_advice = quant.compute_fund_indicators(db, code).advice
+        if base_advice is not None and instrument is not None:
+            advice, analysis = fund_news_analysis.combine_fund_advice(
+                db, instrument, base_advice
+            )
+        else:
+            advice = base_advice
     except QuantError as exc:
         warnings.append(f"趋势建议暂不可用：{exc}")
 
@@ -314,6 +321,7 @@ def build_detail(db: Session, code: str, *, refresh: bool = False) -> FundDetail
         metrics_as_of=metrics_as_of,
         metrics_basis="近1月/3月/1年/3年按自然日期计算，包含现金分红再投资收益",
         advice=advice,
+        analysis=analysis,
         holdings=[
             FundDetailHolding(
                 rank=row.rank,

@@ -60,8 +60,8 @@ import type {
 } from "./types";
 
 const BASE_URL = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/+$/, "");
-// v3：基金收益改为自然日窗口 + 分红再投资口径，淘汰旧的 250/252 点缓存。
-const CACHE_PREFIX = "money:api:v3:";
+// v4：基金详情加入后台新闻分析与综合建议，淘汰旧的纯历史趋势缓存。
+const CACHE_PREFIX = "money:api:v4:";
 const memoryCache = new Map<string, { expiresAt: number; value: unknown }>();
 const inFlight = new Map<string, Promise<unknown>>();
 

@@ -27,8 +27,9 @@ from app.models import (
     FundHolding,
     FundIndustryAllocation,
     FundNav,
+    FundNewsImpact,
     Instrument,
-    NewsItem,
+    NewsEvent,
     Position,
 )
 from app.schemas.quant import (
@@ -1547,46 +1548,63 @@ def comprehensive_research_signals(
                     source="fund_industry_allocations",
                 ))
 
-    # ---- NewsItem 近期相关事件 ----
+    # ---- 已去重、已分析的近期新闻事件 ----
     if holdings:
         news_since = datetime.now() - timedelta(days=NEWS_LOOKBACK_DAYS)
+        holding_ids = [holding["id"] for holding in holdings]
         recent_news = db.execute(
-            select(NewsItem.related_codes, NewsItem.published_at).where(
-                NewsItem.related_codes.is_not(None),
-                NewsItem.published_at.is_not(None),
-                NewsItem.published_at >= news_since,
+            select(
+                FundNewsImpact.instrument_id,
+                FundNewsImpact.signed_score,
+                NewsEvent.latest_published_at,
+            )
+            .join(NewsEvent, NewsEvent.id == FundNewsImpact.event_id)
+            .where(
+                FundNewsImpact.instrument_id.in_(holding_ids),
+                NewsEvent.latest_published_at.is_not(None),
+                NewsEvent.latest_published_at >= news_since,
+                NewsEvent.expires_at.is_not(None),
+                NewsEvent.expires_at >= datetime.now(),
             )
         ).all()
-        news_count: dict[str, int] = {}
+        news_stats: dict[int, dict[str, float | int]] = {}
         latest_news_at: datetime | None = None
-        for related_codes, published_at in recent_news:
+        for instrument_id, signed_score, published_at in recent_news:
             if published_at is not None and (latest_news_at is None or published_at > latest_news_at):
                 latest_news_at = published_at
-            for raw_code in (related_codes or "").split(","):
-                code = raw_code.strip()
-                if code in weight_by_code:
-                    news_count[code] = news_count.get(code, 0) + 1
-        name_by_code = {h["code"]: h["name"] for h in holdings}
+            stat = news_stats.setdefault(instrument_id, {"count": 0, "score": 0.0})
+            stat["count"] = int(stat["count"]) + 1
+            stat["score"] = float(stat["score"]) + float(signed_score)
+        holding_by_id = {holding["id"]: holding for holding in holdings}
         news_as_of = _signal_as_of(latest_news_at)
-        for code, count in sorted(news_count.items(), key=lambda kv: kv[1], reverse=True):
-            if count < 3:
-                break
+        for instrument_id, stat in sorted(
+            news_stats.items(), key=lambda item: abs(float(item[1]["score"])), reverse=True
+        ):
+            holding = holding_by_id.get(instrument_id)
+            if holding is None:
+                continue
+            count, score = int(stat["count"]), float(stat["score"])
+            if count < 2 and abs(score) < 5:
+                continue
+            direction_text = "偏利好" if score >= 5 else "偏利空" if score <= -5 else "影响中性"
+            level = "risk" if score <= -25 else "warning" if score <= -8 else "info"
             signals.append(ResearchSignalItem(
                 category="news",
-                level="warning" if count >= 5 else "info",
+                level=level,
                 scope="fund",
                 message=(
-                    f"{name_by_code[code]}（{code}）近{NEWS_LOOKBACK_DAYS}天出现 {count} 条相关资讯，"
-                    "事件密集，建议关注基本面变化"
+                    f"{holding['name']}（{holding['code']}）近{NEWS_LOOKBACK_DAYS}天有 "
+                    f"{count} 条去重后的有效事件，综合{direction_text}"
                 ),
-                related_codes=[code],
+                related_codes=[holding["code"]],
                 evidence={
-                    "news_count": count,
+                    "event_count": count,
+                    "signed_impact_score": round(score, 4),
                     "lookback_days": NEWS_LOOKBACK_DAYS,
-                    "portfolio_weight": round(weight_by_code[code], 4),
+                    "portfolio_weight": round(weight_by_code[holding["code"]], 4),
                 },
                 as_of=news_as_of,
-                source="news_items",
+                source="fund_news_impacts",
             ))
         if latest_news_at is not None:
             as_of_candidates.append(latest_news_at)

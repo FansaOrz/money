@@ -51,3 +51,13 @@ class NewsSyncResult(NewsSyncStatus):
     """手动触发同步的结果（响应）。"""
 
     errors: list[str] = Field(default_factory=list)
+
+
+class NewsAnalysisResult(ConfiguredBaseModel):
+    """后台新闻事件分析执行结果。"""
+
+    enabled: bool
+    events: int = 0
+    llm_events: int = 0
+    rule_events: int = 0
+    impacts: int = 0

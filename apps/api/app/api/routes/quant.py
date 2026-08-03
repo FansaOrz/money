@@ -25,6 +25,7 @@ from app.schemas.quant import (
     WalkForwardResult,
 )
 from app.services import quant as quant_service
+from app.services import fund_news_analysis
 from app.services import quant_optimizer as optimizer_service
 from app.services import quant_screener as screener_service
 from app.services import quant_validation as validation_service
@@ -38,7 +39,8 @@ router = APIRouter(prefix="/quant", tags=["quant"])
 def fund_indicators(code: str, db: Session = Depends(get_db)) -> FundIndicators:
     """单基金量化指标：20/60/250 日收益、年化波动、最大回撤、夏普、MA、MACD、趋势信号。"""
     try:
-        return quant_service.compute_fund_indicators(db, code)
+        indicators = quant_service.compute_fund_indicators(db, code)
+        return fund_news_analysis.decorate_indicators_advice(db, indicators)
     except QuantError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -65,7 +67,10 @@ def portfolio_metrics(db: Session = Depends(get_db)) -> PortfolioMetricsSummary:
 @router.get("/funds", response_model=list[FundIndicators])
 def fund_metrics(db: Session = Depends(get_db)) -> list[FundIndicators]:
     """返回当前持仓基金的量化指标；样本不足的基金跳过。"""
-    return quant_service.list_fund_indicators(db)
+    return [
+        fund_news_analysis.decorate_indicators_advice(db, item)
+        for item in quant_service.list_fund_indicators(db)
+    ]
 
 
 @router.get("/signals", response_model=SignalListResponse)

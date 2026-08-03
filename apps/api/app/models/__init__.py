@@ -14,6 +14,7 @@ from app.models.instrument import Instrument, InstrumentType
 from app.models.market_index import IndexQuote, MarketIndex
 from app.models.nav_sync_status import NavSyncStatus
 from app.models.news import NewsItem
+from app.models.news_analysis import FundNewsImpact, NewsEvent, NewsEventItem
 from app.models.paper import (
     BacktestRun,
     PaperAccount,
@@ -53,6 +54,7 @@ __all__ = [
     "FundHoldingsSyncStatus",
     "FundIndustryAllocation",
     "FundNav",
+    "FundNewsImpact",
     "FundProfile",
     "FundWarehouseSyncState",
     "Import",
@@ -65,6 +67,8 @@ __all__ = [
     "MarketIndex",
     "NavSyncStatus",
     "NewsItem",
+    "NewsEvent",
+    "NewsEventItem",
     "PaperAccount",
     "PaperHoldingDaily",
     "PaperNavDaily",

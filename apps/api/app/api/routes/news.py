@@ -5,12 +5,14 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.schemas.news import (
+    NewsAnalysisResult,
     NewsItemOut,
     NewsListResponse,
     NewsSyncResult,
     NewsSyncStatus,
 )
 from app.services import news as news_service
+from app.services import fund_news_analysis
 
 router = APIRouter(prefix="/news", tags=["news"])
 
@@ -54,3 +56,9 @@ def list_news(
 def sync_news(db: Session = Depends(get_db)) -> NewsSyncResult:
     """手动触发一次资讯同步（抓取 -> 去重入库）。"""
     return NewsSyncResult(**news_service.sync_news(db))
+
+
+@router.post("/analyze", response_model=NewsAnalysisResult)
+def analyze_news(db: Session = Depends(get_db)) -> NewsAnalysisResult:
+    """分析尚未处理的新闻并写入基金影响；页面请求不会触发大模型。"""
+    return NewsAnalysisResult(**fund_news_analysis.analyze_pending_news(db))
