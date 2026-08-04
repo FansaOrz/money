@@ -568,12 +568,6 @@ def prepare_forward_account(
             f"策略版本已处于 {version.status}，不能重复评估留出集；"
             "参数变化必须创建新策略名/版本"
         )
-    if dict(version.params or {}).get("validation_sha256"):
-        raise StockPaperError(
-            "该研究版本已经评估过完全留出集，禁止重复评估；"
-            "参数或数据变化必须创建新策略版本"
-        )
-
     repository_root = Path(__file__).resolve().parents[4]
     try:
         git_sha = subprocess.run(
@@ -605,6 +599,45 @@ def prepare_forward_account(
             f"{preview}{suffix}；请提交后重新执行"
         )
     params = dict(version.params or {})
+    if params.get("validation_sha256"):
+        if params.get("git_sha") == git_sha:
+            raise StockPaperError(
+                "该研究版本已经评估过完全留出集，禁止重复评估；"
+                "参数或数据变化必须形成新 Git 提交和新策略版本"
+            )
+        try:
+            strategy_lifecycle.transition(
+                db,
+                version.id,
+                "retired",
+                evidence={},
+                actor="system:stock-paper-prepare",
+                reason=(
+                    "已冻结版本未通过晋级，检测到代码提交变化，"
+                    "保留旧证据并创建全新研究版本"
+                ),
+            )
+        except ValueError as exc:
+            raise StockPaperError(str(exc)) from exc
+        successor_params = {
+            key: value
+            for key, value in params.items()
+            if key not in {"validation", "validation_sha256"}
+        }
+        successor_params["supersedes_version_id"] = version.id
+        version = StrategyVersion(
+            name=STRATEGY_NAME,
+            initial_capital=INITIAL_CAPITAL,
+            rebalance_interval=20,
+            fee_rate=_weight(COST.commission_rate),
+            top_n=TOP_N,
+            params=successor_params,
+            status="research",
+        )
+        db.add(version)
+        db.commit()
+        db.refresh(version)
+        params = successor_params
     params.update(
         {
             "git_sha": git_sha,

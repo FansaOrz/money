@@ -410,6 +410,51 @@ def test_portfolio_redistributes_unused_industry_quota() -> None:
     assert all(weight <= 0.20 + 1e-9 for weight in plan.industries.values())
 
 
+def test_portfolio_swaps_same_industry_candidates_to_meet_style_limits() -> None:
+    """Top N 风格偏离时，应换入同业候选，而不是把整个组合清空为现金。"""
+    infos: list[StockInfo] = []
+    scored: list[factors.FactorResult] = []
+    for index in range(40):
+        code = f"{601000 + index:06d}"
+        alternate = index >= 20
+        info = _info(code, "制造")
+        infos.append(info)
+        scored.append(
+            factors.FactorResult(
+                code=code,
+                name=info.name,
+                industry=info.industry,
+                composite=float(40 - index),
+                market_cap=(
+                    100_000_000_000.0 if alternate else 1_000_000_000.0
+                ),
+                float_market_cap=(
+                    100_000_000_000.0 if alternate else 1_000_000_000.0
+                ),
+                size_exposure=1.0 if alternate else -1.0,
+                beta_exposure=0.0,
+                liquidity_exposure=0.0,
+                average_daily_amount=1_000_000_000.0,
+            )
+        )
+
+    plan = strategy.build_portfolio(
+        scored,
+        infos,
+        START + timedelta(days=300),
+        top_n=20,
+        max_industry_weight=1.0,
+        minimum_holdings=20,
+    )
+
+    assert len(plan.target_weights) == 20
+    assert plan.invested_weight == pytest.approx(1.0, abs=1e-5)
+    assert any(int(code) >= 601020 for code in plan.target_weights)
+    deviations = plan.diagnostics["exposure_deviations"]
+    assert abs(deviations["size"]) <= 0.20 + 1e-9
+    assert not any("硬约束无法" in warning for warning in plan.warnings)
+
+
 # ---------------------------------------------------------------------------
 # 回测：成交规则与费用
 # ---------------------------------------------------------------------------

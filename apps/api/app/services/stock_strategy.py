@@ -363,6 +363,8 @@ def build_portfolio(
         industry = universe_industries.get(item.code, item.industry or "未知")
         by_industry.setdefault(industry, []).append(item)
 
+    # 容量上限需要覆盖全部合格候选，而不只是初始 Top N。后续风格中性化
+    # 可能要把同业的高分标的替换为稍低分、但更接近指数暴露的标的。
     stock_weight_limit = {
         item.code: min(
             max_stock_weight,
@@ -375,7 +377,7 @@ def build_portfolio(
                 else max_stock_weight
             ),
         )
-        for item in ranked
+        for item in all_ranked
     }
 
     target: dict[str, float] = {}
@@ -495,6 +497,107 @@ def build_portfolio(
             for code, value in values.items()
         }
 
+    style_tolerances = {"size": 0.20, "beta": 0.15, "liquidity": 0.20}
+    benchmark_style_targets: dict[str, float] = {}
+    for label, exposures in normalized_exposures.items():
+        available = {
+            code: weight
+            for code, weight in benchmark_weights.items()
+            if code in exposures
+        }
+        total = sum(available.values())
+        if total > 0:
+            benchmark_style_targets[label] = (
+                sum(
+                    weight * exposures[code]
+                    for code, weight in available.items()
+                )
+                / total
+            )
+
+    def style_deviations(weights: dict[str, float]) -> dict[str, float]:
+        invested = sum(weights.values())
+        if invested <= 0:
+            return {}
+        return {
+            label: (
+                sum(
+                    weight * exposures[code]
+                    for code, weight in weights.items()
+                    if code in exposures
+                )
+                / invested
+                - benchmark
+            )
+            for label, benchmark in benchmark_style_targets.items()
+            if (exposures := normalized_exposures[label])
+            and all(code in exposures for code in weights)
+        }
+
+    def style_violation_score(deviations: dict[str, float]) -> float:
+        return sum(
+            max(abs(value) - style_tolerances[label], 0.0) ** 2
+            for label, value in deviations.items()
+        )
+
+    # 初始 Top N 往往偏向中小盘或某种流动性风格，仅在已入选股票之间搬
+    # 权重无法接近市值加权指数。用同一行业候选做确定性的局部替换：
+    # 保持持仓数、行业权重和单股权重不变，只在能严格降低超限暴露时换股。
+    # 候选池保留足够深度，同时仍按优化分排序，避免中性化吞噬全部 alpha。
+    candidate_pool = all_ranked[: max(top_n * 8, 200)]
+    scored_lookup = {item.code: item for item in all_ranked}
+    for _round in range(max(len(target) * 4, 1)):
+        current_deviations = style_deviations(target)
+        current_violation = style_violation_score(current_deviations)
+        if current_violation <= 1e-12:
+            break
+        best_swap: tuple[str, str, float, float] | None = None
+        for source, source_weight in sorted(target.items()):
+            source_industry = universe_industries.get(source, "未知")
+            for destination_item in candidate_pool:
+                destination = destination_item.code
+                if destination in target:
+                    continue
+                if (
+                    universe_industries.get(destination, "未知")
+                    != source_industry
+                ):
+                    continue
+                if stock_weight_limit.get(destination, 0.0) + 1e-12 < source_weight:
+                    continue
+                if any(
+                    source not in exposures or destination not in exposures
+                    for exposures in normalized_exposures.values()
+                ):
+                    continue
+                candidate = dict(target)
+                candidate.pop(source)
+                candidate[destination] = source_weight
+                candidate_violation = style_violation_score(
+                    style_deviations(candidate)
+                )
+                improvement = current_violation - candidate_violation
+                if improvement <= 1e-12:
+                    continue
+                factor_loss = max(
+                    optimization_score(scored_lookup[source])
+                    - optimization_score(destination_item),
+                    0.0,
+                )
+                choice = (source, destination, improvement, factor_loss)
+                if best_swap is None or (
+                    improvement > best_swap[2] + 1e-12
+                    or (
+                        abs(improvement - best_swap[2]) <= 1e-12
+                        and factor_loss < best_swap[3]
+                    )
+                ):
+                    best_swap = choice
+        if best_swap is None:
+            break
+        source, destination, _improvement, _factor_loss = best_swap
+        target[destination] = target.pop(source)
+
     # 在同一行业内部搬移权重，实际约束市值/Beta/流动性相对基准偏离；
     # 不改变行业权重，并继续遵守单股上限。
     for _round in range(100):
@@ -519,7 +622,7 @@ def build_portfolio(
                 for code, weight in target.items()
                 if code in exposures
             ) / invested_now
-            tolerance = 0.20 if label != "beta" else 0.15
+            tolerance = style_tolerances[label]
             deviation = portfolio_value - benchmark_value
             if abs(deviation) <= tolerance:
                 continue
@@ -619,7 +722,7 @@ def build_portfolio(
         label: deviation
         for label, deviation in deviations.items()
         if deviation is not None
-        and abs(deviation) > (0.15 if label == "beta" else 0.20)
+        and abs(deviation) > style_tolerances[label]
     }
     if target and exposure_violations:
         plan.warnings.append(
@@ -754,7 +857,7 @@ def build_portfolio(
         "max_adv_participation": max_adv_participation,
         "capacity_constrained_count": sum(
             stock_weight_limit[code] < max_stock_weight - 1e-12
-            for code in stock_weight_limit
+            for code in target
         ),
     }
     for label, deviation in deviations.items():
