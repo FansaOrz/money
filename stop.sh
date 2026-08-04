@@ -32,5 +32,8 @@ stop_process "后端 API" "$DATA_DIR/api.pid"
 stop_process "前端 Web" "$DATA_DIR/web.pid"
 stop_process "每日调度器" "$DATA_DIR/scheduler.pid"
 
+# 调度器中的 A 股日线使用独立限时子进程；异常重启时一并清理，避免重复抓取。
+pkill -f 'python -m app.services.sync_stock_daily_job' 2>/dev/null || true
+
 # 清理脚本 PID 文件之外遗留的 Next.js 服务，避免 3000 端口被旧构建占用。
 pkill -f 'next-server' 2>/dev/null || true

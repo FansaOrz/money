@@ -395,15 +395,22 @@ def coerce_fundamentals(obj: object) -> Fundamentals | None:
 
 # 财务 payload（新浪原始 JSON）中候选中文字段名 → 归一化字段
 _PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
-    "gross_margin": ("销售毛利率(%)", "销售毛利率", "gross_margin", "grossprofit_margin"),
-    "debt_ratio": ("资产负债率(%)", "资产负债率", "debt_ratio", "debt_to_assets"),
+    "gross_margin": (
+        "销售毛利率(%)", "销售毛利率", "gross_margin", "grossprofit_margin",
+        "XSMLL", "sale_gross_margin",
+    ),
+    "debt_ratio": (
+        "资产负债率(%)", "资产负债率", "debt_ratio", "debt_to_assets",
+        "ZCFZL", "assets_debt_ratio",
+    ),
     "net_profit": (
         "净利润(元)", "净利润", "归属于母公司所有者的净利润(元)",
-        "归属于母公司所有者的净利润", "net_profit",
+        "归属于母公司所有者的净利润", "net_profit", "PARENTNETPROFIT",
     ),
     "ocf": (
         "经营活动产生的现金流量净额(元)", "经营活动产生的现金流量净额", "ocf",
     ),
+    "ocf_to_profit": ("ocf_to_profit", "NCO_NETPROFIT"),
 }
 # ROE 列与 payload 的候选键（百分数口径，/100 换算小数）
 _ROE_KEYS = ("净资产收益率(%)", "净资产收益率", "roe", "roe_ttm")
@@ -536,8 +543,35 @@ class SqlStockRepository:
         try:
             from sqlalchemy import select
 
-            rows = self._db.execute(select(code_col, industry_col)).all()  # type: ignore[attr-defined]
-            return {str(code): str(industry) for code, industry in rows if code and industry}
+            source_col = getattr(model, "source", None)
+            if source_col is None:
+                rows = self._db.execute(select(code_col, industry_col)).all()  # type: ignore[attr-defined]
+                return {
+                    str(code): str(industry)
+                    for code, industry in rows
+                    if code and industry
+                }
+            rows = self._db.execute(  # type: ignore[attr-defined]
+                select(code_col, industry_col, source_col)
+            ).all()
+            priority = {
+                "stocktoday_sw2021": 100,
+                "em": 80,
+                "ths": 60,
+                "cninfo_profile": 40,
+                "cninfo": 20,
+            }
+            selected: dict[str, tuple[int, str]] = {}
+            for code, industry, source in rows:
+                if not code or not industry:
+                    continue
+                score = priority.get(str(source), 0)
+                current = selected.get(str(code))
+                if current is None or score > current[0]:
+                    selected[str(code)] = (score, str(industry))
+            return {
+                code: industry for code, (_score, industry) in selected.items()
+            }
         except Exception:  # noqa: BLE001 - 表结构不符预期时降级
             return {}
 
@@ -605,7 +639,7 @@ class SqlStockRepository:
                     volume=volume,
                     amount=amount,
                     suspended=suspended,
-                    raw_return=None,  # 新浪 raw 无涨跌幅列，回测按前收盘计算
+                    raw_return=_to_float(record.get("pct_change")),
                 )
             )
         return bars
@@ -687,6 +721,44 @@ class SqlStockRepository:
             )
             if not research_bars:
                 research_bars = list(exec_bars)
+            elif exec_bars and research_bars[-1].trade_date < exec_bars[-1].trade_date:
+                # 收盘快照先推进 raw；qfq 深度刷新稍后完成。用数据源涨跌幅
+                # 把研究价格链延伸到最新日，避免信号滞后一天。涨跌幅缺失时
+                # 才回退 raw 收盘比（除权日可能有偏差，后续 qfq 刷新会覆盖）。
+                extended = list(research_bars)
+                previous_raw: StockBar | None = None
+                for raw in exec_bars:
+                    if raw.trade_date <= research_bars[-1].trade_date:
+                        previous_raw = raw
+                        continue
+                    change = raw.raw_return
+                    if (
+                        change is None
+                        and previous_raw is not None
+                        and previous_raw.close > 0
+                    ):
+                        change = raw.close / previous_raw.close - 1.0
+                    if change is None:
+                        previous_raw = raw
+                        continue
+                    close = extended[-1].close * (1.0 + change)
+                    scale = close / raw.close if raw.close > 0 else 1.0
+                    extended.append(
+                        StockBar(
+                            code=code,
+                            trade_date=raw.trade_date,
+                            open=raw.open * scale if raw.open is not None else None,
+                            high=raw.high * scale if raw.high is not None else None,
+                            low=raw.low * scale if raw.low is not None else None,
+                            close=close,
+                            volume=raw.volume,
+                            amount=raw.amount,
+                            suspended=raw.suspended,
+                            raw_return=change,
+                        )
+                    )
+                    previous_raw = raw
+                research_bars = extended
             panel[code] = MarketBars(
                 research_bars=tuple(research_bars), exec_bars=tuple(exec_bars)
             )
@@ -777,21 +849,38 @@ class SqlStockRepository:
 
         PIT 口径：仅取 trade_date ≤ as_of 的估值（as_of 为 None 时不过滤），
         避免未来 PE/PB 泄漏进历史打分。"""
-        from sqlalchemy import select
+        from sqlalchemy import and_, func, select
 
         from app.models import StockValuation
 
-        stmt = select(
-            StockValuation.code,
-            StockValuation.trade_date,
-            StockValuation.indicator,
-            StockValuation.value,
+        latest_dates = select(
+            StockValuation.code.label("code"),
+            StockValuation.indicator.label("indicator"),
+            func.max(StockValuation.trade_date).label("trade_date"),
         ).where(
             StockValuation.code.in_(codes),
             StockValuation.indicator.in_(("pe_ttm", "pb")),
         )
         if as_of is not None:
-            stmt = stmt.where(StockValuation.trade_date <= as_of)
+            latest_dates = latest_dates.where(
+                StockValuation.trade_date <= as_of
+            )
+        latest_dates = latest_dates.group_by(
+            StockValuation.code, StockValuation.indicator
+        ).subquery()
+        stmt = select(
+            StockValuation.code,
+            StockValuation.trade_date,
+            StockValuation.indicator,
+            StockValuation.value,
+        ).join(
+            latest_dates,
+            and_(
+                StockValuation.code == latest_dates.c.code,
+                StockValuation.indicator == latest_dates.c.indicator,
+                StockValuation.trade_date == latest_dates.c.trade_date,
+            ),
+        )
         rows = self._db.execute(stmt).all()  # type: ignore[attr-defined]
         latest: dict[str, dict[str, tuple[date, float]]] = {}
         for code, trade_date, indicator, value in rows:
@@ -849,8 +938,15 @@ class SqlStockRepository:
             debt_ratio = _payload_value(row.payload, _PAYLOAD_KEYS["debt_ratio"])
             net_profit = _payload_value(row.payload, _PAYLOAD_KEYS["net_profit"])
             ocf = _payload_value(row.payload, _PAYLOAD_KEYS["ocf"])
-            ocf_to_profit = None
-            if ocf is not None and net_profit is not None and net_profit > 0:
+            ocf_to_profit = _payload_value(
+                row.payload, _PAYLOAD_KEYS["ocf_to_profit"]
+            )
+            if (
+                ocf_to_profit is None
+                and ocf is not None
+                and net_profit is not None
+                and net_profit > 0
+            ):
                 ocf_to_profit = ocf / net_profit
             entry = valuations.get(row.code, {})
             ep = 1.0 / entry["pe_ttm"][1] if "pe_ttm" in entry else None

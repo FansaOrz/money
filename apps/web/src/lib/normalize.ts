@@ -1251,6 +1251,8 @@ export function normalizeNews(
 /* ==================== 模拟交易（虚拟盘，非真实交易） ==================== */
 
 export interface PaperSummaryView {
+  strategyName: string | null;
+  strategyStatus: string | null;
   initialCapital: number | null;
   totalValue: number | null;
   cash: number | null;
@@ -1263,6 +1265,7 @@ export interface PaperSummaryView {
   tradeCount: number | null;
   benchmarkReturn: unknown;
   asOf: string | null;
+  warnings: string[];
 }
 
 export function normalizePaperSummary(
@@ -1274,9 +1277,17 @@ export function normalizePaperSummary(
   );
   const marketValue = toNumber(raw.market_value ?? raw.position_value);
   const cashRaw = toNumber(raw.cash ?? raw.cash_available);
-  const initialCapital = toNumber(raw.initial_capital);
+  const initialCapital = toNumber(raw.initial_capital ?? raw.strategy?.initial_capital);
   const totalProfit = toNumber(raw.total_profit ?? raw.profit);
   return {
+    strategyName:
+      typeof raw.strategy?.name === "string" && raw.strategy.name
+        ? raw.strategy.name
+        : null,
+    strategyStatus:
+      typeof raw.strategy?.status === "string" && raw.strategy.status
+        ? raw.strategy.status
+        : null,
     initialCapital,
     totalValue,
     cash: cashRaw ?? (totalValue !== null && marketValue !== null ? totalValue - marketValue : null),
@@ -1290,7 +1301,10 @@ export function normalizePaperSummary(
     positionCount: toNumber(raw.position_count),
     tradeCount: toNumber(raw.trade_count),
     benchmarkReturn: raw.benchmark_return_rate ?? raw.benchmark_return ?? null,
-    asOf: raw.as_of ?? raw.date ?? raw.updated_at ?? null,
+    asOf: raw.as_of ?? raw.date ?? raw.updated_at ?? raw.last_run_date ?? null,
+    warnings: Array.isArray(raw.warnings)
+      ? raw.warnings.filter((w): w is string => typeof w === "string" && w.length > 0)
+      : [],
   };
 }
 
@@ -2379,16 +2393,16 @@ export function normalizeStockUniverse(
   raw: StockUniverseResponse | StockUniverseItem[] | null | undefined
 ): { name: string | null; items: StockListItemView[]; industries: string[]; asOf: string | null } {
   const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const list = pickList<StockUniverseItem>(raw, ["items", "stocks"]);
+  const list = pickList<StockUniverseItem>(raw, ["items", "stocks", "members"]);
   const codes = Array.isArray(obj.codes) ? obj.codes.filter((c): c is string => typeof c === "string") : [];
   const items: StockListItemView[] =
     list.length > 0
       ? list.map((s, i) => {
-          const code = s.code ?? "—";
+          const code = s.code ?? s.stock_code ?? "—";
           return {
-            key: String(s.code ?? i),
+            key: String(s.code ?? s.stock_code ?? i),
             code,
-            name: s.name ?? code,
+            name: s.name ?? s.stock_name ?? code,
             industry: s.industry ?? s.sector ?? "—",
             market: s.market ?? "—",
           };
@@ -2488,7 +2502,7 @@ function normalizeStockFactorRow(f: StockFactorItem, i: number): StockFactorRowV
     name: f.name ?? code,
     industry: f.industry ?? f.sector ?? "—",
     market: f.market ?? "—",
-    compositeScore: toNumber(f.composite_score ?? f.score),
+    compositeScore: toNumber(f.composite_score ?? f.composite ?? f.score),
     rank: toNumber(f.rank),
     percentile: pctRaw === null ? null : Math.abs(pctRaw) <= 1 ? pctRaw * 100 : pctRaw,
     momentum: toNumber(f.momentum),
@@ -2510,7 +2524,7 @@ function normalizeStockFactorRow(f: StockFactorItem, i: number): StockFactorRowV
 export function normalizeStockFactors(
   raw: StockFactorsResponse | StockFactorItem[] | null | undefined
 ): StockFactorsView {
-  const list = pickList<StockFactorItem>(raw, ["items", "factors", "results"]);
+  const list = pickList<StockFactorItem>(raw, ["items", "factors", "results", "rows"]);
   const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   return {
     asOf: typeof obj.as_of === "string" ? obj.as_of : null,

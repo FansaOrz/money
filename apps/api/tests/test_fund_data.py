@@ -17,7 +17,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import FundNav, Instrument, NavSyncStatus
+from app.models import Account, FundNav, Instrument, NavSyncStatus, Position
 from app.services import fund_data
 from app.services.fund_data import (
     PAGE_SIZE,
@@ -26,6 +26,7 @@ from app.services.fund_data import (
     fetch_nav_history_fast,
     fetch_nav_history_with_fallback,
     resolve_window,
+    sync_fund_navs,
     sync_fund_nav_history,
     upsert_nav_rows,
 )
@@ -618,3 +619,48 @@ class TestSyncFundNavHistory:
         assert seen["years"] == 1
         sync_fund_nav_history(db_session, days=9999)
         assert seen["years"] == 5
+
+
+def test_sync_fund_navs_held_only_skips_unowned_funds(
+    db_session: Session,
+    instrument: Instrument,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """晚间快速同步只请求实际持仓，不遍历全市场基金目录。"""
+    unowned = Instrument(code="000001", name="未持有基金")
+    account = Account(name="测试账户")
+    db_session.add_all([unowned, account])
+    db_session.flush()
+    db_session.add(
+        Position(
+            account_id=account.id,
+            instrument_id=instrument.id,
+            shares=Decimal("100"),
+            cost=Decimal("100"),
+        )
+    )
+    db_session.commit()
+    requested: list[str] = []
+
+    def fake_latest(code: str, timeout: int = 10) -> dict:
+        requested.append(code)
+        return {
+            "nav_date": date(2026, 8, 3),
+            "unit_nav": Decimal("1.1"),
+            "accumulated_nav": Decimal("1.1"),
+            "daily_growth_rate": Decimal("1.0"),
+            "source": "test",
+        }
+
+    monkeypatch.setattr(fund_data, "fetch_latest_nav", fake_latest)
+    result = sync_fund_navs(db_session, held_only=True)
+
+    assert requested == [instrument.code]
+    assert result["held_only"] is True
+    assert result["total_funds"] == 1
+    position = db_session.scalar(
+        select(Position).where(Position.instrument_id == instrument.id)
+    )
+    assert position is not None
+    assert position.nav_date == date(2026, 8, 3)
+    assert position.market_value == Decimal("110.00")

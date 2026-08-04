@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,7 @@ from app.models import (
     StockValuation,
 )
 from app.services.research import ak_fetch, parquet_store
+from app.timezone import now_cn
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +275,137 @@ def parse_sina_daily_frame(code: str, frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
+def parse_eastmoney_daily_frame(code: str, frame: pd.DataFrame) -> pd.DataFrame:
+    """把东方财富 stock_zh_a_hist 中文列归一化为标准日线。
+
+    东方财富“成交量”口径为手，落湖统一换算为股（×100）；成交额为元。
+    """
+    records: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+        trade_date = _to_date(row.get("日期")) or _to_date(row.get("date"))
+        close = _to_float(row.get("收盘"))
+        if close is None:
+            close = _to_float(row.get("close"))
+        if trade_date is None or close is None:
+            continue
+        volume_lots = _to_float(row.get("成交量"))
+        if volume_lots is None:
+            volume_lots = _to_float(row.get("volume"))
+        pct_change = _to_float(row.get("涨跌幅"))
+        if pct_change is None:
+            pct_change = _to_float(row.get("pct_change"))
+        open_price = _to_float(row.get("开盘"))
+        high = _to_float(row.get("最高"))
+        low = _to_float(row.get("最低"))
+        amount = _to_float(row.get("成交额"))
+        turnover = _to_float(row.get("换手率"))
+        records.append(
+            {
+                "code": code,
+                "trade_date": trade_date,
+                "open": open_price if open_price is not None else _to_float(row.get("open")),
+                "high": high if high is not None else _to_float(row.get("high")),
+                "low": low if low is not None else _to_float(row.get("low")),
+                "close": close,
+                "volume": int(volume_lots * 100) if volume_lots is not None else None,
+                "amount": amount if amount is not None else _to_float(row.get("amount")),
+                "outstanding_share": None,
+                "turnover": turnover
+                if turnover is not None
+                else _to_float(row.get("turnover")),
+                "pct_change": pct_change / 100.0 if pct_change is not None else None,
+            }
+        )
+    return pd.DataFrame.from_records(
+        records,
+        columns=[
+            "code",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+            "outstanding_share",
+            "turnover",
+            "pct_change",
+        ],
+    )
+
+
+def parse_tencent_daily_frame(code: str, frame: pd.DataFrame) -> pd.DataFrame:
+    """把腾讯 stock_zh_a_hist_tx 日线归一化为标准列。
+
+    当前 AKShare 腾讯适配器的 volume 比原始“股”口径多乘了 100，
+    以 amount/price 和换手率交叉核对后在这里除回 100。
+    """
+    records: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+        trade_date = _to_date(row.get("date"))
+        close = _to_float(row.get("close"))
+        if trade_date is None or close is None:
+            continue
+        volume = _to_float(row.get("volume"))
+        records.append(
+            {
+                "code": code,
+                "trade_date": trade_date,
+                "open": _to_float(row.get("open")),
+                "high": _to_float(row.get("high")),
+                "low": _to_float(row.get("low")),
+                "close": close,
+                "volume": int(volume / 100) if volume is not None else None,
+                "amount": _to_float(row.get("amount")),
+                "outstanding_share": None,
+                "turnover": _to_float(row.get("turnover")),
+                "pct_change": None,
+            }
+        )
+    return pd.DataFrame.from_records(
+        records,
+        columns=[
+            "code",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+            "outstanding_share",
+            "turnover",
+            "pct_change",
+        ],
+    )
+
+
+def _fetch_daily_with_fallback(
+    code: str, *, adjust: str, start_date: date | None
+) -> tuple[pd.DataFrame | None, str | None]:
+    """新浪主源，依次回退东方财富、腾讯，并返回实际来源。"""
+    sina = ak_fetch.fetch_stock_daily_sina(sina_symbol(code), adjust=adjust)
+    if sina is not None:
+        return parse_sina_daily_frame(code, sina), "sina"
+    eastmoney = ak_fetch.fetch_stock_daily_eastmoney(
+        code,
+        start_date=(start_date or date(1990, 1, 1)).strftime("%Y%m%d"),
+        end_date=date.today().strftime("%Y%m%d"),
+        adjust=adjust,
+    )
+    if eastmoney is not None:
+        return parse_eastmoney_daily_frame(code, eastmoney), "eastmoney"
+    tencent = ak_fetch.fetch_stock_daily_tencent(
+        sina_symbol(code),
+        start_date=(start_date or date(1990, 1, 1)).strftime("%Y%m%d"),
+        end_date=date.today().strftime("%Y%m%d"),
+        adjust=adjust,
+    )
+    if tencent is not None:
+        return parse_tencent_daily_frame(code, tencent), "tencent"
+    return None, None
+
+
 def _sync_one_daily(
     db: Session,
     code: str,
@@ -285,18 +417,25 @@ def _sync_one_daily(
 ) -> tuple[bool, str | None]:
     """同步单只股票日线。返回 (是否成功, 错误信息)。"""
     raw_frame: pd.DataFrame | None = None
+    sources: list[str] = []
     if fetch_raw:
-        fetched = ak_fetch.fetch_stock_daily_sina(sina_symbol(code), adjust="")
-        if fetched is None:
-            return False, "raw 行情抓取失败"
-        raw_frame = parse_sina_daily_frame(code, fetched)
+        raw_frame, raw_source = _fetch_daily_with_fallback(
+            code, adjust="", start_date=start_date
+        )
+        if raw_frame is None:
+            return False, "raw 行情抓取失败（新浪、东方财富与腾讯均不可用）"
+        if raw_source:
+            sources.append(f"raw:{raw_source}")
         if start_date is not None and not raw_frame.empty:
             raw_frame = raw_frame[raw_frame["trade_date"] >= start_date]
 
     if fetch_qfq:
-        fetched_qfq = ak_fetch.fetch_stock_daily_sina(sina_symbol(code), adjust="qfq")
-        if fetched_qfq is not None:
-            qfq_frame = parse_sina_daily_frame(code, fetched_qfq)
+        qfq_frame, qfq_source = _fetch_daily_with_fallback(
+            code, adjust="qfq", start_date=start_date
+        )
+        if qfq_frame is not None:
+            if qfq_source:
+                sources.append(f"qfq:{qfq_source}")
             if start_date is not None and not qfq_frame.empty:
                 qfq_frame = qfq_frame[qfq_frame["trade_date"] >= start_date]
             if not qfq_frame.empty:
@@ -320,6 +459,7 @@ def _sync_one_daily(
         bar.rows = rows if rows else total_rows
         bar.parquet_path = str(parquet_store.daily_path(code, root=root))
         bar.available_at = datetime.now(UTC)
+        bar.source = ",".join(sources) or "unknown"
         bar.last_error = None
     elif fetch_raw:
         # 抓到空数据：可能是新股/停牌，不算失败但也不伪造断点
@@ -400,11 +540,19 @@ def sync_stock_daily(
     - 单只失败记入 failed 与 StockDailyBar.last_error，不中断整体；
       每只股票处理后进度（processed/total/updated/failed/last_code）落 stock_sync_state。
     """
+    previous = db.get(StockSyncState, "daily")
+    previous_last_code = previous.last_code if previous is not None else None
+    previous_status = previous.status if previous is not None else None
     state = _begin_task(db, "daily")
-    prev = db.get(StockSyncState, "daily")
     if codes is None:
         batch_size = limit if limit is not None and limit > 0 else get_settings().research_sync_batch_size
-        resume_after = prev.last_code if (resume and prev.failed > 0) else None
+        resume_after = (
+            previous_last_code
+            if resume
+            and previous_last_code
+            and previous_status in {"running", "partial", "failed"}
+            else None
+        )
         codes = _select_daily_batch(db, batch_size, resume_after=resume_after)
         if not codes and resume_after is not None:
             # 恢复位点之后已无标的：本轮视为结束，开启新一轮从头滚
@@ -461,6 +609,192 @@ def sync_stock_daily(
         "updated": updated,
         "failed": failed,
         "last_code": None if wrapped else last_code,
+        "errors": errors,
+    }
+
+
+def sync_stock_market_close(
+    db: Session,
+    *,
+    trade_date: date | None = None,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """用东方财富全市场快照快速落当日 raw 日线。
+
+    该任务只负责在收盘后一次性推进当日 OHLCV，保证信号与模拟盘拥有统一
+    数据日；逐股新浪/东方财富历史同步仍负责深度历史与 qfq 校正。
+    """
+    state = _begin_task(db, "market_close")
+    if trade_date is None:
+        now = now_cn()
+        calendar = ak_fetch.fetch_trade_calendar_sina()
+        if calendar is None:
+            detail = "交易日历不可用，为避免写入错误日期，本次收盘快照跳过"
+            _finish_task(db, state, status="failed", detail=detail)
+            return {
+                "task": "market_close",
+                "status": "failed",
+                "total": 0,
+                "updated": 0,
+                "failed": 1,
+                "errors": [detail],
+            }
+        calendar_days = {
+            parsed
+            for value in calendar.to_numpy().ravel()
+            if (parsed := _to_date(value)) is not None
+        }
+        if now.date() not in calendar_days:
+            detail = f"{now.date().isoformat()} 不是沪深交易日，收盘快照跳过"
+            _finish_task(db, state, status="paused", detail=detail)
+            return {
+                "task": "market_close",
+                "status": "paused",
+                "total": 0,
+                "updated": 0,
+                "failed": 0,
+                "errors": [detail],
+            }
+        if now.time() < time(15, 10):
+            detail = "尚未到北京时间 15:10，为避免写入盘中快照，本次跳过"
+            _finish_task(db, state, status="paused", detail=detail)
+            return {
+                "task": "market_close",
+                "status": "paused",
+                "total": 0,
+                "updated": 0,
+                "failed": 0,
+                "errors": [detail],
+            }
+        day = now.date()
+    else:
+        # 显式日期只用于研究重放和测试，调用方对日期负责。
+        day = trade_date
+
+    frame = ak_fetch.fetch_stock_spot_eastmoney()
+    spot_source = "eastmoney_spot"
+    volume_multiplier = 100
+    if frame is None:
+        frame = ak_fetch.fetch_stock_spot_sina()
+        spot_source = "sina_spot"
+        volume_multiplier = 1
+    if frame is None:
+        _finish_task(
+            db,
+            state,
+            status="failed",
+            detail="东方财富与新浪全市场收盘快照均不可用",
+        )
+        return {
+            "task": "market_close",
+            "status": "failed",
+            "total": 0,
+            "updated": 0,
+            "failed": 1,
+            "errors": ["stock_zh_a_spot_em 与 stock_zh_a_spot 均不可用"],
+        }
+    # 前向平台默认只需沪深300+中证500；若尚未同步指数成分才退回全市场。
+    tracked_codes = set(
+        db.scalars(
+            select(IndexConstituent.stock_code).where(
+                IndexConstituent.index_code.in_(("000300", "000905"))
+            )
+        ).all()
+    )
+    master_codes = tracked_codes or set(db.scalars(select(StockMaster.code)).all())
+    updated = 0
+    failed = 0
+    errors: list[str] = []
+    for _, record in frame.iterrows():
+        raw_code = record.get("代码")
+        raw_text = str(raw_code).strip() if raw_code is not None else ""
+        digits = "".join(char for char in raw_text if char.isdigit())
+        code = digits[-6:] if len(digits) >= 6 else digits.zfill(6)
+        if code not in master_codes:
+            continue
+        close = _to_float(record.get("最新价"))
+        if close is None or close <= 0:
+            continue
+        volume_lots = _to_float(record.get("成交量"))
+        pct_change = _to_float(record.get("涨跌幅"))
+        row = pd.DataFrame.from_records(
+            [
+                {
+                    "code": code,
+                    "trade_date": day,
+                    "open": _to_float(record.get("今开")),
+                    "high": _to_float(record.get("最高")),
+                    "low": _to_float(record.get("最低")),
+                    "close": close,
+                    "volume": int(volume_lots * volume_multiplier)
+                    if volume_lots is not None
+                    else None,
+                    "amount": _to_float(record.get("成交额")),
+                    "outstanding_share": None,
+                    "turnover": _to_float(record.get("换手率")),
+                    "pct_change": pct_change / 100.0
+                    if pct_change is not None
+                    else None,
+                }
+            ]
+        )
+        try:
+            parquet_store.write_daily(
+                code,
+                row,
+                layer=parquet_store.DAILY_RAW,
+                root=root,
+                incremental=True,
+            )
+            meta = db.get(StockDailyBar, code)
+            if meta is None:
+                meta = StockDailyBar(code=code, rows=0)
+                db.add(meta)
+            meta.first_trade_date = min(
+                [value for value in (meta.first_trade_date, day) if value is not None]
+            )
+            meta.last_trade_date = max(
+                [value for value in (meta.last_trade_date, day) if value is not None]
+            )
+            meta.rows = max(int(meta.rows or 0), 1)
+            meta.parquet_path = str(parquet_store.daily_path(code, root=root))
+            meta.available_at = datetime.now(UTC)
+            meta.source = spot_source
+            meta.last_error = None
+            updated += 1
+        except Exception as exc:  # noqa: BLE001 - 单股落盘失败不影响全市场
+            failed += 1
+            errors.append(f"{code}: {exc}")
+        if (updated + failed) % 200 == 0:
+            db.commit()
+            _progress_task(
+                db,
+                state,
+                processed=updated + failed,
+                total=len(frame),
+                updated=updated,
+                failed=failed,
+                last_code=code,
+            )
+    db.commit()
+    status = _final_status(updated, failed, processed=updated + failed)
+    _finish_task(
+        db,
+        state,
+        total=updated + failed,
+        updated=updated,
+        failed=failed,
+        detail="; ".join(errors[:20]) or None,
+        status=status,
+        clear_last_code=True,
+    )
+    return {
+        "task": "market_close",
+        "status": status,
+        "total": updated + failed,
+        "updated": updated,
+        "failed": failed,
+        "data_date": day.isoformat(),
         "errors": errors,
     }
 

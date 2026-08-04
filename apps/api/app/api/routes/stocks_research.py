@@ -9,6 +9,7 @@ from datetime import date
 from statistics import fmean
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -228,6 +229,88 @@ def compute_factors(
         methodology=FACTOR_METHODOLOGY,
         warnings=warnings,
     )
+
+
+@router.get("/factors", response_model=StockFactorsResponse)
+def compute_factors_get(
+    universe: str | None = Query(default=None, description="hs300 | zz500 | all"),
+    industry: str | None = Query(default=None),
+    search: str | None = Query(default=None, description="代码或名称关键词"),
+    limit: int = Query(default=500, ge=1, le=500),
+    db: Session = Depends(get_db),
+    repository: StockRepository = Depends(get_stock_repository),
+) -> StockFactorsResponse:
+    """筛选页入口：自动使用最新行情日并复用正式因子引擎。"""
+    from app.models import IndexConstituent
+
+    calendar = repository.trade_calendar(None, None)
+    if not calendar.days:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="尚无股票交易日历"
+        )
+    aliases = {
+        "hs300": "000300",
+        "csi300": "000300",
+        "000300": "000300",
+        "zz500": "000905",
+        "csi500": "000905",
+        "000905": "000905",
+    }
+    normalized = (universe or "").strip().lower()
+    candidate_codes: list[str] | None = None
+    if normalized and normalized != "all":
+        index_code = aliases.get(normalized)
+        if index_code is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="universe 仅支持 hs300 / zz500 / all",
+            )
+        candidate_codes = list(
+            db.scalars(
+                select(IndexConstituent.stock_code)
+                .where(IndexConstituent.index_code == index_code)
+                .order_by(IndexConstituent.stock_code)
+            ).all()
+        )
+    elif not normalized:
+        candidate_codes = list(
+            db.scalars(
+                select(IndexConstituent.stock_code)
+                .where(IndexConstituent.index_code.in_(("000300", "000905")))
+                .distinct()
+                .order_by(IndexConstituent.stock_code)
+            ).all()
+        ) or None
+
+    if industry or search:
+        infos = repository.list_stocks(candidate_codes)
+        needle = (search or "").strip().lower()
+        candidate_codes = [
+            item.code
+            for item in infos
+            if (not industry or item.industry == industry)
+            and (
+                not needle
+                or needle in item.code.lower()
+                or needle in item.name.lower()
+            )
+        ]
+        if not candidate_codes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="筛选条件下没有候选股票",
+            )
+    result = compute_factors(
+        StockFactorsRequest(
+            as_of=calendar.days[-1].isoformat(),
+            candidate_codes=candidate_codes,
+        ),
+        repository,
+    )
+    was_longer = len(result.rows) > limit
+    result.rows = result.rows[:limit]
+    result.truncated = result.truncated or was_longer
+    return result
 
 
 # ---------------------------------------------------------------------------

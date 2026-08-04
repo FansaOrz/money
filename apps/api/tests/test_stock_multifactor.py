@@ -338,6 +338,32 @@ def test_portfolio_top_n_and_ranking() -> None:
     assert industries == {"银行", "公用"}
 
 
+def test_portfolio_redistributes_unused_industry_quota() -> None:
+    """30 只分散标的有足够风险容量时，应接近满仓而非因未覆盖行业大量留现。"""
+    infos = [
+        _info(f"{600100 + index:06d}", f"行业{index // 3}")
+        for index in range(30)
+    ]
+    scored = [
+        factors.FactorResult(
+            code=info.code,
+            name=info.name,
+            industry=info.industry,
+            composite=30 - index,
+        )
+        for index, info in enumerate(infos)
+    ]
+
+    plan = strategy.build_portfolio(
+        scored, infos, START + timedelta(days=300), top_n=30
+    )
+
+    assert 20 <= len(plan.target_weights) <= 30
+    assert plan.invested_weight == pytest.approx(1.0, abs=1e-5)
+    assert all(weight <= 0.05 + 1e-9 for weight in plan.target_weights.values())
+    assert all(weight <= 0.20 + 1e-9 for weight in plan.industries.values())
+
+
 # ---------------------------------------------------------------------------
 # 回测：成交规则与费用
 # ---------------------------------------------------------------------------

@@ -1,0 +1,254 @@
+"""A股规则策略前向模拟：就绪门槛、T+1、幂等和账本闭环。"""
+
+from datetime import date, datetime, time, timedelta
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models import (
+    IndexConstituent,
+    StockDailyBar,
+    StockFinancialIndicator,
+    StockIndustry,
+    StockMaster,
+    StockPaperNavDaily,
+    StockPaperRun,
+    StockPaperSignal,
+    StockPaperTrade,
+    StockValuation,
+)
+from app.services import stock_paper
+from app.services.stock_repository import Fundamentals, StockBar, StockInfo, TradeCalendar
+from app.timezone import CN_TZ
+
+
+class ForwardRepository:
+    def __init__(self, infos: list[StockInfo], bars: dict[str, list[StockBar]]) -> None:
+        self.infos = infos
+        self.bars = bars
+
+    def list_stocks(self, codes: list[str] | None = None) -> list[StockInfo]:
+        wanted = set(codes) if codes else None
+        return [item for item in self.infos if wanted is None or item.code in wanted]
+
+    def daily_bars(
+        self,
+        codes: list[str] | None = None,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> list[StockBar]:
+        wanted = set(codes) if codes else set(self.bars)
+        return [
+            bar
+            for code in wanted
+            for bar in self.bars.get(code, [])
+            if (start is None or bar.trade_date >= start)
+            and (end is None or bar.trade_date <= end)
+        ]
+
+    def market_bars(self, codes, start=None, end=None):
+        from app.services.stock_repository import MarketBars
+
+        result = {}
+        for code in codes:
+            rows = tuple(
+                bar
+                for bar in self.bars.get(code, [])
+                if (start is None or bar.trade_date >= start)
+                and (end is None or bar.trade_date <= end)
+            )
+            result[code] = MarketBars(research_bars=rows, exec_bars=rows)
+        return result
+
+    def fundamentals(
+        self, codes: list[str] | None = None, as_of: date | None = None
+    ) -> list[Fundamentals]:
+        return []
+
+    def trade_calendar(
+        self, start: date | None, end: date | None
+    ) -> TradeCalendar:
+        days = sorted(
+            {
+                bar.trade_date
+                for rows in self.bars.values()
+                for bar in rows
+                if (start is None or bar.trade_date >= start)
+                and (end is None or bar.trade_date <= end)
+            }
+        )
+        return TradeCalendar(tuple(days))
+
+    def index_bars(self, index_code: str, start=None, end=None):
+        return []
+
+    def name_histories(self, codes):
+        return {}
+
+
+def _seed_trial(db: Session) -> tuple[ForwardRepository, date]:
+    first_day = date(2025, 1, 1)
+    signal_day = first_day + timedelta(days=299)
+    infos: list[StockInfo] = []
+    bars: dict[str, list[StockBar]] = {}
+    for index in range(50):
+        code = f"{600000 + index:06d}"
+        industry = "制造" if index < 25 else "消费"
+        infos.append(StockInfo(code=code, name=f"股票{index}", industry=industry))
+        db.add(StockMaster(code=code, name=f"股票{index}", exchange="sh"))
+        db.add(
+            IndexConstituent(
+                index_code="000300" if index < 25 else "000905",
+                stock_code=code,
+                stock_name=f"股票{index}",
+            )
+        )
+        db.add(StockIndustry(code=code, source="test", industry_name=industry))
+        db.add(
+            StockFinancialIndicator(
+                code=code,
+                report_date=date(2024, 12, 31),
+                roe=10,
+                payload="{}",
+                source="test",
+            )
+        )
+        db.add(
+            StockDailyBar(
+                code=code,
+                first_trade_date=first_day,
+                last_trade_date=signal_day,
+                rows=300,
+                source="test",
+            )
+        )
+        db.add(
+            StockValuation(
+                code=code,
+                trade_date=signal_day,
+                indicator="pe_ttm",
+                value=12,
+                source="test",
+            )
+        )
+        db.add(
+            StockValuation(
+                code=code,
+                trade_date=signal_day,
+                indicator="pb",
+                value=1.5,
+                source="test",
+            )
+        )
+        series = []
+        for offset in range(300):
+            day = first_day + timedelta(days=offset)
+            close = 10.0 * (1.0 + (0.0002 + index * 0.00001)) ** offset
+            series.append(
+                StockBar(
+                    code=code,
+                    trade_date=day,
+                    open=close,
+                    high=close * 1.01,
+                    low=close * 0.99,
+                    close=close,
+                    volume=1_000_000,
+                    amount=100_000_000,
+                )
+            )
+        bars[code] = series
+    db.commit()
+    return ForwardRepository(infos, bars), signal_day
+
+
+def test_readiness_blocks_empty_database(db_session: Session) -> None:
+    readiness = stock_paper.get_readiness(db_session)
+    assert readiness.ready is False
+    assert readiness.blockers
+
+
+def test_forward_cycle_generates_then_executes_t_plus_one(
+    db_session: Session, monkeypatch
+) -> None:
+    repository, signal_day = _seed_trial(db_session)
+    monkeypatch.setattr(stock_paper, "EXPECTED_UNIVERSE_COUNT", 50)
+    monkeypatch.setattr(stock_paper, "load_repository", lambda _db: repository)
+    monkeypatch.setattr(
+        stock_paper,
+        "now_cn",
+        lambda: datetime.combine(signal_day, time(16), tzinfo=CN_TZ),
+    )
+
+    first = stock_paper.run_cycle(db_session)
+    assert first.run_date == signal_day.isoformat()
+    assert first.signal_generated is True
+    assert first.trade_count == 0
+    signal = db_session.scalar(select(StockPaperSignal))
+    assert signal is not None
+    assert signal.status == "pending"
+    assert signal.signal_date == signal_day
+
+    # 同一行情日重跑幂等，不重复生成信号/净值。
+    repeated = stock_paper.run_cycle(db_session)
+    assert repeated.skipped is True
+    assert db_session.query(StockPaperRun).count() == 1
+    assert db_session.query(StockPaperNavDaily).count() == 1
+
+    next_day = signal_day + timedelta(days=1)
+    for code, rows in repository.bars.items():
+        previous = rows[-1]
+        close = previous.close * 1.001
+        rows.append(
+            StockBar(
+                code=code,
+                trade_date=next_day,
+                open=close,
+                high=close * 1.01,
+                low=close * 0.99,
+                close=close,
+                volume=1_000_000,
+                amount=100_000_000,
+            )
+        )
+    for row in db_session.scalars(select(StockDailyBar)).all():
+        row.last_trade_date = next_day
+        row.rows += 1
+    db_session.commit()
+
+    second = stock_paper.run_cycle(db_session)
+    assert second.run_date == next_day.isoformat()
+    assert second.trade_count > 0
+    assert second.rebalanced is True
+    db_session.refresh(signal)
+    assert signal.status == "executed"
+    assert signal.executed_at == next_day
+    assert db_session.query(StockPaperTrade).count() == second.trade_count
+    assert db_session.query(StockPaperNavDaily).count() == 2
+
+    summary = stock_paper.get_summary(db_session)
+    assert summary.started is True
+    assert summary.strategy is not None
+    assert summary.strategy.candidate_count == 50
+    assert summary.metrics.trading_days == 2
+    assert summary.positions
+
+
+def test_late_initialization_never_backfills_missed_open(
+    db_session: Session, monkeypatch
+) -> None:
+    repository, signal_day = _seed_trial(db_session)
+    monkeypatch.setattr(stock_paper, "EXPECTED_UNIVERSE_COUNT", 50)
+    monkeypatch.setattr(stock_paper, "load_repository", lambda _db: repository)
+    created_day = signal_day + timedelta(days=1)
+    monkeypatch.setattr(
+        stock_paper,
+        "now_cn",
+        lambda: datetime.combine(created_day, time(12), tzinfo=CN_TZ),
+    )
+
+    stock_paper.run_cycle(db_session)
+
+    signal = db_session.scalar(select(StockPaperSignal))
+    assert signal is not None
+    assert signal.signal_date == signal_day
+    assert signal.execute_on == created_day + timedelta(days=1)

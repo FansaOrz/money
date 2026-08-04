@@ -106,11 +106,12 @@ def paper_signals(
 def paper_run(
     payload: PaperRunRequest | None = None, db: Session = Depends(get_db)
 ) -> PaperRunResponse:
-    """手动触发一次每日模拟交易循环（幂等：同日重跑直接返回已有结果）。
+    """手动触发一次前向模拟交易循环（同一数据日重跑不会重复记账）。
 
     流程：调用 screener 取全候选信号；到调仓日（每 20 个交易日一次，
     首次运行为建仓日）固化信号快照并按 top10 target_weight 虚拟成交；
-    按当日 FundNav 估值落库；生成候选池等权基准。不产生任何真实下单。
+    按筛选器实际使用的最新净值日估值落库；生成候选池等权基准。
+    不产生任何真实下单。
     """
     run_date_str = payload.run_date if payload else None
     try:

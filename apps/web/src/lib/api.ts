@@ -44,6 +44,9 @@ import type {
   StockDetail,
   StockFactorsResponse,
   StockMasterResponse,
+  StockPaperRunResult,
+  StockPaperSummary,
+  StockPaperTrade,
   StockPricePoint,
   StockQuote,
   StockFinancials,
@@ -99,6 +102,8 @@ async function parseErrorBody(res: Response): Promise<string> {
 
 function cacheTtl(path: string): number {
   if (path.startsWith("/api/sync/status")) return 15_000;
+  // 持仓净值晚间会分批更新，短缓存确保“今日收益”及时反映后台同步结果。
+  if (path.startsWith("/api/portfolio/") || path.startsWith("/api/positions")) return 15_000;
   if (path.startsWith("/api/news")) return 60_000;
   if (
     path.startsWith("/api/quant/") ||
@@ -410,6 +415,13 @@ export const api = {
     return [];
   },
   paperRun: () => postJson<PaperRunResult>("/api/paper/run"),
+  /* A股规则策略：两个月前向模拟（与基金模拟盘独立） */
+  stockPaperSummary: () =>
+    getJson<StockPaperSummary>("/api/stocks/paper/summary"),
+  stockPaperTrades: () =>
+    getJson<StockPaperTrade[]>("/api/stocks/paper/trades"),
+  stockPaperRun: () =>
+    postJson<StockPaperRunResult>("/api/stocks/paper/run"),
   /* ==================== 股票研究（/api/stocks/*，后端可能尚未上线） ==================== */
   /* 股票数据可用性总览：quotes / financials / factors / signals 等数据集的 available_at */
   stockDataStatus: () => getJson<StockDataStatus>("/api/stocks/data/status"),

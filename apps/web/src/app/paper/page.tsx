@@ -52,19 +52,29 @@ function MetricCard({
 
 /* ---------- 模拟盘告示 ---------- */
 
-function PaperNotice({ asOf }: { asOf?: string | null }) {
+function PaperNotice({ summary }: { summary: PaperSummaryView | null }) {
   return (
-    <div className="mb-6 flex items-start gap-2.5 rounded-lg border border-sky-200 bg-sky-50 px-3.5 py-2.5 text-sm text-sky-800">
+    <div className="mb-6 flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-sm text-amber-900">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mt-0.5 h-4 w-4 shrink-0">
         <path d="M12 8v5M12 16.5v.5" />
         <circle cx="12" cy="12" r="9" />
       </svg>
-      <span>
-        本页面为<span className="font-semibold">模拟交易（虚拟盘）</span>
-        ，初始虚拟资金 100 万元，所有持仓与成交均为策略信号驱动的虚拟记录，
-        <span className="font-semibold">不涉及任何真实资金与真实交易</span>
-        {asOf ? `（数据日期：${fmtDate(asOf)}）` : ""}。仅供参考，不构成投资建议。
-      </span>
+      <div>
+        <p>
+          当前运行的是
+          <span className="font-semibold">
+            {summary?.strategyName ? `「${summary.strategyName}」` : "前向模拟（虚拟盘）"}
+          </span>
+          ：从当时可见的数据向后测试，不补造历史成绩，
+          <span className="font-semibold">也不涉及任何真实资金与真实交易</span>
+          {summary?.asOf ? `（最新记账日：${fmtDate(summary.asOf)}）` : ""}。
+        </p>
+        {summary?.warnings.map((warning) => (
+          <p key={warning} className="mt-1 text-xs text-amber-800">
+            {warning}
+          </p>
+        ))}
+      </div>
     </div>
   );
 }
@@ -110,7 +120,7 @@ function PaperCurveChart({ points }: { points: PaperCurvePoint[] }) {
     return (
       <EmptyState
         title="暂无可绘制的模拟净值曲线"
-        hint="GET /api/paper/history 返回为空或不足两个点。可先点击右上角「运行一次模拟」生成数据。"
+        hint="前向模拟每天北京时间 22:00 在最后一轮净值同步完成后自动运行；积累两个有效交易日后显示曲线。"
       />
     );
   }
@@ -267,7 +277,7 @@ function PaperTradesTable({ trades }: { trades: PaperTradeView[] }) {
     return (
       <EmptyState
         title="暂无虚拟成交记录"
-        hint="GET /api/paper/trades 返回为空。可点击「运行一次模拟」触发策略生成虚拟订单。"
+        hint="虚拟成交由每天 22:00 的自动任务生成；只有到达调仓日并出现有效目标时才会成交。"
       />
     );
   }
@@ -417,9 +427,6 @@ export default function PaperPage() {
   const [signals, setSignals] = useState<PaperSignalView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
-  const [runMessage, setRunMessage] = useState<string | null>(null);
-  const [runError, setRunError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -452,30 +459,6 @@ export default function PaperPage() {
     void load();
   }, [load]);
 
-  const run = useCallback(async () => {
-    setRunning(true);
-    setRunMessage(null);
-    setRunError(null);
-    try {
-      const res = await api.paperRun();
-      const count = toNumber(res.trade_count) ?? (Array.isArray(res.trades) ? res.trades.length : null);
-      const base =
-        typeof res.message === "string" && res.message
-          ? res.message
-          : "本次模拟运行完成（虚拟成交，非真实交易）";
-      setRunMessage(count !== null && count > 0 ? `${base}，产生 ${count} 笔虚拟成交` : base);
-      await load();
-    } catch (e) {
-      setRunError(
-        e instanceof ApiError
-          ? `${e.message}。${API_DOWN_HINT}`
-          : "网络请求失败，请确认后端服务已启动"
-      );
-    } finally {
-      setRunning(false);
-    }
-  }, [load]);
-
   const initialCapital = summary?.initialCapital ?? DEFAULT_INITIAL_CAPITAL;
   const totalValue = summary?.totalValue ?? null;
   const fallbackProfit =
@@ -492,37 +475,16 @@ export default function PaperPage() {
     <>
       <PageHeader
         title="模拟交易"
-        description="100 万虚拟资金按五档信号自动调仓的模拟盘，全部数据均为虚拟记录"
+        description="用 100 万虚拟资金持续检验当前量化规则，重点看它能否长期跑赢等权基准"
         action={
-          <button
-            type="button"
-            onClick={run}
-            disabled={running || loading}
-            className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {running && (
-              <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z" />
-              </svg>
-            )}
-            {running ? "正在运行…" : "运行一次模拟"}
-          </button>
+          <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-sm font-medium text-emerald-800">
+            <span className="h-2 w-2 rounded-full bg-emerald-500" />
+            每天 22:00 自动运行
+          </div>
         }
       />
 
-      <PaperNotice asOf={summary?.asOf} />
-
-      {runMessage && (
-        <div className="mb-6 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 text-sm text-emerald-800">
-          {runMessage}
-        </div>
-      )}
-      {runError && (
-        <div className="mb-6 rounded-lg border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-sm text-rose-700">
-          模拟运行失败：{runError}
-        </div>
-      )}
+      <PaperNotice summary={summary} />
 
       {loading ? (
         <Card>

@@ -65,8 +65,16 @@ from app.services.quant import (
     _win_rate,
 )
 
-DEFAULT_STRATEGY_NAME = "规则模型V1-月调仓"
+LEGACY_STRATEGY_NAME = "规则模型V1-月调仓"
+DEFAULT_STRATEGY_NAME = "规则模型V2-前向模拟"
 DEFAULT_ACCOUNT_NAME = "默认模拟账户"
+DEFAULT_STRATEGY_PARAMS = {
+    "model_version": "v2",
+    "purpose": "forward_paper_validation",
+    "signal_engine": "quant_screener",
+    "methodology": "使用修复净值与指数窗口后的当前量化规则，只从当时可见的数据向前验证",
+    "historical_validation": "not_passed",
+}
 
 # 金额/份额落库精度
 _CENT = Decimal("0.01")
@@ -105,7 +113,7 @@ def _f(value: Decimal | None) -> float | None:
 
 
 def ensure_default_account(db: Session) -> PaperAccount:
-    """获取（或创建）默认模拟账户：初始 100 万元、20 交易日调仓、双边费用 0.1%。"""
+    """获取（或创建）V2 前向模拟账户，不复用已失效 V1 的持仓和净值。"""
     version = db.execute(
         select(StrategyVersion).where(StrategyVersion.name == DEFAULT_STRATEGY_NAME)
     ).scalars().first()
@@ -116,6 +124,8 @@ def ensure_default_account(db: Session) -> PaperAccount:
             rebalance_interval=DEFAULT_REBALANCE_INTERVAL,
             fee_rate=DEFAULT_FEE_RATE,
             top_n=DEFAULT_TOP_N,
+            params=dict(DEFAULT_STRATEGY_PARAMS),
+            status="paper_testing",
         )
         db.add(version)
         db.flush()
@@ -425,7 +435,9 @@ def run_paper_cycle(
 ) -> PaperRunResponse:
     """每日模拟交易循环：信号 → 调仓（到期时）→ 估值 → 基准，幂等。
 
-    run_date 缺省为当日；净值数据晚于 run_date 的记录不参与本次估值。
+    run_date 缺省时，以筛选器实际使用的数据日期作为记账日。这样在周末、休市
+    或基金净值尚未更新时不会把同一份数据重复记成新的“交易日”。显式传入
+    run_date 主要供可重复的研究测试使用。
     """
     today = run_date or date.today()
     account = ensure_default_account(db)
@@ -433,23 +445,25 @@ def run_paper_cycle(
     if version is None:  # pragma: no cover - 外键保证存在
         raise PaperError("账户绑定的策略版本不存在")
 
-    # ---- 幂等：同日已运行则直接返回已有结果 ----
-    existing = db.execute(
-        select(BacktestRun).where(
-            BacktestRun.account_id == account.id, BacktestRun.run_date == today
-        )
-    ).scalars().first()
-    if existing is not None:
-        nav_row = db.execute(
-            select(PaperNavDaily).where(
-                PaperNavDaily.account_id == account.id,
-                PaperNavDaily.nav_date == today,
+    warnings: list[str] = []
+    screener = None
+
+    # 显式研究日期可先命中幂等；日常前向运行需先知道筛选器真实的数据日期。
+    if run_date is not None:
+        existing = db.execute(
+            select(BacktestRun).where(
+                BacktestRun.account_id == account.id, BacktestRun.run_date == today
             )
         ).scalars().first()
-        db.commit()
-        return _run_response(account, existing, nav_row, skipped=True, warnings=[])
-
-    warnings: list[str] = []
+        if existing is not None:
+            nav_row = db.execute(
+                select(PaperNavDaily).where(
+                    PaperNavDaily.account_id == account.id,
+                    PaperNavDaily.nav_date == today,
+                )
+            ).scalars().first()
+            db.commit()
+            return _run_response(account, existing, nav_row, skipped=True, warnings=[])
 
     # ---- 1. 全候选信号（screener：默认当前真实持仓为候选池）----
     try:
@@ -458,6 +472,42 @@ def run_paper_cycle(
         db.rollback()
         raise PaperError(f"筛选器无法生成候选信号：{exc}") from exc
     warnings.extend(screener.warnings)
+
+    if run_date is None:
+        try:
+            data_date = _parse_day(screener.as_of)
+        except QuantError as exc:
+            db.rollback()
+            raise PaperError(f"筛选器未返回有效的数据日期：{exc}") from exc
+        if data_date is None:
+            db.rollback()
+            raise PaperError("筛选器未返回数据日期，无法安全地推进前向模拟")
+        today = data_date
+
+        existing = db.execute(
+            select(BacktestRun).where(
+                BacktestRun.account_id == account.id, BacktestRun.run_date == today
+            )
+        ).scalars().first()
+        if existing is not None:
+            nav_row = db.execute(
+                select(PaperNavDaily).where(
+                    PaperNavDaily.account_id == account.id,
+                    PaperNavDaily.nav_date == today,
+                )
+            ).scalars().first()
+            stale_warning = (
+                f"基金净值最新仍是 {today.isoformat()}，本次未重复记账，"
+                "模拟交易日和调仓倒计时均未增加"
+            )
+            db.commit()
+            return _run_response(
+                account,
+                existing,
+                nav_row,
+                skipped=True,
+                warnings=[stale_warning],
+            )
 
     # ---- 2. 运行序号与是否调仓日 ----
     run_count = db.execute(
@@ -776,6 +826,17 @@ def get_summary(db: Session) -> PaperSummary:
     cash = Decimal(account.cash)
     market_value = Decimal(latest.market_value) if latest else Decimal("0")
     total_value = Decimal(latest.total_value) if latest else cash
+    warnings: list[str] = []
+    if version is not None and version.status == "paper_testing":
+        warnings.append(
+            "这套规则正在做前向模拟验证，历史样本外验证没有通过；"
+            "当前结果只能用来观察规则是否有效，不能当成已经验证成功的策略。"
+        )
+    if len(nav_rows) < 20:
+        warnings.append(
+            f"目前只有 {len(nav_rows)} 个有效净值交易日，样本太少，"
+            "暂时不要根据收益高低判断规则好坏。"
+        )
 
     return PaperSummary(
         account_id=account.id,
@@ -783,6 +844,7 @@ def get_summary(db: Session) -> PaperSummary:
         strategy=PaperStrategyInfo(
             version_id=version.id if version else 0,
             name=version.name if version else "",
+            status=version.status if version else "unknown",
             initial_capital=Decimal(account.initial_capital),
             rebalance_interval=version.rebalance_interval if version else 0,
             fee_rate=float(version.fee_rate) if version else 0.0,
@@ -809,6 +871,7 @@ def get_summary(db: Session) -> PaperSummary:
         start_date=nav_rows[0].nav_date.isoformat() if nav_rows else None,
         last_run_date=latest.nav_date.isoformat() if latest else None,
         next_rebalance_in=next_rebalance_in,
+        warnings=warnings,
     )
 
 

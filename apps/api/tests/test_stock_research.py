@@ -6,6 +6,7 @@ DataFrame，测试全程离线；另覆盖网络失败（返回 None）时的优
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     IndexConstituent,
+    IndexMembershipEvent,
     StockDailyBar,
     StockFinancialIndicator,
     StockIndustry,
@@ -137,8 +139,24 @@ def mock_ak(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ak_fetch, "fetch_stock_daily_sina", lambda symbol, adjust="": _daily_frame()
     )
+    monkeypatch.setattr(
+        ak_fetch,
+        "fetch_stock_daily_eastmoney",
+        lambda symbol, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        ak_fetch,
+        "fetch_stock_daily_tencent",
+        lambda symbol, **kwargs: None,
+    )
     monkeypatch.setattr(ak_fetch, "fetch_index_cons", lambda symbol: _cons_frame())
+    monkeypatch.setattr(
+        ak_fetch, "fetch_financial_indicator_eastmoney", lambda symbol: None
+    )
     monkeypatch.setattr(ak_fetch, "fetch_financial_indicator", lambda symbol: _financial_frame())
+    monkeypatch.setattr(
+        ak_fetch, "fetch_financial_indicator_ths", lambda symbol: None
+    )
     monkeypatch.setattr(
         ak_fetch, "fetch_report_disclosure", lambda market, period: _disclosure_frame(market)
     )
@@ -151,6 +169,7 @@ def mock_ak(monkeypatch: pytest.MonkeyPatch) -> None:
         ak_fetch, "fetch_industry_cons", lambda symbol: _industry_cons_frame(symbol)
     )
     monkeypatch.setattr(ak_fetch, "fetch_industry_change_cninfo", lambda symbol: None)
+    monkeypatch.setattr(ak_fetch, "fetch_stock_profile_cninfo", lambda symbol: None)
 
 
 @pytest.fixture(autouse=True)
@@ -252,8 +271,15 @@ def test_sync_daily_incremental_resume(db_session: Session, mock_ak: None, resea
 def test_sync_daily_network_failure(
     db_session: Session, monkeypatch: pytest.MonkeyPatch, research_root: Path
 ) -> None:
+    monkeypatch.setattr(ak_fetch, "fetch_stock_code_name", lambda: _master_frame())
     stock_data.sync_stock_master(db_session)
     monkeypatch.setattr(ak_fetch, "fetch_stock_daily_sina", lambda symbol, adjust="": None)
+    monkeypatch.setattr(
+        ak_fetch, "fetch_stock_daily_eastmoney", lambda symbol, **kwargs: None
+    )
+    monkeypatch.setattr(
+        ak_fetch, "fetch_stock_daily_tencent", lambda symbol, **kwargs: None
+    )
     result = stock_data.sync_stock_daily(db_session, ["600519", "000001"])
     assert result["failed"] == 2
     assert result["updated"] == 0
@@ -328,6 +354,12 @@ def test_sync_daily_resume_after_failed_run(
         return None if symbol == "sz000001" else _daily_frame()
 
     monkeypatch.setattr(ak_fetch, "fetch_stock_daily_sina", flaky)
+    monkeypatch.setattr(
+        ak_fetch, "fetch_stock_daily_eastmoney", lambda symbol, **kwargs: None
+    )
+    monkeypatch.setattr(
+        ak_fetch, "fetch_stock_daily_tencent", lambda symbol, **kwargs: None
+    )
     result = stock_data.sync_stock_daily(db_session, ["000001", "300750"], fetch_qfq=False)
     assert result["status"] == "partial"  # 有成功有失败绝不能是 success
     assert result["last_code"] == "300750"
@@ -431,6 +463,73 @@ def test_import_membership_events_bad_csv(db_session: Session) -> None:
     assert result["errors"]
 
 
+def test_import_stocktoday_index_weights(db_session: Session, tmp_path: Path) -> None:
+    snapshot_root = tmp_path / "tushare_snapshot"
+    partition = snapshot_root / "indices" / "index_weight" / "000300.SH"
+    partition.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "index_code": "000300.SH",
+                "con_code": "000001.SZ",
+                "trade_date": "20240131",
+                "weight": 1.2,
+            },
+            {
+                "index_code": "000300.SH",
+                "con_code": "600519.SH",
+                "trade_date": "20240131",
+                "weight": 3.5,
+            },
+            {
+                "index_code": "000300.SH",
+                "con_code": "600519.SH",
+                "trade_date": "20240229",
+                "weight": 3.4,
+            },
+            {
+                "index_code": "000300.SH",
+                "con_code": "300750.SZ",
+                "trade_date": "20240229",
+                "weight": 2.1,
+            },
+        ]
+    ).to_parquet(partition / "2024.parquet", index=False)
+
+    result = stock_universe.import_stocktoday_index_weights(db_session, snapshot_root)
+    assert result["status"] == "success"
+    assert result["snapshots_imported"] == 4
+    assert result["events_imported"] == 4
+
+    snapshots = db_session.scalars(select(StockUniverseSnapshot)).all()
+    assert len(snapshots) == 4
+    events = db_session.scalars(select(IndexMembershipEvent)).all()
+    assert len(events) == 4
+    assert {event.source for event in events} == {"stocktoday:index_weight"}
+
+    january = stock_universe.get_universe(
+        db_session, "000300", date(2024, 1, 31)
+    )
+    assert january["basis"] == "snapshot"
+    assert {row["stock_code"] for row in january["members"]} == {
+        "000001",
+        "600519",
+    }
+    february = stock_universe.get_universe(
+        db_session, "000300", date(2024, 2, 29)
+    )
+    assert {row["stock_code"] for row in february["members"]} == {
+        "300750",
+        "600519",
+    }
+
+    repeated = stock_universe.import_stocktoday_index_weights(
+        db_session, snapshot_root
+    )
+    assert repeated["snapshots_imported"] == 0
+    assert repeated["events_imported"] == 0
+
+
 def test_sync_index_cons_network_failure(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ak_fetch, "fetch_index_cons", lambda symbol: None)
     result = stock_universe.sync_index_cons(db_session, ["000300"])
@@ -452,6 +551,225 @@ def test_sync_financial_and_available_at(db_session: Session, mock_ak: None) -> 
     assert rows[0].report_date == date(2023, 12, 31)
     assert rows[0].available_at is not None
     assert "摊薄每股收益(元)" in rows[0].payload
+
+
+def test_import_stocktoday_valuations(
+    db_session: Session, tmp_path: Path
+) -> None:
+    snapshot_root = tmp_path / "tushare_snapshot"
+    partition = snapshot_root / "stocks" / "daily_basic"
+    partition.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "600519.SH",
+                "trade_date": "20240102",
+                "pe_ttm": 25.2,
+                "pb": 8.1,
+            },
+            {
+                "ts_code": "600519.SH",
+                "trade_date": "20240103",
+                "pe_ttm": 25.5,
+                "pb": 8.2,
+            },
+        ]
+    ).to_parquet(partition / "600519.SH.parquet", index=False)
+
+    result = stock_fundamentals.import_stocktoday_valuations(
+        db_session, snapshot_root
+    )
+    assert result["status"] == "success"
+    assert result["codes"] == 1
+    assert result["rows"] == 4
+    rows = db_session.scalars(
+        select(StockValuation).order_by(
+            StockValuation.trade_date, StockValuation.indicator
+        )
+    ).all()
+    assert len(rows) == 4
+    assert {row.source for row in rows} == {"stocktoday"}
+
+    repeated = stock_fundamentals.import_stocktoday_valuations(
+        db_session, snapshot_root
+    )
+    assert repeated["rows"] == 4
+    assert len(db_session.scalars(select(StockValuation)).all()) == 4
+
+
+def test_import_stocktoday_financial_indicators(
+    db_session: Session, tmp_path: Path
+) -> None:
+    snapshot_root = tmp_path / "tushare_snapshot"
+    partition = snapshot_root / "stocks" / "fina_indicator"
+    partition.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "600519.SH",
+                "ann_date": "20240420",
+                "end_date": "20231231",
+                "eps": 2.1,
+                "roe": 18.2,
+                "grossprofit_margin": 51.0,
+            },
+            {
+                "ts_code": "600519.SH",
+                "ann_date": "20240510",
+                "end_date": "20231231",
+                "eps": 2.2,
+                "roe": 18.5,
+                "grossprofit_margin": 52.0,
+            },
+            {
+                "ts_code": "600519.SH",
+                "ann_date": "20240428",
+                "end_date": "20240331",
+                "eps": 0.6,
+                "roe": 4.8,
+                "grossprofit_margin": 50.0,
+            },
+        ]
+    ).to_parquet(partition / "600519.SH.parquet", index=False)
+
+    result = stock_fundamentals.import_stocktoday_financial_indicators(
+        db_session, snapshot_root
+    )
+    assert result["status"] == "success"
+    assert result["codes"] == 1
+    assert result["rows"] == 2
+    rows = db_session.scalars(
+        select(StockFinancialIndicator).order_by(
+            StockFinancialIndicator.report_date
+        )
+    ).all()
+    assert len(rows) == 2
+    assert float(rows[0].eps) == pytest.approx(2.1)
+    assert rows[0].available_at.date() == date(2024, 4, 20)
+    assert rows[0].source == "stocktoday"
+    assert json.loads(rows[0].payload)["grossprofit_margin"] == 51.0
+
+
+def test_import_stocktoday_name_history(
+    db_session: Session, tmp_path: Path
+) -> None:
+    snapshot_root = tmp_path / "tushare_snapshot"
+    partition = snapshot_root / "stocks" / "namechange"
+    partition.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "600001.SH",
+                "name": "*ST测试",
+                "start_date": "20200102",
+                "end_date": "20210630",
+                "change_reason": "实施退市风险警示",
+            },
+            {
+                "ts_code": "600001.SH",
+                "name": "测试股份",
+                "start_date": "20210701",
+                "end_date": None,
+                "change_reason": "撤销退市风险警示",
+            },
+        ]
+    ).to_parquet(partition / "600001.SH.parquet", index=False)
+
+    result = stock_fundamentals.import_stocktoday_name_history(
+        db_session, snapshot_root
+    )
+    assert result["status"] == "success"
+    assert result["rows"] == 2
+    rows = db_session.scalars(
+        select(StockNameHistory).order_by(StockNameHistory.start_date)
+    ).all()
+    assert [row.is_st for row in rows] == [True, False]
+    assert rows[0].end_date == date(2021, 6, 30)
+    assert {row.source for row in rows} == {"stocktoday"}
+
+
+def test_import_stocktoday_industries(
+    db_session: Session, tmp_path: Path
+) -> None:
+    snapshot_root = tmp_path / "tushare_snapshot"
+    partition = snapshot_root / "stocks" / "index_member_all"
+    partition.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "600519.SH",
+                "name": "贵州茅台",
+                "l1_code": "801120.SI",
+                "l1_name": "食品饮料",
+                "l2_code": "801125.SI",
+                "l2_name": "白酒Ⅱ",
+                "l3_code": "851251.SI",
+                "l3_name": "白酒Ⅲ",
+                "is_new": "Y",
+            }
+        ]
+    ).to_parquet(partition / "600519.SH.parquet", index=False)
+
+    result = stock_fundamentals.import_stocktoday_industries(
+        db_session, snapshot_root
+    )
+    assert result["status"] == "success"
+    assert result["rows"] == 1
+    row = db_session.scalar(select(StockIndustry))
+    assert row is not None
+    assert row.industry_name == "食品饮料"
+    assert row.industry_code == "801120.SI"
+    assert row.source == "stocktoday_sw2021"
+
+
+def test_sync_financial_uses_eastmoney_normalized_fields(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        ak_fetch,
+        "fetch_financial_indicator_eastmoney",
+        lambda symbol: pd.DataFrame(
+            [
+                {
+                    "REPORT_DATE": "2026-06-30",
+                    "NOTICE_DATE": "2026-07-31",
+                    "EPSJB": 0.22,
+                    "ROEJQ": 6.41,
+                    "XSMLL": 29.21,
+                    "ZCFZL": 59.17,
+                    "PARENTNETPROFIT": 833_852_270.0,
+                    "NCO_NETPROFIT": 0.72,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        ak_fetch,
+        "fetch_financial_indicator",
+        lambda symbol: pytest.fail("东财成功时不应调用新浪"),
+    )
+    monkeypatch.setattr(
+        ak_fetch,
+        "fetch_financial_indicator_ths",
+        lambda symbol: pytest.fail("东财成功时不应调用同花顺"),
+    )
+
+    result = stock_fundamentals.sync_financial_indicators(
+        db_session, ["000683"]
+    )
+
+    assert result["status"] == "success"
+    assert result["sources"] == {"eastmoney": 1}
+    row = db_session.scalar(
+        select(StockFinancialIndicator).where(
+            StockFinancialIndicator.code == "000683"
+        )
+    )
+    assert row is not None
+    assert row.source == "eastmoney"
+    assert float(row.roe) == pytest.approx(6.41)
+    assert row.available_at is not None
+    assert '"销售毛利率(%)": 29.21' in row.payload
 
 
 def test_sync_disclosure_available_at(db_session: Session, mock_ak: None) -> None:
@@ -558,6 +876,7 @@ def test_industry_cninfo_current_columns(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(ak_fetch, "fetch_industry_boards", lambda: None)
+    monkeypatch.setattr(ak_fetch, "fetch_stock_profile_cninfo", lambda code: None)
     frame = pd.DataFrame(
         [
             {"行业中类": "银行", "行业大类": "银行", "变更日期": date(2021, 1, 1)},
@@ -588,6 +907,46 @@ def test_sync_valuation_partial_sources(
     assert result["updated"] == 1
     assert result["failed"] == 1
     assert result["rows"] == 2
+
+
+def test_sync_market_valuations_builds_pb_from_financial_bps(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_master(db_session, ["600519"])
+    db_session.add(
+        IndexConstituent(
+            index_code="000300", stock_code="600519", stock_name="贵州茅台"
+        )
+    )
+    db_session.add(
+        StockFinancialIndicator(
+            code="600519",
+            report_date=date(2024, 3, 31),
+            roe=20,
+            payload='{"BPS": 10}',
+            source="eastmoney",
+        )
+    )
+    db_session.commit()
+    monkeypatch.setattr(
+        ak_fetch,
+        "fetch_stock_spot_tencent",
+        lambda: pd.DataFrame(
+            [{"code": "sh600519", "zxj": "25", "pe_ttm": "12.5"}]
+        ),
+    )
+
+    result = stock_fundamentals.sync_market_valuations(
+        db_session, date(2024, 4, 30)
+    )
+
+    assert result["status"] == "success"
+    rows = db_session.scalars(select(StockValuation)).all()
+    assert {(row.indicator, float(row.value)) for row in rows} == {
+        ("pe_ttm", 12.5),
+        ("pb", 2.5),
+    }
+    assert {row.source for row in rows} == {"tencent_close"}
 
 
 def test_sync_name_history_st_flag(db_session: Session, mock_ak: None) -> None:
@@ -639,7 +998,13 @@ def test_extract_name_segments() -> None:
 
 
 def test_fundamentals_network_failure(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ak_fetch, "fetch_financial_indicator_eastmoney", lambda symbol: None
+    )
     monkeypatch.setattr(ak_fetch, "fetch_financial_indicator", lambda symbol: None)
+    monkeypatch.setattr(
+        ak_fetch, "fetch_financial_indicator_ths", lambda symbol: None
+    )
     result = stock_fundamentals.sync_financial_indicators(db_session, ["600519"])
     assert result["status"] == "failed"
     assert result["errors"]
@@ -660,7 +1025,7 @@ def test_sync_industries_primary_source(db_session: Session, mock_ak: None) -> N
 
 
 def test_sync_industries_fallback_when_boards_unavailable(
-    db_session: Session, monkeypatch: pytest.MonkeyPatch
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, mock_ak: None
 ) -> None:
     """主源不可用 -> 巨潮个股行业变动回退。"""
     stock_data.sync_stock_master(db_session)
@@ -670,6 +1035,7 @@ def test_sync_industries_fallback_when_boards_unavailable(
         "fetch_industry_change_cninfo",
         lambda symbol: pd.DataFrame([{"行业名称": "白酒"}]) if symbol == "600519" else None,
     )
+    monkeypatch.setattr(ak_fetch, "fetch_stock_profile_cninfo", lambda symbol: None)
     result = stock_fundamentals.sync_industries(db_session, ["600519", "000001"])
     # 600519 回退成功，000001 回退失败 -> partial
     assert result["status"] == "partial"
@@ -787,11 +1153,19 @@ def test_repository_industry_from_stock_industry(db_session: Session) -> None:
     db_session.add(
         StockIndustry(code="600519", name="贵州茅台", source="em", industry_name="白酒")
     )
+    db_session.add(
+        StockIndustry(
+            code="600519",
+            name="贵州茅台",
+            source="stocktoday_sw2021",
+            industry_name="食品饮料",
+        )
+    )
     db_session.commit()
 
     repo = SqlStockRepository(db_session)
     infos = {info.code: info for info in repo.list_stocks(None)}
-    assert infos["600519"].industry == "白酒"
+    assert infos["600519"].industry == "食品饮料"
     assert infos["000001"].industry == "未知"  # 未覆盖的降级为未知
 
 

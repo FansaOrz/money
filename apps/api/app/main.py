@@ -29,6 +29,7 @@ from app.api.routes import (
     research_portfolios,
     research_quality,
     stocks,
+    stock_paper,
     stocks_research,
     sync_status,
     transactions,
@@ -81,6 +82,7 @@ def create_app() -> FastAPI:
     app.include_router(discovery.router, prefix="/api")
     app.include_router(discovery_quant.router, prefix="/api")
     app.include_router(stocks.router, prefix="/api")
+    app.include_router(stock_paper.router, prefix="/api")
     app.include_router(stocks_research.router, prefix="/api")
     app.include_router(research_portfolios.router, prefix="/api")
     app.include_router(research_quality.router, prefix="/api")

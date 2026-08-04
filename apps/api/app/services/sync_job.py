@@ -9,7 +9,7 @@ def main() -> None:
     create_tables()
     db = SessionLocal()
     try:
-        result = sync_fund_navs(db)
+        result = sync_fund_navs(db, held_only=True)
         print(f"同步完成：{result}")
     finally:
         db.close()

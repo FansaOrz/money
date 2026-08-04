@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 API_DIR="$ROOT_DIR/apps/api"
 WEB_DIR="$ROOT_DIR/apps/web"
+WEB_STANDALONE_DIR="$WEB_DIR/.next/standalone"
 DATA_DIR="$ROOT_DIR/data"
 NODE_BIN="/usr/local/nvm/versions/node/v20.20.2/bin"
 
@@ -51,9 +52,20 @@ if [[ ! -d "$WEB_DIR/.next" ]]; then
   (cd "$WEB_DIR" && NEXT_PUBLIC_API_URL= API_PROXY_URL=http://127.0.0.1:8001 npm run build)
 fi
 
-start_process "前端 Web" "$DATA_DIR/web.pid" "$DATA_DIR/web.log" \
-  env API_PROXY_URL=http://127.0.0.1:8001 \
-      npm --prefix "$WEB_DIR" run start -- -p 3000
+if [[ -f "$WEB_STANDALONE_DIR/server.js" ]]; then
+  # standalone 构建不会自动携带静态资源，需要在启动前补到产物目录。
+  mkdir -p "$WEB_STANDALONE_DIR/.next"
+  cp -a "$WEB_DIR/.next/static" "$WEB_STANDALONE_DIR/.next/"
+  start_process "前端 Web" "$DATA_DIR/web.pid" "$DATA_DIR/web.log" \
+    env API_PROXY_URL=http://127.0.0.1:8001 \
+        HOSTNAME=0.0.0.0 \
+        PORT=3000 \
+        node "$WEB_STANDALONE_DIR/server.js"
+else
+  start_process "前端 Web" "$DATA_DIR/web.pid" "$DATA_DIR/web.log" \
+    env API_PROXY_URL=http://127.0.0.1:8001 \
+        npm --prefix "$WEB_DIR" run start -- -p 3000
+fi
 
 (
   cd "$API_DIR"
@@ -73,7 +85,7 @@ if command -v crontab >/dev/null 2>&1; then
     echo "已移除 sync_navs.sh 的 crontab 项（净值同步统一由常驻调度器触发）"
   fi
 fi
-echo "常驻调度器已配置：17:30 市场指数、20:30 基金净值、07:30 美股指数、17:05 A股日线"
+echo "常驻调度器已配置：19:30/20:30/22:00 持仓基金净值、22:00 净值同步后自动模拟交易、17:30 市场指数、07:30 美股指数、16:10 A股行业/财务补齐、17:05 A股日线、18:30 A股前向模拟"
 
 echo
 echo "Web:   http://localhost:3000"

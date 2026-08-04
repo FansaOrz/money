@@ -21,6 +21,7 @@ class PaperStrategyInfo(ConfiguredBaseModel):
 
     version_id: int
     name: str
+    status: str = Field(description="策略状态；paper_testing 表示正在做前向模拟验证")
     initial_capital: DecimalStr
     rebalance_interval: int = Field(description="调仓间隔（交易日）")
     fee_rate: float = Field(description="双边简化费用率（小数，买卖各收一次）")
@@ -200,7 +201,10 @@ class PaperRunRequest(ConfiguredBaseModel):
 
     run_date: str | None = Field(
         default=None,
-        description="运行基准日 YYYY-MM-DD，缺省为当日；净值数据晚于该日的记录不参与本次估值",
+        description=(
+            "运行基准日 YYYY-MM-DD；缺省时采用筛选器实际使用的最新净值日期，"
+            "避免休市或净值未更新时重复记账"
+        ),
     )
 
 

@@ -37,8 +37,80 @@ Money 是一个面向个人使用的本地投资管理与研究系统。它从�
 - 基金及股票自选列表
 - 基金、股票研究组合
 - 100 万虚拟资金模拟盘
+- A 股规则多因子两个月前向模拟：T 日信号、T+1 开盘成交、独立股票账本
 - 市场指数、每日资讯和同步状态展示
 - 多因子、风险模型、组合优化、HRP、走步回测及统计验证
+
+### A 股规则量化
+
+`/stock-quant` 是股票规则策略的前向验证工作台，默认策略为：
+
+- 沪深300 + 中证500当前成分中数据就绪成员，账户创建时冻结候选池；
+- 动态剔除 ST、停牌、次新、低流动性和历史样本不足股票；
+- 质量 30%、价值 25%、12-1 动量 20%、趋势 15%、低波 10%；
+- 行业内缩尾与标准化，单股上限 5%、单行业上限 20%，未分配仓位留现金；
+- 月频调仓，T 日收盘生成信号，下一交易日开盘成交；
+- 模拟佣金、最低 5 元佣金、卖出印花税、滑点和各板块涨跌停；
+- 信号、未成交订单、成交、持仓、每日净值和等权基准全部落库，可追溯到策略版本。
+
+系统只有在沪深300+中证500全部当前成分的近期日线、行业、财务和 PE/PB 估值逐只
+就绪后才允许创建观察账户，不再使用低覆盖子集提前启动。首次点击“启动
+两个月前向验证”时只固化当日信号，不会当日成交；下一真实
+行情日才模拟建仓。同一行情日重复运行幂等，不重复记账。观察满两个月后，
+应同时检查超额收益、最大回撤、夏普、信息比率、换手和费用，不能只看收益。
+
+主要接口：
+
+- `GET /api/stocks/paper/summary`：数据就绪度、观察进度、持仓、净值和指标
+- `POST /api/stocks/paper/run`：手动推进到最新真实行情日
+- `GET /api/stocks/paper/trades`：模拟成交明细
+- `POST /api/stocks/sync/market-close`：收盘全市场快照快速通道
+- `POST /api/stocks/research/backtest`：历史月频规则回测
+
+股票数据采用多源分工而非混合口径：中证接口维护指数成分，新浪历史日线为
+深度主源、东方财富为历史回退；收盘快照优先东方财富、失败自动回退新浪；
+东方财富/巨潮维护公开行业主源与回退，StockToday 可用时以申万 2021 一级行业
+作为规则策略分组；东方财富/新浪/同花顺财务指标配合披露日期做 point-in-time
+对齐；百度提供历史估值，腾讯收盘快照批量维护每日 PE(TTM)，PB 由同日收盘价
+与最新已披露每股净资产计算。实际采用来源和同步错误会
+写入数据状态，页面会在覆盖低于安全门槛时阻止启动模拟。
+
+付费数据窗口可用时，`scripts/download_stocktoday_snapshot.py` 会通过
+StockToday 的 Tushare 兼容接口补充原始数据仓库。任务按股票和接口分区保存
+Parquet，使用无 token 的 JSONL 清单记录来源、参数、字段、行数和采集时间，
+已完成分区会自动跳过，因此中断后可直接续传。目前下载范围包括：
+
+- 沪深300、中证500自 2010 年以来的指数日线、权重和真实历史成分；
+- 当前 800 只成分股的日线、复权因子、估值、涨跌停、停牌和曾用名；
+- 申万 2021 三级行业成员关系及同花顺行业目录；
+- 财务指标、利润表、资产负债表、现金流量表和分红记录。
+
+历史权重会物化为 `stock_universe_snapshots`，并推导
+`index_membership_events` 调入调出事件。历史 PE(TTM)/PB 会物化到估值表，
+财务指标按公告日建立 point-in-time 口径，带日期的曾用名记录用于历史 ST
+过滤；规则策略行业中性分组优先使用申万 2021 一级行业。历史回测因此能按
+当时真实股票池和当时已知数据选股，而不是错误地拿
+今天仍在指数中的股票或最终财报回测过去。原始宽表仍完整保留在 Parquet 中。
+
+续传数据快照（token 文件只在本机读取，不写入仓库或采集清单）：
+
+```bash
+cd apps/api
+python scripts/download_stocktoday_snapshot.py \
+  --token-file ../../tmp/tushare.py \
+  --skill-dir ../../tmp/agent_skill_tushare \
+  --database ../../data/money.db \
+  --output-dir ../../data/research/tushare_snapshot \
+  --start-date 20100101
+
+MONEY_DATABASE_URL=sqlite:///../../data/money.db \
+python scripts/import_stocktoday_snapshot.py \
+  --snapshot-dir ../../data/research/tushare_snapshot
+
+python scripts/validate_stocktoday_snapshot.py \
+  --database ../../data/money.db \
+  --snapshot-dir ../../data/research/tushare_snapshot
+```
 
 ## 技术栈
 
@@ -142,8 +214,11 @@ bash stop.sh
 | 候选池历史净值回填 | 每日 03:23 |
 | 美股指数 | 每日 07:30 |
 | A 股日线 | 每日 17:05 |
+| A 股行业/财务/估值覆盖补齐 | 每日 16:10 |
+| A 股规则策略前向模拟 | 每日 18:30 |
 | A 股及港股市场指数 | 每日 17:30 |
-| 基金净值、组合快照与模拟盘 | 每日 20:30 |
+| 持仓基金净值与组合快照 | 每日 19:30、20:30、22:00 |
+| 模拟盘 | 每日 20:30 |
 | 基金底层持仓披露检查 | 每月 1 日 19:05 |
 | 全市场基金目录 | 每周日 02:30 |
 
@@ -154,6 +229,8 @@ bash stop.sh
 ```bash
 bash sync_navs.sh
 ```
+
+该命令只更新当前持仓基金；全市场候选池数据由凌晨低优先级任务分批维护。
 
 按批次回填基金近五年历史净值：
 
@@ -179,6 +256,9 @@ python -m app.services.sync_backfill_job --batch-size 20 --batch 0
 | `MONEY_RESEARCH_DATA_DIR` | `./data/research` | Parquet 研究数据目录 |
 | `MONEY_RESEARCH_DB` | `./data/research/research.duckdb` | DuckDB 文件路径 |
 | `MONEY_RESEARCH_SYNC_BATCH_SIZE` | `200` | A 股日线单批同步数量 |
+| `MONEY_SCHEDULED_STOCK_SYNC_BATCH_SIZE` | `40` | 调度器后台 A 股日线单批数量 |
+| `MONEY_SCHEDULED_STOCK_SYNC_TIMEOUT_MINUTES` | `60` | A 股后台任务最长运行分钟数，超时后从断点续跑 |
+| `MONEY_SCHEDULED_STOCK_REFERENCE_BATCH_SIZE` | `20` | 当前指数成分行业/财务/估值缺口的每日补齐批次 |
 | `MONEY_NEWS_ANALYSIS_ENABLED` | `true` | 后台聚合并分析新资讯 |
 | `MONEY_NEWS_ANALYSIS_LOOKBACK_DAYS` | `30` | 新闻事件分析回看天数 |
 | `MONEY_NEWS_ANALYSIS_BATCH_SIZE` | `100` | 每轮最多处理的新资讯数 |

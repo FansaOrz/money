@@ -126,6 +126,17 @@ def sync_daily(
     return StockSyncResult(**result)
 
 
+@router.post("/sync/market-close", response_model=StockSyncResult)
+def sync_market_close(
+    trade_date: date | None = Query(
+        default=None, description="研究重放用；日常缺省为北京时间今天"
+    ),
+    db: Session = Depends(get_db),
+) -> StockSyncResult:
+    """一次拉取全市场收盘快照，快速推进股票前向模拟的数据日。"""
+    return StockSyncResult(**stock_data.sync_stock_market_close(db, trade_date=trade_date))
+
+
 @router.post("/sync/universe", response_model=StockSyncResult)
 def sync_universe(
     index_codes: str | None = Query(default=None, description="逗号分隔指数代码，缺省 000300,000905"),
@@ -212,10 +223,19 @@ def materialize_snapshot(
 @router.get("/universe", response_model=UniverseResponse)
 def get_universe(
     index_code: str = Query(default="000300"),
+    universe: str | None = Query(default=None, description="hs300 | zz500 兼容别名"),
     as_of: date | None = Query(default=None, description="缺省/未来日期 -> 当前成分"),
     db: Session = Depends(get_db),
 ) -> UniverseResponse:
     """查询指数成分（当前/历史快照/事件回放）。"""
+    aliases = {
+        "hs300": "000300",
+        "csi300": "000300",
+        "zz500": "000905",
+        "csi500": "000905",
+    }
+    if universe:
+        index_code = aliases.get(universe.strip().lower(), universe.strip())
     result = stock_universe.get_universe(db, index_code, as_of)
     return UniverseResponse(**result, total=len(result["members"]))
 
@@ -237,6 +257,43 @@ def list_stocks(
         items=[StockMasterOut(code=r.code, name=r.name, exchange=r.exchange) for r in rows],
         total=len(rows),
     )
+
+
+@router.get("/master")
+def list_stocks_compat(
+    industry: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> dict:
+    """股票筛选页兼容入口，返回带行业的主数据。"""
+    industry_rows = db.execute(
+        select(StockIndustry.code, StockIndustry.industry_name)
+        .order_by(StockIndustry.code, StockIndustry.source)
+    ).all()
+    industry_map: dict[str, str] = {}
+    for code, name in industry_rows:
+        industry_map.setdefault(code, name)
+    stmt = select(StockMaster).order_by(StockMaster.code)
+    if search:
+        like = f"%{search.strip()}%"
+        stmt = stmt.where(StockMaster.code.like(like) | StockMaster.name.like(like))
+    rows = db.scalars(stmt).all()
+    items = [
+        {
+            "code": row.code,
+            "name": row.name,
+            "exchange": row.exchange,
+            "industry": industry_map.get(row.code, "未知"),
+        }
+        for row in rows
+        if not industry or industry_map.get(row.code) == industry
+    ][:limit]
+    return {
+        "items": items,
+        "total": len(items),
+        "industries": sorted(set(industry_map.values())),
+    }
 
 
 @router.get("/industries", response_model=StockIndustryListResponse)

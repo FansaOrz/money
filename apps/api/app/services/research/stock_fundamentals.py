@@ -14,14 +14,20 @@ from __future__ import annotations
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.models import (
+    IndexConstituent,
+    StockDailyBar,
     StockFinancialIndicator,
     StockIndustry,
     StockNameHistory,
@@ -39,8 +45,10 @@ from app.services.research.stock_data import (
     _to_date,
     _to_float,
 )
+from app.timezone import CN_TZ
 
 logger = logging.getLogger(__name__)
+_REFERENCE_INDEX_CODES = ("000300", "000905")
 
 # 北京时间收盘时刻：披露日 15:00 之后数据视为可用
 _DISCLOSURE_AVAILABLE_TIME = time(15, 0)
@@ -63,23 +71,119 @@ def _now() -> datetime:
 # 财务指标
 # ---------------------------------------------------------------------------
 
-def sync_financial_indicators(db: Session, codes: list[str]) -> dict[str, Any]:
-    """批量同步财务分析指标（新浪）。coverage 取决于数据源历史深度。"""
+def _eastmoney_financial_symbol(code: str) -> str:
+    suffix = "SH" if code.startswith(("6", "9")) and not code.startswith("92") else "BJ"
+    if code.startswith(("0", "2", "3")):
+        suffix = "SZ"
+    return f"{code}.{suffix}"
+
+
+def _normalize_financial_frame(frame: pd.DataFrame, source: str) -> pd.DataFrame:
+    """把东财/新浪/同花顺三种财务表统一为一行一个报告期。"""
+    if source == "eastmoney":
+        normalized = frame.copy()
+        normalized["report_date"] = normalized.get("REPORT_DATE")
+        normalized["eps"] = normalized.get("EPSJB")
+        normalized["roe"] = normalized.get("ROEJQ")
+        normalized["销售毛利率(%)"] = normalized.get("XSMLL")
+        normalized["资产负债率(%)"] = normalized.get("ZCFZL")
+        normalized["净利润(元)"] = normalized.get("PARENTNETPROFIT")
+        normalized["ocf_to_profit"] = normalized.get("NCO_NETPROFIT")
+        normalized["notice_date"] = normalized.get("NOTICE_DATE")
+        return normalized
+    if source != "ths" or not {
+        "report_date",
+        "metric_name",
+        "value",
+    }.issubset(frame.columns):
+        return frame
+
+    records: list[dict[str, Any]] = []
+    for report_date, group in frame.groupby("report_date", sort=False):
+        metrics = {
+            str(row.get("metric_name")): _to_float(row.get("value"))
+            for _, row in group.iterrows()
+        }
+        eps = metrics.get("basic_eps")
+        ocf_per_share = metrics.get("index_per_operating_cash_flow_net")
+        records.append(
+            {
+                "report_date": report_date,
+                "eps": eps,
+                "roe": metrics.get("index_weighted_avg_roe")
+                or metrics.get("index_full_diluted_roe"),
+                "销售毛利率(%)": metrics.get("sale_gross_margin"),
+                "资产负债率(%)": metrics.get("assets_debt_ratio"),
+                "净利润(元)": metrics.get("parent_holder_net_profit"),
+                "ocf_to_profit": (
+                    ocf_per_share / eps
+                    if ocf_per_share is not None and eps is not None and eps > 0
+                    else None
+                ),
+                "ths_metrics": metrics,
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
+
+def _fetch_financial_with_fallback(
+    code: str,
+) -> tuple[pd.DataFrame | None, str | None]:
+    """东财主源，依次回退新浪和同花顺。"""
+    # 东财财务接口对部分科创板代码会长期不返回；这些标的优先走新浪，
+    # 避免一个悬挂请求阻塞整批补库。
+    if code.startswith(("688", "689")):
+        frame = ak_fetch.fetch_financial_indicator(code)
+        if frame is not None:
+            return _normalize_financial_frame(frame, "sina"), "sina"
+    frame = ak_fetch.fetch_financial_indicator_eastmoney(
+        _eastmoney_financial_symbol(code)
+    )
+    if frame is not None:
+        return _normalize_financial_frame(frame, "eastmoney"), "eastmoney"
+    if not code.startswith(("688", "689")):
+        frame = ak_fetch.fetch_financial_indicator(code)
+        if frame is not None:
+            return _normalize_financial_frame(frame, "sina"), "sina"
+    frame = ak_fetch.fetch_financial_indicator_ths(code)
+    if frame is not None:
+        return _normalize_financial_frame(frame, "ths"), "ths"
+    return None, None
+
+
+def sync_financial_indicators(
+    db: Session, codes: list[str], *, max_workers: int = 1
+) -> dict[str, Any]:
+    """批量同步财务指标：东方财富主源，新浪与同花顺顺序回退。"""
     state = _begin_task(db, "financial")
     updated = 0
     failed = 0
     errors: list[str] = []
     total_rows = 0
+    source_counts: dict[str, int] = {}
     total_codes = len(codes)
-    for idx, code in enumerate(codes, start=1):
-        frame = ak_fetch.fetch_financial_indicator(code)
+    if max_workers > 1 and total_codes > 1:
+        with ThreadPoolExecutor(max_workers=min(max_workers, total_codes)) as pool:
+            fetched = list(pool.map(_fetch_financial_with_fallback, codes))
+    else:
+        fetched = [_fetch_financial_with_fallback(code) for code in codes]
+    for idx, (code, (frame, source)) in enumerate(
+        zip(codes, fetched, strict=True), start=1
+    ):
         if frame is None:
             failed += 1
-            errors.append(f"{code}: 数据源不可用")
+            errors.append(f"{code}: 东方财富、新浪与同花顺均不可用")
         else:
-            rows = _upsert_financial_frame(db, code, frame)
+            rows = _upsert_financial_frame(db, code, frame, source=source or "unknown")
             total_rows += rows
-            updated += 1
+            if rows > 0:
+                updated += 1
+                source_counts[source or "unknown"] = (
+                    source_counts.get(source or "unknown", 0) + 1
+                )
+            else:
+                failed += 1
+                errors.append(f"{code}: 数据源返回内容没有有效报告期")
         db.commit()
         _progress_task(
             db, state, processed=idx, total=total_codes,
@@ -98,7 +202,139 @@ def sync_financial_indicators(db: Session, codes: list[str]) -> dict[str, Any]:
         "updated": updated,
         "failed": failed,
         "rows": total_rows,
+        "sources": source_counts,
         "errors": errors,
+    }
+
+
+def sync_reference_coverage(
+    db: Session, *, batch_size: int = 20
+) -> dict[str, Any]:
+    """优先补齐当前沪深300+中证500缺失的行业、财务和 PE/PB。
+
+    每次处理有限批次，适合调度器每日收敛；调用方传入足够大的 batch_size
+    可用于首次全量建设。已有覆盖不会重复请求。
+    """
+    universe = set(
+        db.scalars(
+            select(IndexConstituent.stock_code).where(
+                IndexConstituent.index_code.in_(_REFERENCE_INDEX_CODES)
+            )
+        ).all()
+    )
+    industry_ready = set(
+        db.scalars(
+            select(StockIndustry.code)
+            .where(StockIndustry.code.in_(universe))
+            .distinct()
+        ).all()
+    )
+    financial_ready = set(
+        db.scalars(
+            select(StockFinancialIndicator.code)
+            .where(StockFinancialIndicator.code.in_(universe))
+            .distinct()
+        ).all()
+    )
+    latest = db.scalar(
+        select(StockDailyBar.last_trade_date)
+        .where(StockDailyBar.code.in_(universe))
+        .order_by(StockDailyBar.last_trade_date.desc())
+        .limit(1)
+    )
+    valuation_ready: set[str] = set()
+    if latest is not None:
+        valuation_rows = db.execute(
+            select(
+                StockValuation.code,
+                func.count(func.distinct(StockValuation.indicator)),
+            )
+            .where(
+                StockValuation.code.in_(universe),
+                StockValuation.trade_date <= latest,
+                StockValuation.indicator.in_(("pe_ttm", "pb")),
+            )
+            .group_by(StockValuation.code)
+        ).all()
+        valuation_ready = {
+            code for code, count in valuation_rows if int(count) == 2
+        }
+    industry_codes = sorted(universe - industry_ready)[:batch_size]
+    financial_codes = sorted(universe - financial_ready)[:batch_size]
+    valuation_codes = sorted(universe - valuation_ready)[:batch_size]
+    financial_result = (
+        sync_financial_indicators(db, financial_codes)
+        if financial_codes
+        else {"total": 0, "updated": 0, "failed": 0}
+    )
+    industry_result = (
+        sync_industries(db, industry_codes)
+        if industry_codes
+        else {"total": 0, "updated": 0, "failed": 0}
+    )
+    valuation_result = (
+        sync_valuations(
+            db,
+            valuation_codes,
+            indicators=["市盈率(TTM)", "市净率"],
+            max_workers=4,
+        )
+        if valuation_codes
+        else {"total": 0, "updated": 0, "failed": 0}
+    )
+    # 重新统计，返回的是实际持久化后的剩余缺口。
+    industry_after = set(
+        db.scalars(
+            select(StockIndustry.code)
+            .where(StockIndustry.code.in_(universe))
+            .distinct()
+        ).all()
+    )
+    financial_after = set(
+        db.scalars(
+            select(StockFinancialIndicator.code)
+            .where(StockFinancialIndicator.code.in_(universe))
+            .distinct()
+        ).all()
+    )
+    valuation_after: set[str] = set()
+    if latest is not None:
+        valuation_rows = db.execute(
+            select(
+                StockValuation.code,
+                func.count(func.distinct(StockValuation.indicator)),
+            )
+            .where(
+                StockValuation.code.in_(universe),
+                StockValuation.trade_date <= latest,
+                StockValuation.indicator.in_(("pe_ttm", "pb")),
+            )
+            .group_by(StockValuation.code)
+        ).all()
+        valuation_after = {
+            code for code, count in valuation_rows if int(count) == 2
+        }
+    results = (financial_result, industry_result, valuation_result)
+    total = sum(int(result["total"]) for result in results)
+    updated = sum(int(result["updated"]) for result in results)
+    failed = sum(int(result["failed"]) for result in results)
+    return {
+        "task": "stock_reference",
+        "status": _final_status(updated, failed, processed=total),
+        "total": total,
+        "updated": updated,
+        "failed": failed,
+        "universe": len(universe),
+        "industry_ready": len(industry_after),
+        "financial_ready": len(financial_after),
+        "valuation_ready": len(valuation_after),
+        "industry_remaining": len(universe - industry_after),
+        "financial_remaining": len(universe - financial_after),
+        "valuation_remaining": len(universe - valuation_after),
+        "financial_sources": financial_result.get("sources", {}),
+        "errors": list(financial_result.get("errors", []))
+        + list(industry_result.get("errors", []))
+        + list(valuation_result.get("errors", [])),
     }
 
 
@@ -121,12 +357,16 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _upsert_financial_frame(db: Session, code: str, frame: pd.DataFrame) -> int:
+def _upsert_financial_frame(
+    db: Session, code: str, frame: pd.DataFrame, *, source: str = "sina"
+) -> int:
     """归一化并 upsert 财务指标。报告期列兼容 日期/report_date。"""
     count = 0
     available_at = _now()
     for _, record in frame.iterrows():
-        report_date = _to_date(record.get("日期") or record.get("report_date"))
+        report_date = _to_date(record.get("日期"))
+        if report_date is None:
+            report_date = _to_date(record.get("report_date"))
         if report_date is None:
             continue
         payload: dict[str, Any] = {
@@ -141,12 +381,97 @@ def _upsert_financial_frame(db: Session, code: str, frame: pd.DataFrame) -> int:
         if row is None:
             row = StockFinancialIndicator(code=code, report_date=report_date)
             db.add(row)
-        row.eps = _to_float(record.get("摊薄每股收益(元)") or record.get("eps"))
-        row.roe = _to_float(record.get("净资产收益率(%)") or record.get("roe"))
+        row.eps = _to_float(record.get("摊薄每股收益(元)"))
+        if row.eps is None:
+            row.eps = _to_float(record.get("eps"))
+        row.roe = _to_float(record.get("净资产收益率(%)"))
+        if row.roe is None:
+            row.roe = _to_float(record.get("roe"))
         row.payload = json.dumps(payload, ensure_ascii=False, default=str)
-        row.available_at = row.available_at or available_at
+        row.source = source
+        notice_date = _to_date(record.get("notice_date"))
+        row.available_at = (
+            datetime.combine(notice_date, _DISCLOSURE_AVAILABLE_TIME, tzinfo=CN_TZ)
+            .astimezone(UTC)
+            if notice_date is not None
+            else row.available_at or available_at
+        )
         count += 1
     return count
+
+
+def import_stocktoday_financial_indicators(
+    db: Session, snapshot_root: Path
+) -> dict[str, Any]:
+    """导入 StockToday 财务指标，并按公告日建立 point-in-time 口径。
+
+    当前模型每个报告期只保存一个版本；若数据源同一报告期存在多次修订，
+    选择最早公告版本，避免最终修订值泄漏到更早的历史回测。所有修订版本
+    仍完整保留在原始 Parquet 中。
+    """
+    base = snapshot_root / "stocks" / "fina_indicator"
+    files = sorted(base.glob("*.parquet"))
+    if not files:
+        return {
+            "status": "failed",
+            "files": 0,
+            "codes": 0,
+            "rows": 0,
+            "errors": [f"未找到 fina_indicator Parquet：{base}"],
+        }
+
+    errors: list[str] = []
+    rows_imported = 0
+    codes_imported = 0
+    for file_index, path in enumerate(files, start=1):
+        try:
+            frame = pd.read_parquet(path)
+            if "end_date" not in frame.columns:
+                raise ValueError("缺少 end_date")
+            frame = frame.copy()
+            frame["_report_date"] = pd.to_datetime(
+                frame["end_date"], errors="coerce"
+            )
+            if "ann_date" in frame.columns:
+                frame["_notice_date"] = pd.to_datetime(
+                    frame["ann_date"], errors="coerce"
+                )
+            else:
+                frame["_notice_date"] = pd.NaT
+            frame = (
+                frame.dropna(subset=["_report_date"])
+                .sort_values(
+                    ["_report_date", "_notice_date"],
+                    na_position="last",
+                )
+                .drop_duplicates("_report_date", keep="first")
+            )
+            frame["report_date"] = frame["_report_date"].dt.date
+            frame["notice_date"] = frame["_notice_date"].dt.date
+            frame = frame.drop(columns=["_report_date", "_notice_date"])
+            if frame.empty:
+                continue
+            if "ts_code" in frame.columns:
+                code = str(frame.iloc[0]["ts_code"]).split(".")[0].zfill(6)
+            else:
+                code = path.stem.split(".")[0].zfill(6)
+            imported = _upsert_financial_frame(
+                db, code, frame, source="stocktoday"
+            )
+            rows_imported += imported
+            codes_imported += imported > 0
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+        if file_index % 25 == 0:
+            db.commit()
+    db.commit()
+    return {
+        "status": "success" if not errors else "partial",
+        "files": len(files),
+        "codes": codes_imported,
+        "rows": rows_imported,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +682,8 @@ def sync_valuations(
     codes: list[str],
     indicators: list[str] | None = None,
     period: str = "近一年",
+    *,
+    max_workers: int = 1,
 ) -> dict[str, Any]:
     """批量同步百度估值。indicators 缺省为 VALUATION_INDICATORS 全部中文名。"""
     state = _begin_task(db, "valuation")
@@ -366,13 +693,26 @@ def sync_valuations(
     errors: list[str] = []
     total_rows = 0
     total_codes = len(codes)
-    for idx, code in enumerate(codes, start=1):
-        code_failed = False
+
+    def fetch_code(code: str) -> list[tuple[str, pd.DataFrame | None]]:
+        return [
+            (name, ak_fetch.fetch_valuation_baidu(code, name, period))
+            for name in names
+        ]
+
+    if max_workers > 1 and len(codes) > 1:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(codes))) as pool:
+            fetched_by_code = list(pool.map(fetch_code, codes))
+    else:
+        fetched_by_code = [fetch_code(code) for code in codes]
+
+    for idx, (code, fetched) in enumerate(
+        zip(codes, fetched_by_code, strict=True), start=1
+    ):
         rows_before = total_rows
-        for name in names:
-            frame = ak_fetch.fetch_valuation_baidu(code, name, period)
+        code_failed = any(frame is None for _name, frame in fetched)
+        for name, frame in fetched:
             if frame is None:
-                code_failed = True
                 continue
             total_rows += _upsert_valuation_frame(db, code, VALUATION_INDICATORS.get(name, name), frame)
         if code_failed and total_rows == rows_before:
@@ -404,6 +744,137 @@ def sync_valuations(
         "failed": failed,
         "rows": total_rows,
         "errors": errors,
+    }
+
+
+def sync_market_valuations(
+    db: Session,
+    trade_date: date,
+    codes: list[str] | None = None,
+) -> dict[str, Any]:
+    """收盘后批量落 PE(TTM) 与 PB，作为百度逐股历史接口的日常主通道。
+
+    腾讯全市场快照直接提供 PE(TTM) 与价格；PB 使用同一收盘价除以最新已入库
+    财报的每股净资产。亏损股没有有效 PE 时仍写入空值，表示“已覆盖但不适用”，
+    因子层会自然将其视为价值指标缺失，而不会把数据源缺失误认为低估。
+    """
+    state = _begin_task(db, "valuation")
+    frame = ak_fetch.fetch_stock_spot_tencent()
+    if frame is None:
+        detail = "腾讯全市场估值快照不可用"
+        _finish_task(db, state, status="failed", detail=detail)
+        return {
+            "task": "valuation",
+            "status": "failed",
+            "total": 0,
+            "updated": 0,
+            "failed": 1,
+            "rows": 0,
+            "errors": [detail],
+        }
+
+    if codes is None:
+        wanted = set(
+            db.scalars(
+                select(IndexConstituent.stock_code).where(
+                    IndexConstituent.index_code.in_(_REFERENCE_INDEX_CODES)
+                )
+            ).all()
+        )
+    else:
+        wanted = {str(code).strip().zfill(6) for code in codes}
+
+    financial_rows = db.scalars(
+        select(StockFinancialIndicator)
+        .where(StockFinancialIndicator.code.in_(wanted))
+        .order_by(
+            StockFinancialIndicator.code,
+            StockFinancialIndicator.report_date.desc(),
+        )
+    ).all()
+    bps_by_code: dict[str, float] = {}
+    for row in financial_rows:
+        if row.code in bps_by_code:
+            continue
+        try:
+            payload = json.loads(row.payload)
+        except (TypeError, ValueError):
+            continue
+        for key in (
+            "BPS",
+            "每股净资产_调整后(元)",
+            "每股净资产_调整前(元)",
+            "调整后的每股净资产(元)",
+        ):
+            bps = _to_float(payload.get(key))
+            if bps is not None and bps > 0:
+                bps_by_code[row.code] = bps
+                break
+
+    records: dict[str, tuple[float | None, float | None]] = {}
+    for _, item in frame.iterrows():
+        raw_code = str(item.get("code") or item.get("代码") or "").strip()
+        digits = "".join(char for char in raw_code if char.isdigit())
+        code = digits[-6:] if len(digits) >= 6 else digits.zfill(6)
+        if code not in wanted:
+            continue
+        price = _to_float(item.get("zxj") or item.get("最新价"))
+        if price is None or price <= 0:
+            continue
+        pe = _to_float(item.get("pe_ttm") or item.get("市盈率(TTM)"))
+        bps = bps_by_code.get(code)
+        pb = price / bps if bps is not None and bps > 0 else None
+        records[code] = (pe, pb)
+
+    updated = 0
+    failed = 0
+    for code in sorted(wanted):
+        values = records.get(code)
+        if values is None or values[1] is None:
+            failed += 1
+            continue
+        for indicator, value in zip(("pe_ttm", "pb"), values, strict=True):
+            row = db.scalar(
+                select(StockValuation).where(
+                    StockValuation.code == code,
+                    StockValuation.trade_date == trade_date,
+                    StockValuation.indicator == indicator,
+                )
+            )
+            if row is None:
+                row = StockValuation(
+                    code=code,
+                    trade_date=trade_date,
+                    indicator=indicator,
+                    source="tencent_close",
+                )
+                db.add(row)
+            row.value = value
+            row.source = "tencent_close"
+        updated += 1
+    db.commit()
+    status = _final_status(updated, failed, processed=len(wanted))
+    detail = (
+        f"{failed} 只缺少腾讯收盘价或财报每股净资产" if failed else None
+    )
+    _finish_task(
+        db,
+        state,
+        total=len(wanted),
+        updated=updated,
+        failed=failed,
+        detail=detail,
+        status=status,
+        clear_last_code=True,
+    )
+    return {
+        "task": "valuation",
+        "status": status,
+        "total": len(wanted),
+        "updated": updated,
+        "failed": failed,
+        "rows": updated * 2,
+        "errors": [detail] if detail else [],
     }
 
 
@@ -441,6 +912,108 @@ def _upsert_valuation_frame(db: Session, code: str, indicator: str, frame: pd.Da
         existing_dates.add(trade_date)
         count += 1
     return count
+
+
+def import_stocktoday_valuations(
+    db: Session, snapshot_root: Path
+) -> dict[str, Any]:
+    """将 StockToday ``daily_basic`` 全历史 PE(TTM)/PB 导入估值表。
+
+    原始宽表继续保存在 Parquet；关系库只物化规则策略实际使用的两项估值，
+    让任意历史打分日都能按当日可见估值计算 EP/BP。
+    """
+    base = snapshot_root / "stocks" / "daily_basic"
+    files = sorted(base.glob("*.parquet"))
+    if not files:
+        return {
+            "status": "failed",
+            "files": 0,
+            "codes": 0,
+            "rows": 0,
+            "errors": [f"未找到 daily_basic Parquet：{base}"],
+        }
+
+    table = StockValuation.__table__
+    dialect = db.get_bind().dialect.name
+    errors: list[str] = []
+    rows_imported = 0
+    codes_imported = 0
+    for file_index, path in enumerate(files, start=1):
+        try:
+            frame = pd.read_parquet(
+                path, columns=["ts_code", "trade_date", "pe_ttm", "pb"]
+            )
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+            continue
+        payloads: list[dict[str, Any]] = []
+        for ts_code_value, trade_date_value, pe_ttm, pb in frame.itertuples(
+            index=False, name=None
+        ):
+            code = str(ts_code_value).split(".")[0].zfill(6)
+            trade_date = _to_date(trade_date_value)
+            if trade_date is None:
+                continue
+            for indicator, raw_value in (("pe_ttm", pe_ttm), ("pb", pb)):
+                payloads.append(
+                    {
+                        "code": code,
+                        "trade_date": trade_date,
+                        "indicator": indicator,
+                        "value": _to_float(raw_value),
+                        "source": "stocktoday",
+                    }
+                )
+        for offset in range(0, len(payloads), 2_000):
+            chunk = payloads[offset : offset + 2_000]
+            if dialect == "sqlite":
+                statement = sqlite_insert(table).values(chunk)
+                statement = statement.on_conflict_do_update(
+                    index_elements=["code", "trade_date", "indicator"],
+                    set_={
+                        "value": statement.excluded.value,
+                        "source": statement.excluded.source,
+                        "updated_at": func.now(),
+                    },
+                )
+                db.execute(statement)
+            elif dialect == "postgresql":
+                statement = postgresql_insert(table).values(chunk)
+                statement = statement.on_conflict_do_update(
+                    index_elements=["code", "trade_date", "indicator"],
+                    set_={
+                        "value": statement.excluded.value,
+                        "source": statement.excluded.source,
+                        "updated_at": func.now(),
+                    },
+                )
+                db.execute(statement)
+            else:
+                for item in chunk:
+                    row = db.scalar(
+                        select(StockValuation).where(
+                            StockValuation.code == item["code"],
+                            StockValuation.trade_date == item["trade_date"],
+                            StockValuation.indicator == item["indicator"],
+                        )
+                    )
+                    if row is None:
+                        db.add(StockValuation(**item))
+                    else:
+                        row.value = item["value"]
+                        row.source = item["source"]
+        rows_imported += len(payloads)
+        codes_imported += bool(payloads)
+        if file_index % 25 == 0:
+            db.commit()
+    db.commit()
+    return {
+        "status": "success" if not errors else "partial",
+        "files": len(files),
+        "codes": codes_imported,
+        "rows": rows_imported,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +1081,13 @@ def _extract_name_segments(text: str) -> list[str]:
     return segments
 
 
-def _upsert_name_frame(db: Session, code: str, frame: pd.DataFrame) -> int:
+def _upsert_name_frame(
+    db: Session,
+    code: str,
+    frame: pd.DataFrame,
+    *,
+    source: str = "akshare",
+) -> int:
     """归一化并 upsert 名称变更历史。
 
     兼容两类数据源：
@@ -588,8 +1167,55 @@ def _upsert_name_frame(db: Session, code: str, frame: pd.DataFrame) -> int:
         row.end_date = end
         row.is_st = _is_st_name(name)
         row.change_reason = reason
+        row.source = source
         count += 1
     return count
+
+
+def import_stocktoday_name_history(
+    db: Session, snapshot_root: Path
+) -> dict[str, Any]:
+    """导入带精确起止日期的曾用名记录，供历史 ST 过滤使用。"""
+    base = snapshot_root / "stocks" / "namechange"
+    files = sorted(base.glob("*.parquet"))
+    if not files:
+        return {
+            "status": "failed",
+            "files": 0,
+            "codes": 0,
+            "rows": 0,
+            "errors": [f"未找到 namechange Parquet：{base}"],
+        }
+
+    errors: list[str] = []
+    rows_imported = 0
+    codes_imported = 0
+    for file_index, path in enumerate(files, start=1):
+        try:
+            frame = pd.read_parquet(path)
+            if frame.empty:
+                continue
+            if "ts_code" in frame.columns:
+                code = str(frame.iloc[0]["ts_code"]).split(".")[0].zfill(6)
+            else:
+                code = path.stem.split(".")[0].zfill(6)
+            imported = _upsert_name_frame(
+                db, code, frame, source="stocktoday"
+            )
+            rows_imported += imported
+            codes_imported += imported > 0
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+        if file_index % 25 == 0:
+            db.commit()
+    db.commit()
+    return {
+        "status": "success" if not errors else "partial",
+        "files": len(files),
+        "codes": codes_imported,
+        "rows": rows_imported,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +1241,122 @@ def _upsert_industry(db: Session, code: str, industry_name: str, source: str) ->
     row.industry_name = industry_name
 
 
-def sync_industries(db: Session, codes: list[str] | None = None) -> dict[str, Any]:
+def import_stocktoday_industries(
+    db: Session, snapshot_root: Path
+) -> dict[str, Any]:
+    """导入当前申万 2021 一级行业，完整三级映射保留在 Parquet。"""
+    base = snapshot_root / "stocks" / "index_member_all"
+    files = sorted(base.glob("*.parquet"))
+    if not files:
+        return {
+            "status": "failed",
+            "files": 0,
+            "codes": 0,
+            "rows": 0,
+            "errors": [f"未找到 index_member_all Parquet：{base}"],
+        }
+
+    source = "stocktoday_sw2021"
+    errors: list[str] = []
+    rows_imported = 0
+    for file_index, path in enumerate(files, start=1):
+        try:
+            frame = pd.read_parquet(path)
+            if frame.empty:
+                continue
+            record = frame.iloc[0]
+            code = str(
+                record.get("ts_code") or path.stem
+            ).split(".")[0].zfill(6)
+            industry_name = str(record.get("l1_name") or "").strip()
+            if not industry_name:
+                raise ValueError("缺少 l1_name")
+            row = db.scalar(
+                select(StockIndustry).where(
+                    StockIndustry.code == code,
+                    StockIndustry.source == source,
+                )
+            )
+            if row is None:
+                row = StockIndustry(
+                    code=code,
+                    source=source,
+                    industry_name=industry_name,
+                )
+                db.add(row)
+            row.name = str(record.get("name") or "").strip() or None
+            row.industry_code = (
+                str(record.get("l1_code") or "").strip() or None
+            )
+            row.industry_name = industry_name
+            rows_imported += 1
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+        if file_index % 25 == 0:
+            db.commit()
+    db.commit()
+    return {
+        "status": "success" if not errors else "partial",
+        "files": len(files),
+        "codes": rows_imported,
+        "rows": rows_imported,
+        "errors": errors,
+    }
+
+
+def _latest_industry_from_change(frame: pd.DataFrame | None) -> str | None:
+    if frame is None:
+        return None
+    if "变更日期" in frame.columns:
+        frame = frame.sort_values("变更日期")
+    latest: str | None = None
+    for _, record in frame.iterrows():
+        name = (
+            record.get("行业中类")
+            or record.get("行业大类")
+            or record.get("行业门类")
+            or record.get("行业名称")
+            or record.get("所属行业")
+            or record.get("industry_name")
+            or record.get("变更后行业")
+        )
+        try:
+            invalid = name is None or pd.isna(name)
+        except (TypeError, ValueError):
+            invalid = name is None
+        if not invalid:
+            text = str(name).strip()
+            if text:
+                latest = text
+    return latest
+
+
+def _fetch_industry_fallback(code: str) -> tuple[str | None, str | None]:
+    """优先取公司概况当前行业，缺失时回看行业变更记录。"""
+    profile = ak_fetch.fetch_stock_profile_cninfo(code)
+    if profile is not None:
+        for _, record in profile.iterrows():
+            name = record.get("所属行业") or record.get("industry_name")
+            if name is not None:
+                text = str(name).strip()
+                if text:
+                    return text, "cninfo_profile"
+    latest = _latest_industry_from_change(
+        ak_fetch.fetch_industry_change_cninfo(code)
+    )
+    return (
+        (latest, _INDUSTRY_SOURCE_CNINFO)
+        if latest
+        else (None, None)
+    )
+
+
+def sync_industries(
+    db: Session,
+    codes: list[str] | None = None,
+    *,
+    max_workers: int = 1,
+) -> dict[str, Any]:
     """同步股票行业归属（主源东财板块成分，巨潮个股变动记录回退补缺）。
 
     - 主源：遍历东财行业板块 -> 每板块抓全量成分 -> 按 code 分配，批量成本低；
@@ -678,39 +1419,21 @@ def sync_industries(db: Session, codes: list[str] | None = None) -> dict[str, An
     elif boards is None:
         # 主源整体不可用且无显式目标时，退化为 master 全表逐股回退
         fallback_targets = list(db.scalars(select(StockMaster.code).order_by(StockMaster.code)).all())
-    for code in fallback_targets:
-        frame = ak_fetch.fetch_industry_change_cninfo(code)
-        if frame is None:
+    if max_workers > 1 and len(fallback_targets) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(max_workers, len(fallback_targets))
+        ) as pool:
+            fallback_rows = list(pool.map(_fetch_industry_fallback, fallback_targets))
+    else:
+        fallback_rows = [_fetch_industry_fallback(code) for code in fallback_targets]
+    for code, (latest, source) in zip(
+        fallback_targets, fallback_rows, strict=True
+    ):
+        if not latest or not source:
             failed += 1
-            errors.append(f"{code}: 巨潮行业回退抓取失败")
+            errors.append(f"{code}: 巨潮行业变更与公司概况均抓取失败")
             continue
-        latest: str | None = None
-        # 优先巨潮标准的行业大类；按变更日期升序取最新记录。
-        if "变更日期" in frame.columns:
-            frame = frame.sort_values("变更日期")
-        for _, record in frame.iterrows():
-            name = (
-                record.get("行业中类")
-                or record.get("行业大类")
-                or record.get("行业门类")
-                or record.get("行业名称")
-                or record.get("所属行业")
-                or record.get("industry_name")
-                or record.get("变更后行业")
-            )
-            try:
-                invalid = name is None or pd.isna(name)
-            except (TypeError, ValueError):
-                invalid = name is None
-            if not invalid:
-                text = str(name).strip()
-                if text:
-                    latest = text
-        if not latest:
-            failed += 1
-            errors.append(f"{code}: 巨潮行业回退无记录")
-            continue
-        _upsert_industry(db, code, latest, _INDUSTRY_SOURCE_CNINFO)
+        _upsert_industry(db, code, latest, source)
         covered.add(code)
         total_rows += 1
         updated += 1

@@ -117,6 +117,9 @@ def test_ensure_default_account_creates_with_defaults(db_session: Session) -> No
     assert account.cash == Decimal("1000000")
     assert account.initial_capital == Decimal("1000000")
     version = db_session.get(StrategyVersion, account.strategy_version_id)
+    assert version.name == "规则模型V2-前向模拟"
+    assert version.status == "paper_testing"
+    assert version.params["purpose"] == "forward_paper_validation"
     assert version.rebalance_interval == 20
     assert Decimal(version.fee_rate) == Decimal("0.001")
     assert version.top_n == 10
@@ -141,6 +144,34 @@ def test_superseded_strategy_cannot_run(db_session: Session) -> None:
     db_session.commit()
     with pytest.raises(PaperError, match="旧方法失效"):
         paper_service.ensure_default_account(db_session)
+
+
+def test_v2_account_does_not_reuse_legacy_v1(db_session: Session) -> None:
+    legacy = StrategyVersion(
+        name=paper_service.LEGACY_STRATEGY_NAME,
+        initial_capital=Decimal("1000000"),
+        rebalance_interval=20,
+        fee_rate=Decimal("0.001"),
+        top_n=10,
+        status="superseded_invalid_methodology",
+        params={"superseded_reason": "旧方法失效"},
+    )
+    db_session.add(legacy)
+    db_session.flush()
+    legacy_account = PaperAccount(
+        strategy_version_id=legacy.id,
+        name=paper_service.DEFAULT_ACCOUNT_NAME,
+        initial_capital=Decimal("1000000"),
+        cash=Decimal("900000"),
+    )
+    db_session.add(legacy_account)
+    db_session.commit()
+
+    active = paper_service.ensure_default_account(db_session)
+    assert active.id != legacy_account.id
+    assert active.strategy_version_id != legacy.id
+    assert active.cash == Decimal("1000000")
+    assert len(db_session.execute(select(PaperAccount)).scalars().all()) == 2
 
 
 def test_summary_without_account_returns_404(client: TestClient) -> None:
@@ -539,10 +570,12 @@ def test_api_run_endpoint_and_idempotency(client: TestClient, db_session: Sessio
     second = client.post("/api/paper/run", json={"run_date": run_date})
     assert second.json()["skipped"] is True
 
-    # 空 body 也可运行（使用当日日期，无新净值则估值不变）
+    # 空 body 使用筛选器真实的数据日期；没有新净值时不新增“交易日”
     third = client.post("/api/paper/run")
     assert third.status_code == 200
-    assert third.json()["rebalanced"] is False  # 第 2 个交易日，非调仓日
+    assert third.json()["skipped"] is True
+    assert third.json()["trading_day_index"] == 1
+    assert "未重复记账" in third.json()["warnings"][0]
 
 
 def test_api_run_invalid_date(client: TestClient, db_session: Session) -> None:

@@ -45,14 +45,30 @@ function StatCard({
 
 /** 区间收益卡：金额 + 收益率 + 覆盖率/滞后提示 */
 function ReturnCard({ view }: { view: ReturnWindowView }) {
-  const hasData = view.returnAmount !== null || view.returnRate !== null;
   const coveragePct = view.coverage !== null ? view.coverage * 100 : null;
   const partial = coveragePct !== null && coveragePct < 99.5;
   const qdiiLag = view.items.some(
     (it) => it.isQdii && it.staleReason !== null && it.status !== "stale"
   );
+  const todayFreshCoverage =
+    view.key === "1d" && view.asOfEndDate
+      ? view.items
+          .filter((item) => item.endDate === view.asOfEndDate)
+          .reduce((sum, item) => sum + (item.weight ?? 0), 0)
+      : null;
+  const todayIsPartial = todayFreshCoverage !== null && todayFreshCoverage < 0.995;
+  const displayedAmount = todayIsPartial
+    ? view.items
+        .filter((item) => item.endDate === view.asOfEndDate)
+        .reduce((sum, item) => sum + (item.returnAmount ?? 0), 0)
+    : view.returnAmount;
+  const displayedRate = todayIsPartial ? null : view.returnRate;
+  const hasData = displayedAmount !== null || displayedRate !== null;
 
   const hints: string[] = [];
+  if (todayIsPartial) {
+    hints.push(`仅汇总今日已更新的 ${(todayFreshCoverage! * 100).toFixed(0)}%，金额仍会变化`);
+  }
   if (partial) hints.push(`覆盖率 ${coveragePct!.toFixed(0)}%`);
   if (qdiiLag) hints.push("QDII 净值滞后");
   if ((view.approximateCount ?? 0) > 0) hints.push("含估算");
@@ -70,12 +86,12 @@ function ReturnCard({ view }: { view: ReturnWindowView }) {
       {hasData ? (
         <>
           <p
-            className={`mt-1.5 text-xl font-semibold tabular-nums sm:text-2xl ${signClass(view.returnAmount)}`}
+            className={`mt-1.5 text-xl font-semibold tabular-nums sm:text-2xl ${signClass(displayedAmount)}`}
           >
-            {fmtMoney(view.returnAmount)}
+            {fmtMoney(displayedAmount)}
           </p>
-          <p className={`mt-0.5 text-sm tabular-nums ${signClass(view.returnRate)}`}>
-            {fmtPercent(view.returnRate)}
+          <p className={`mt-0.5 text-sm tabular-nums ${signClass(displayedRate)}`}>
+            {fmtPercent(displayedRate)}
           </p>
           <p className="mt-1 text-xs text-slate-400">
             {hints.length > 0 ? hints.join(" · ") : "全量覆盖"}
@@ -141,6 +157,13 @@ export default function DashboardPage() {
 
   useEffect(() => {
     void load();
+    const timer = window.setInterval(() => void load(), 60_000);
+    const refreshOnFocus = () => void load();
+    window.addEventListener("focus", refreshOnFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
   }, [load]);
 
   const snapshotDate = summary?.asOf ? fmtDate(summary.asOf) : null;

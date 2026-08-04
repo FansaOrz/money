@@ -15,11 +15,12 @@ from __future__ import annotations
 import csv
 import io
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import delete, select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.orm import Session
 
 from app.models import IndexConstituent, IndexMembershipEvent, StockUniverseSnapshot
@@ -30,6 +31,7 @@ from app.services.research.stock_data import (
     _finish_task,
     _to_date,
 )
+from app.timezone import CN_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +187,160 @@ def import_membership_events_csv(
         "status": "success" if not errors else "success",
         "imported": imported,
         "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def import_stocktoday_index_weights(
+    db: Session, snapshot_root: Path
+) -> dict[str, Any]:
+    """导入 StockToday ``index_weight`` Parquet 为历史快照与调整事件。
+
+    原始权重继续完整保留在 Parquet；数据库物化成员集合，并按相邻快照差异
+    推导 add/remove 事件，使历史回测不再使用今天的成分股产生幸存者偏差。
+    """
+    base = snapshot_root / "indices" / "index_weight"
+    files = sorted(base.glob("*/*.parquet"))
+    if not files:
+        return {
+            "status": "failed",
+            "snapshots_imported": 0,
+            "events_imported": 0,
+            "errors": [f"未找到 index_weight Parquet：{base}"],
+        }
+
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    for path in files:
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+            continue
+        required = {"index_code", "con_code", "trade_date"}
+        if frame.empty or not required.issubset(frame.columns):
+            continue
+        frames.append(frame[list(required)])
+    if not frames:
+        return {
+            "status": "failed",
+            "snapshots_imported": 0,
+            "events_imported": 0,
+            "errors": errors or ["所有 index_weight 分区均为空或缺少必需列"],
+        }
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined["index_code"] = (
+        combined["index_code"].astype(str).str.split(".").str[0]
+    )
+    combined["stock_code"] = (
+        combined["con_code"].astype(str).str.split(".").str[0].str.zfill(6)
+    )
+    combined["snapshot_date"] = pd.to_datetime(
+        combined["trade_date"], errors="coerce"
+    ).dt.date
+    combined = combined.dropna(subset=["snapshot_date"]).drop_duplicates(
+        subset=["index_code", "snapshot_date", "stock_code"], keep="last"
+    )
+
+    existing_snapshot_keys = set(
+        db.execute(
+            select(
+                StockUniverseSnapshot.index_code,
+                StockUniverseSnapshot.snapshot_date,
+                StockUniverseSnapshot.stock_code,
+            ).where(
+                StockUniverseSnapshot.index_code.in_(TRACKED_INDEXES)
+            )
+        ).all()
+    )
+    snapshot_payloads: list[dict[str, Any]] = []
+    event_payloads: list[dict[str, Any]] = []
+    for index_code in TRACKED_INDEXES:
+        index_frame = combined[combined["index_code"] == index_code]
+        previous: set[str] = set()
+        for snapshot_date, group in index_frame.groupby(
+            "snapshot_date", sort=True
+        ):
+            current = set(group["stock_code"].astype(str))
+            for code in sorted(current):
+                key = (index_code, snapshot_date, code)
+                if key not in existing_snapshot_keys:
+                    snapshot_payloads.append(
+                        {
+                            "index_code": index_code,
+                            "snapshot_date": snapshot_date,
+                            "stock_code": code,
+                        }
+                    )
+            available_at = datetime.combine(
+                snapshot_date, time(15, 0), tzinfo=CN_TZ
+            ).astimezone(UTC)
+            event_payloads.extend(
+                {
+                    "index_code": index_code,
+                    "stock_code": code,
+                    "event_type": "add",
+                    "effective_date": snapshot_date,
+                    "source": "stocktoday:index_weight",
+                    "available_at": available_at,
+                }
+                for code in sorted(current - previous)
+            )
+            event_payloads.extend(
+                {
+                    "index_code": index_code,
+                    "stock_code": code,
+                    "event_type": "remove",
+                    "effective_date": snapshot_date,
+                    "source": "stocktoday:index_weight",
+                    "available_at": available_at,
+                }
+                for code in sorted(previous - current)
+            )
+            previous = current
+
+    existing_event_keys = set(
+        db.execute(
+            select(
+                IndexMembershipEvent.index_code,
+                IndexMembershipEvent.stock_code,
+                IndexMembershipEvent.effective_date,
+                IndexMembershipEvent.event_type,
+            ).where(IndexMembershipEvent.index_code.in_(TRACKED_INDEXES))
+        ).all()
+    )
+    event_payloads = [
+        row
+        for row in event_payloads
+        if (
+            row["index_code"],
+            row["stock_code"],
+            row["effective_date"],
+            row["event_type"],
+        )
+        not in existing_event_keys
+    ]
+    for offset in range(0, len(snapshot_payloads), 5_000):
+        db.execute(
+            insert(StockUniverseSnapshot),
+            snapshot_payloads[offset : offset + 5_000],
+        )
+        db.commit()
+    for offset in range(0, len(event_payloads), 5_000):
+        db.execute(
+            insert(IndexMembershipEvent),
+            event_payloads[offset : offset + 5_000],
+        )
+        db.commit()
+    return {
+        "status": "success" if not errors else "partial",
+        "files": len(files),
+        "snapshot_dates": int(
+            combined[["index_code", "snapshot_date"]].drop_duplicates().shape[0]
+        ),
+        "snapshots_imported": len(snapshot_payloads),
+        "events_imported": len(event_payloads),
         "errors": errors,
     }
 

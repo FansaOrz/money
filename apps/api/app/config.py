@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     research_db: str = "./data/research/research.duckdb"
     # 同步日线时每次批量处理的股票数量，避免长时间占用网络
     research_sync_batch_size: int = 200
+    # 调度器中的 A 股任务使用更小批次并在独立子进程中限时执行，
+    # 避免第三方接口卡顿阻塞晚间基金净值任务。
+    scheduled_stock_sync_batch_size: int = 40
+    scheduled_stock_sync_timeout_minutes: int = 60
+    # 当前沪深300+中证500行业/财务缺口的每日补齐批次。
+    scheduled_stock_reference_batch_size: int = 20
 
     # 新闻事件分析在后台调度器中执行，页面请求只读取本地结果。
     news_analysis_enabled: bool = True

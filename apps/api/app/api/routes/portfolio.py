@@ -56,8 +56,8 @@ def portfolio_positions(db: Session = Depends(get_db)) -> PositionListResponse:
 
 @router.post("/sync-navs", response_model=NavSyncResult)
 def sync_navs(db: Session = Depends(get_db)) -> NavSyncResult:
-    """同步全部基金最新净值，并生成组合资产快照。"""
-    return NavSyncResult(**sync_fund_navs(db))
+    """优先同步当前持仓基金最新净值，并生成组合资产快照。"""
+    return NavSyncResult(**sync_fund_navs(db, held_only=True))
 
 
 @router.get("/snapshots", response_model=list[PortfolioSnapshotItem])

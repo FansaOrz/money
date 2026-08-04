@@ -13,9 +13,9 @@ universe 过滤（每个打分日 T 重新计算，即动态 universe）：
 - 行业中性：以 universe 行业市值等权份额为基准，行业目标权重
   = universe 行业只数占比 × 投入仓位（近似流通市值中性，数据缺失时
   按只数口径），单行业权重不超过 max_industry_weight 硬上限；
-- 行业内按复合分排名依次分配，单股权重 ≤ max_stock_weight（默认 5%），
-  截断剩余顺延给同行业下一只；行业无可配股票或行业上限用满时，
-  未用仓位转为现金（不跨行业倒灌，保持行业中性）；
+- 行业内按复合分排名依次分配，单股权重 ≤ max_stock_weight（默认 5%）；
+  基准行业配额未用满时，在入选行业间按剩余容量再分配，但始终遵守
+  单股和单行业硬上限；只有全部容量不足时才持有现金；
 - 月调仓：由回测层按月度节奏调用本模块，本模块保持无状态纯函数。
 
 涨跌停与费用在回测层（stock_backtest）处理；本模块不感知成交价。
@@ -247,7 +247,8 @@ def build_portfolio(
     - 行业目标份额 = universe 中行业只数占比（市值数据缺失时的等权近似），
       并受 max_industry_weight 硬上限约束（上限内按份额与上限取小）；
     - 行业内按复合分从高到低分配，单股 ≤ max_stock_weight，截断顺延；
-    - 行业目标用不满（合格股票不足或全部触顶）的部分转为现金；
+    - 行业基准配额用不满时，在入选行业的剩余风险容量内再分配；
+      全部入选标的容量仍不足时，剩余部分转为现金；
     - 行业覆盖：已知行业占比低于 MIN_KNOWN_INDUSTRY_RATIO 时抛
       IndustryCoverageError（enforce_industry_coverage=False 仅记 warning，
       供研究性因子查询降级使用）。
@@ -294,11 +295,9 @@ def build_portfolio(
 
     target: dict[str, float] = {}
     industry_weight: dict[str, float] = {}
-    shortfall = 0.0
     for industry, quota in industry_quota.items():
         members = by_industry.get(industry, [])
         if not members:
-            shortfall += quota  # 该行业无入选股票：配额留现金
             continue
         remaining = quota
         for item in members:
@@ -310,15 +309,74 @@ def build_portfolio(
             target[item.code] = round(weight, 6)
             industry_weight[industry] = industry_weight.get(industry, 0.0) + weight
             remaining -= weight
-        shortfall += max(remaining, 0.0)
 
+    # 基准行业配额常因全局 top_n 未覆盖所有行业而留下大量现金。将剩余
+    # 资金在“已入选且仍有容量”的行业/股票间回补，同时保持两级硬上限。
+    remaining_cash = max(1.0 - sum(target.values()), 0.0)
+    for _ in range(max(len(ranked), 1) + 1):
+        if remaining_cash <= 1e-10:
+            break
+        capacity_by_industry: dict[str, float] = {}
+        members_by_industry: dict[str, list[factors.FactorResult]] = {}
+        for item in ranked:
+            industry = universe_industries.get(item.code, item.industry or "未知")
+            stock_room = max(max_stock_weight - target.get(item.code, 0.0), 0.0)
+            industry_room = max(
+                max_industry_weight - industry_weight.get(industry, 0.0), 0.0
+            )
+            if stock_room <= 1e-12 or industry_room <= 1e-12:
+                continue
+            members_by_industry.setdefault(industry, []).append(item)
+        for industry, members in members_by_industry.items():
+            stock_capacity = sum(
+                max(max_stock_weight - target.get(item.code, 0.0), 0.0)
+                for item in members
+            )
+            capacity_by_industry[industry] = min(
+                stock_capacity,
+                max(max_industry_weight - industry_weight.get(industry, 0.0), 0.0),
+            )
+        total_capacity = sum(capacity_by_industry.values())
+        if total_capacity <= 1e-12:
+            break
+        to_allocate = min(remaining_cash, total_capacity)
+        allocated = 0.0
+        for industry, capacity in capacity_by_industry.items():
+            industry_add = to_allocate * capacity / total_capacity
+            members = members_by_industry[industry]
+            rooms = {
+                item.code: max(
+                    max_stock_weight - target.get(item.code, 0.0), 0.0
+                )
+                for item in members
+            }
+            room_total = sum(rooms.values())
+            for item in members:
+                addition = industry_add * rooms[item.code] / room_total
+                target[item.code] = target.get(item.code, 0.0) + addition
+                allocated += addition
+            industry_weight[industry] = (
+                industry_weight.get(industry, 0.0) + industry_add
+            )
+        remaining_cash = max(remaining_cash - allocated, 0.0)
+
+    target = {
+        code: round(weight, 6)
+        for code, weight in target.items()
+        if weight > 1e-9
+    }
+    rounded_total = sum(target.values())
+    if rounded_total > 1.0 and target:
+        code = max(target, key=target.get)
+        target[code] = round(target[code] - (rounded_total - 1.0), 6)
     invested = sum(target.values())
     plan.target_weights = dict(sorted(target.items(), key=lambda kv: kv[1], reverse=True))
     plan.invested_weight = round(invested, 6)
     plan.industries = {key: round(value, 6) for key, value in sorted(industry_weight.items())}
-    if shortfall > 1e-9:
+    final_shortfall = max(1.0 - invested, 0.0)
+    if final_shortfall > 1e-6:
         plan.warnings.append(
-            f"行业配额/单股上限截断，{shortfall:.1%} 仓位留为现金（行业中性不跨行业倒灌）"
+            f"单股/单行业风险容量不足，{final_shortfall:.1%} 仓位留为现金"
         )
     return plan
 

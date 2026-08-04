@@ -671,15 +671,31 @@ def sync_fund_nav_history(
     }
 
 
-def sync_fund_navs(db: Session) -> dict[str, int | str | None]:
-    """同步所有基金最新净值并更新持仓市值。"""
-    instruments = db.scalars(select(Instrument).order_by(Instrument.code)).all()
+def sync_fund_navs(
+    db: Session,
+    *,
+    held_only: bool = False,
+) -> dict[str, int | str | bool | None]:
+    """同步基金最新净值并更新持仓市值。
+
+    ``held_only=True`` 时只抓取当前仍有份额的基金，供晚间多轮快速同步使用；
+    全市场目录的历史数据由独立低优先级任务维护，不能拖慢用户持仓收益更新。
+    """
+    query = select(Instrument).order_by(Instrument.code)
+    if held_only:
+        query = (
+            query.join(Position, Position.instrument_id == Instrument.id)
+            .where(Position.shares > 0)
+            .distinct()
+        )
+    instruments = db.scalars(query).all()
     updated = 0
     failed = 0
     latest_dates: list[date] = []
 
     for instrument in instruments:
-        data = fetch_latest_nav(instrument.code)
+        # 持仓会在晚间补抓三轮，单轮宁可快速跳过异常源，也不能被少数超时基金拖住。
+        data = fetch_latest_nav(instrument.code, timeout=6 if held_only else 10)
         if data is None:
             failed += 1
             continue
@@ -714,6 +730,7 @@ def sync_fund_navs(db: Session) -> dict[str, int | str | None]:
         "failed": failed,
         "latest_nav_date": max(latest_dates).isoformat() if latest_dates else None,
         "snapshot_date": snapshot_date.isoformat() if snapshot_date else None,
+        "held_only": held_only,
     }
 
 

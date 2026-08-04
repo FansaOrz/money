@@ -20,11 +20,13 @@ def test_next_run_times_are_aware_beijing() -> None:
 
 def test_nav_schedule_same_day_when_before_deadline() -> None:
     times = next_run_times(_at(10, 0))
+    assert (times["fund_nav_early"].hour, times["fund_nav_early"].minute) == (19, 30)
     nav = times["fund_nav"]
     assert (nav.hour, nav.minute) == (20, 30)
     assert nav.day == 15
-    # paper 与净值同步同刻执行
-    assert times["paper"] == nav
+    assert (times["fund_nav_late"].hour, times["fund_nav_late"].minute) == (22, 0)
+    # paper 等最后一轮净值同步完成后执行，覆盖晚披露基金
+    assert times["paper"] == times["fund_nav_late"]
 
 
 def test_nav_schedule_rolls_to_next_day_after_deadline() -> None:
@@ -32,6 +34,8 @@ def test_nav_schedule_rolls_to_next_day_after_deadline() -> None:
     nav = times["fund_nav"]
     assert (nav.hour, nav.minute) == (20, 30)
     assert nav.day == 16
+    # 22:00 补抓尚未发生，仍应安排在当天。
+    assert times["fund_nav_late"].day == 15
 
 
 def test_indices_schedule_at_market_close() -> None:
@@ -82,6 +86,14 @@ def test_candidate_pool_nav_schedule() -> None:
     assert backfill.day == 15
 
 
+def test_stock_reference_schedule_precedes_market_close() -> None:
+    times = next_run_times(_at(10, 0))
+    reference = times["stock_reference"]
+    daily = times["stock_daily"]
+    assert (reference.hour, reference.minute) == (16, 10)
+    assert reference < daily
+
+
 def test_all_schedules_in_future() -> None:
     now = _at(23, 45, day=31, month=12)
     times = next_run_times(now)
@@ -119,8 +131,8 @@ def test_us_indices_is_independent_job(db_session) -> None:
     assert run.total == 2
 
 
-def test_sync_stock_daily_uses_configured_batch_size(db_session) -> None:
-    """stock_daily 任务不显式截断头部 200 只，走服务的断点续传默认批。"""
+def test_sync_stock_daily_uses_small_scheduled_batch(db_session) -> None:
+    """调度器直调入口使用独立的小批次配置，避免单轮运行数小时。"""
     from app.models.sync_run import SyncRun
     from app.services import scheduler
     from sqlalchemy import select
@@ -137,9 +149,9 @@ def test_sync_stock_daily_uses_configured_batch_size(db_session) -> None:
          patch("app.services.research.stock_data.sync_stock_daily", fake_daily):
         scheduler._sync_stock_daily()
 
-    # 不传 codes / 不传 limit：由 sync_stock_daily 按 research_sync_batch_size 断点选批
+    # 不传 codes；limit 使用调度器专用小批次，服务仍按断点选择标的。
     assert captured["codes"] is None
-    assert "limit" not in captured["kwargs"]
+    assert captured["kwargs"]["limit"] == 40
     run = db_session.scalar(select(SyncRun).where(SyncRun.job_name == "stock_daily"))
     assert run is not None and run.status == "partial"  # 空批次 -> partial 而非 success
 
@@ -154,3 +166,16 @@ def test_main_loop_calls_us_indices_job() -> None:
     # 美股时段不再复用 A/港指数任务
     us_block = source.split("next_us_indices", 1)[1]
     assert "_sync_indices()" not in us_block.split("next_holdings")[0]
+
+
+def test_main_loop_launches_stock_daily_in_background() -> None:
+    """A 股长任务只能启动后台看护，不能在主循环同步执行。"""
+    import inspect
+    from app.services import scheduler
+
+    source = inspect.getsource(scheduler.main)
+    stock_block = source.split("if now >= next_stock_daily:", 1)[1].split(
+        "if now >= next_fund_catalog:", 1
+    )[0]
+    assert "_launch_stock_daily()" in stock_block
+    assert "_sync_stock_daily()" not in stock_block

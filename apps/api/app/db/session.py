@@ -20,6 +20,8 @@ def create_db_engine(database_url: str | None = None) -> Engine:
     if url.startswith("sqlite"):
         # SQLite 默认不允许跨线程使用连接，FastAPI 多线程下需要关闭该检查
         connect_args["check_same_thread"] = False
+        # 后台同步任务会短暂写库；等待当前写事务释放，避免立刻报 database is locked。
+        connect_args["timeout"] = 30
     return create_engine(url, connect_args=connect_args, pool_pre_ping=True)
 
 

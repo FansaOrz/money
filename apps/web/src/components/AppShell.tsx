@@ -87,6 +87,16 @@ function StockScreenerIcon() {
   );
 }
 
+function StockQuantIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4.5 w-4.5">
+      <path d="M3 18l5-6 4 3 6-9" />
+      <path d="M15 6h3v3" />
+      <path d="M4 21h16" />
+    </svg>
+  );
+}
+
 function StockDetailIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4.5 w-4.5">
@@ -211,6 +221,7 @@ const NAV_GROUPS: NavGroup[] = [
         // 个股详情是股票筛选后的上下文页面，不单列不存在的列表入口。
         matchPrefixes: ["/stocks/"],
       },
+      { href: "/stock-quant", label: "A股量化", icon: <StockQuantIcon /> },
     ],
   },
   {

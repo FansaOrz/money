@@ -42,6 +42,14 @@ from app.models.research import (
     StockValuation,
 )
 from app.models.sync_run import SyncRun
+from app.models.stock_paper import (
+    StockPaperAccount,
+    StockPaperNavDaily,
+    StockPaperPosition,
+    StockPaperRun,
+    StockPaperSignal,
+    StockPaperTrade,
+)
 from app.models.transaction import Transaction, TransactionType
 
 __all__ = [
@@ -83,6 +91,12 @@ __all__ = [
     "StockIndustry",
     "StockMaster",
     "StockNameHistory",
+    "StockPaperAccount",
+    "StockPaperNavDaily",
+    "StockPaperPosition",
+    "StockPaperRun",
+    "StockPaperSignal",
+    "StockPaperTrade",
     "StockReportDisclosure",
     "StockSyncState",
     "StockUniverseSnapshot",

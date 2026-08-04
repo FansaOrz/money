@@ -707,6 +707,15 @@ export interface NewsItem {
 
 /** 模拟账户汇总（GET /api/paper/summary） */
 export interface PaperSummary {
+  strategy?: {
+    version_id?: number | string | null;
+    name?: string | null;
+    status?: string | null;
+    initial_capital?: number | string | null;
+    rebalance_interval?: number | string | null;
+    fee_rate?: number | string | null;
+    top_n?: number | string | null;
+  } | null;
   initial_capital?: number | string | null;
   total_value?: number | string | null;
   total_market_value?: number | string | null;
@@ -733,6 +742,8 @@ export interface PaperSummary {
   as_of?: string | null;
   date?: string | null;
   updated_at?: string | null;
+  last_run_date?: string | null;
+  warnings?: string[] | null;
   [key: string]: unknown;
 }
 
@@ -1410,7 +1421,9 @@ export interface StockMasterResponse {
 /** 股票宇宙/范围（GET /api/stocks/universe 列表项） */
 export interface StockUniverseItem {
   code?: string | null;
+  stock_code?: string | null;
   name?: string | null;
+  stock_name?: string | null;
   industry?: string | null;
   sector?: string | null;
   market?: string | null;
@@ -1424,6 +1437,7 @@ export interface StockUniverseResponse {
   universe?: string | null;
   items?: StockUniverseItem[] | null;
   stocks?: StockUniverseItem[] | null;
+  members?: StockUniverseItem[] | null;
   codes?: string[] | null;
   industries?: string[] | null;
   total?: number | string | null;
@@ -1536,6 +1550,7 @@ export interface StockFactorItem {
   sector?: string | null;
   market?: string | null;
   composite_score?: number | string | null;
+  composite?: number | string | null;
   score?: number | string | null;
   rank?: number | string | null;
   percentile?: number | string | null;
@@ -1561,6 +1576,7 @@ export interface StockFactorsResponse {
   items?: StockFactorItem[] | null;
   factors?: StockFactorItem[] | null;
   results?: StockFactorItem[] | null;
+  rows?: StockFactorItem[] | null;
   as_of?: string | null;
   available_at?: string | null;
   total?: number | string | null;
@@ -1663,6 +1679,151 @@ export interface StockBacktestResult {
   methodology?: string | null;
   warnings?: string[] | null;
   [key: string]: unknown;
+}
+
+/** A股规则策略两个月前向模拟。 */
+export interface StockPaperReadiness {
+  ready: boolean;
+  status: string;
+  universe_count: number;
+  daily_ready_count: number;
+  industry_ready_count: number;
+  financial_ready_count: number;
+  valuation_ready_count: number;
+  latest_data_date?: string | null;
+  source_health: Record<string, {
+    status?: string | null;
+    finished_at?: string | null;
+    updated?: number | null;
+    failed?: number | null;
+    detail?: string | null;
+  }>;
+  blockers: string[];
+  warnings: string[];
+}
+
+export interface StockPaperMetrics {
+  total_return?: number | null;
+  benchmark_return?: number | null;
+  excess_return?: number | null;
+  annual_return?: number | null;
+  annual_volatility?: number | null;
+  max_drawdown?: number | null;
+  sharpe?: number | null;
+  win_rate?: number | null;
+  information_ratio?: number | null;
+  trading_days: number;
+  rebalance_count: number;
+  trade_count: number;
+  total_fees: number;
+}
+
+export interface StockPaperStrategy {
+  version_id: number;
+  name: string;
+  status: string;
+  trial_start: string;
+  trial_end: string;
+  calendar_days_elapsed: number;
+  calendar_days_remaining: number;
+  observation_progress: number;
+  candidate_count: number;
+  params: Record<string, unknown>;
+}
+
+export interface StockPaperPosition {
+  code: string;
+  name: string;
+  industry: string;
+  shares: number;
+  cost: number;
+  price?: number | null;
+  market_value?: number | null;
+  weight?: number | null;
+  pnl?: number | null;
+}
+
+export interface StockPaperSignal {
+  id: number;
+  signal_date: string;
+  execute_on?: string | null;
+  status: string;
+  universe_count: number;
+  selected_count: number;
+  invested_weight: number;
+  items: Array<{
+    code: string;
+    name: string;
+    industry: string;
+    rank: number;
+    composite: number;
+    weight: number;
+    quality?: number | null;
+    value?: number | null;
+    momentum?: number | null;
+    trend?: number | null;
+    lowvol?: number | null;
+  }>;
+  warnings: string[];
+}
+
+export interface StockPaperHistoryPoint {
+  date: string;
+  nav: number;
+  benchmark_nav: number;
+  total_value: number;
+  daily_return?: number | null;
+  benchmark_daily_return?: number | null;
+  rebalanced: boolean;
+}
+
+export interface StockPaperSummary {
+  started: boolean;
+  account_id?: number | null;
+  account_name?: string | null;
+  as_of?: string | null;
+  initial_capital: number;
+  cash: number;
+  market_value: number;
+  total_value: number;
+  nav: number;
+  benchmark_nav: number;
+  strategy?: StockPaperStrategy | null;
+  readiness: StockPaperReadiness;
+  metrics: StockPaperMetrics;
+  positions: StockPaperPosition[];
+  latest_signal?: StockPaperSignal | null;
+  history: StockPaperHistoryPoint[];
+  warnings: string[];
+}
+
+export interface StockPaperTrade {
+  id: number;
+  trade_date: string;
+  signal_date: string;
+  code: string;
+  name: string;
+  side: string;
+  shares: number;
+  price: number;
+  amount: number;
+  fee: number;
+  target_weight: number;
+  reason: string;
+}
+
+export interface StockPaperRunResult {
+  account_id: number;
+  run_date: string;
+  skipped: boolean;
+  status: string;
+  signal_generated: boolean;
+  rebalanced: boolean;
+  trade_count: number;
+  total_value: number;
+  nav: number;
+  benchmark_nav: number;
+  warnings: string[];
 }
 
 /** 单只股票聚合详情（GET /api/stocks/{code}/master 等详情端点的宽松结构） */
