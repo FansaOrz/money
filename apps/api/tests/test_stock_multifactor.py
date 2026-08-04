@@ -28,11 +28,13 @@ from app.services import stock_backtest as backtest
 from app.services import stock_factors as factors
 from app.services import stock_strategy as strategy
 from app.services.stock_repository import (
+    CorporateAction,
     Fundamentals,
     NamePeriod,
     StockBar,
     StockInfo,
     TradeCalendar,
+    UniverseMembership,
     board_of,
     one_word_limit,
     price_limit_for,
@@ -98,6 +100,8 @@ def _fundamentals(
         debt_ratio=debt_ratio,
         ep=ep,
         bp=bp,
+        market_cap=10_000_000_000.0,
+        float_market_cap=8_000_000_000.0,
     )
 
 
@@ -118,19 +122,20 @@ def _closes(days: int, growth: float = 0.001) -> list[float]:
 
 
 def test_momentum_12_1_skips_recent_month() -> None:
-    """12-1 动量跳过最近 21 日：端点为 T-21 与 T-273，最近 21 日涨跌不影响。"""
+    """12-1 动量跳过最近21日：端点为T-21与T-252。"""
     base = _closes(300, 0.001)
     m1 = factors.momentum_12_1(base)
     assert m1 is not None
-    expected = base[-22] / base[-274] - 1.0
+    expected = base[-22] / base[-253] - 1.0
     assert m1 == pytest.approx(expected, rel=1e-12)
 
     # 篡改最近 21 日（尾部 21 个点），动量不变
     tampered = base[:-21] + [v * 5.0 for v in base[-21:]]
     assert factors.momentum_12_1(tampered) == pytest.approx(m1, rel=1e-12)
 
-    # 样本不足（< 274）返回 None
-    assert factors.momentum_12_1(_closes(200)) is None
+    # T 到 T-252 共需 253 个点
+    assert factors.momentum_12_1(_closes(252)) is None
+    assert factors.momentum_12_1(_closes(253)) is not None
 
 
 def test_trend_and_lowvol_windows() -> None:
@@ -169,6 +174,45 @@ def test_winsorize_and_zscore() -> None:
     # 单一样本：记 0；缺失保持 None
     assert factors.zscore({"a": 5.0}) == {"a": 0.0}
     assert factors.zscore({"a": None}) == {"a": None}
+
+
+def test_sparse_factor_data_cannot_compete_with_complete_stock() -> None:
+    """仅有技术因子的股票低于覆盖门槛，只展示而不能进入目标组合。"""
+    as_of = START + timedelta(days=299)
+    full = factors.build_context(
+        _info("600001"),
+        _make_bars("600001", 300, 0.001),
+        [_fundamentals("600001")],
+        as_of,
+    )
+    sparse = factors.build_context(
+        _info("600002"),
+        _make_bars("600002", 300, 0.002),
+        [
+            Fundamentals(
+                code="600002",
+                available_at=as_of,
+                market_cap=10_000_000_000.0,
+                float_market_cap=8_000_000_000.0,
+            )
+        ],
+        as_of,
+    )
+    scored = factors.compute_cross_section([full, sparse], as_of)
+    by_code = {item.code: item for item in scored}
+    assert by_code["600001"].eligible
+    assert not by_code["600002"].eligible
+    assert by_code["600002"].data_coverage == pytest.approx(0.45)
+
+    plan = strategy.build_portfolio(
+        scored,
+        [_info("600001"), _info("600002")],
+        as_of,
+        top_n=2,
+        max_stock_weight=1.0,
+        max_industry_weight=1.0,
+    )
+    assert set(plan.target_weights) == {"600001"}
 
 
 def test_industry_neutral_zscore() -> None:
@@ -350,6 +394,8 @@ def test_portfolio_redistributes_unused_industry_quota() -> None:
             name=info.name,
             industry=info.industry,
             composite=30 - index,
+            market_cap=10_000_000_000.0,
+            float_market_cap=8_000_000_000.0,
         )
         for index, info in enumerate(infos)
     ]
@@ -397,6 +443,7 @@ def test_price_limit_blocks_and_defers() -> None:
         initial_capital=1_000_000.0,
         top_n=1,
         max_stock_weight=0.05,
+        initial_signal=True,
     )
     outcome = backtest.run_backtest_panel(
         panel, [_info(code)], {code: [_fundamentals(code)]}, config
@@ -406,6 +453,7 @@ def test_price_limit_blocks_and_defers() -> None:
     # 首笔买入不在涨停的 T+1（顺延），且不晚于区间末日
     first_buy = next(fill for fill in detail.fills if fill.action == "buy")
     assert first_buy.fill_date > bars[301].trade_date
+    assert first_buy.shares % 100 == 0
     assert code in detail.blocked_codes
 
 
@@ -426,6 +474,183 @@ def test_fee_model_min_commission_and_stamp_tax() -> None:
     )
     assert backtest.trade_price(bar, "buy", 0.001) == pytest.approx(10.01)
     assert backtest.trade_price(bar, "sell", 0.001) == pytest.approx(9.99)
+    low_impact = backtest.trade_price(
+        bar, "buy", 0.001, shares=1_000, market_impact_coefficient=0.01
+    )
+    high_impact = backtest.trade_price(
+        bar, "buy", 0.001, shares=100_000, market_impact_coefficient=0.01
+    )
+    assert high_impact > low_impact > 10.01
+
+
+def test_corporate_action_preserves_raw_price_portfolio_value() -> None:
+    """送股与股息应收/到账分日处理，不把除权误算成策略亏损。"""
+    code = "600001"
+    days = [START + timedelta(days=index) for index in range(306)]
+    bars = _make_bars(code, len(days), growth=0.0, start_close=10.0)
+    action_day = days[303]
+    adjusted_bars = [
+        StockBar(
+            code=bar.code,
+            trade_date=bar.trade_date,
+            open=(bar.open / 2 if bar.trade_date >= action_day else bar.open),
+            high=(bar.high / 2 if bar.trade_date >= action_day else bar.high),
+            low=(bar.low / 2 if bar.trade_date >= action_day else bar.low),
+            close=(bar.close / 2 if bar.trade_date >= action_day else bar.close),
+            volume=bar.volume,
+            amount=bar.amount,
+        )
+        for bar in bars
+    ]
+    panel = backtest.MarketPanel(
+        calendar=TradeCalendar(tuple(days)),
+        bars_by_code={code: adjusted_bars},
+        bar_lookup={code: {bar.trade_date: bar for bar in adjusted_bars}},
+        index_series=[],
+        corporate_actions_by_date={
+            action_day: (
+                CorporateAction(
+                    code=code,
+                    action_date=action_day,
+                    kind="share_distribution",
+                    share_ratio=1.0,
+                    event_key="shares-1",
+                    source="test",
+                ),
+                CorporateAction(
+                    code=code,
+                    action_date=action_day,
+                    kind="cash_entitlement",
+                    cash_per_share=0.1,
+                    event_key="cash-1",
+                    payment_date=days[305],
+                    source="test",
+                ),
+            ),
+            days[305]: (
+                CorporateAction(
+                    code=code,
+                    action_date=days[305],
+                    kind="cash_payment",
+                    event_key="cash-1",
+                    payment_date=days[305],
+                    source="test",
+                ),
+            ),
+        },
+    )
+    outcome = backtest.run_backtest_panel(
+        panel,
+        [_info(code)],
+        {code: [_fundamentals(code)]},
+        backtest.BacktestConfig(
+            start=days[300],
+            end=days[-1],
+            initial_signal=True,
+            top_n=1,
+            max_stock_weight=1.0,
+            max_industry_weight=1.0,
+            max_volume_participation=1.0,
+        ),
+    )
+    assert outcome.final_value > 990_000
+    assert any("送转/拆并" in warning for warning in outcome.warnings)
+    assert any("确认现金股利" in warning for warning in outcome.warnings)
+    assert any("现金股利应收" in warning for warning in outcome.warnings)
+
+
+def test_rights_issue_respects_cash_constraint() -> None:
+    """配股认购不得创造现金；现金不足时记录部分认购。"""
+    code = "600001"
+    days = [START + timedelta(days=index) for index in range(306)]
+    bars = _make_bars(code, len(days), growth=0.0, start_close=10.0)
+    action_day = days[303]
+    panel = backtest.MarketPanel(
+        calendar=TradeCalendar(tuple(days)),
+        bars_by_code={code: bars},
+        bar_lookup={code: {bar.trade_date: bar for bar in bars}},
+        index_series=[],
+        corporate_actions_by_date={
+            action_day: (
+                CorporateAction(
+                    code=code,
+                    action_date=action_day,
+                    kind="rights_issue",
+                    subscription_ratio=1.0,
+                    subscription_price=10.0,
+                    event_key="rights-1",
+                    source="test",
+                ),
+            )
+        },
+    )
+    outcome = backtest.run_backtest_panel(
+        panel,
+        [_info(code)],
+        {code: [_fundamentals(code)]},
+        backtest.BacktestConfig(
+            start=days[300],
+            end=days[-1],
+            initial_signal=True,
+            top_n=1,
+            max_stock_weight=1.0,
+            max_industry_weight=1.0,
+            max_volume_participation=1.0,
+        ),
+    )
+    assert outcome.final_value <= 1_001_000
+    assert any("配股因现金约束仅认购" in warning for warning in outcome.warnings)
+
+
+def test_share_merger_converts_position_to_successor() -> None:
+    """换股吸收合并按比例转入存续代码，不能按普通退市清零。"""
+    old_code = "600001"
+    successor = "600002"
+    ratio = 0.5
+    days = [START + timedelta(days=index) for index in range(306)]
+    old_bars = _make_bars(old_code, len(days), growth=0.0, start_close=10.0)
+    successor_bars = _make_bars(
+        successor, len(days), growth=0.0, start_close=20.0
+    )
+    action_day = days[303]
+    panel = backtest.MarketPanel(
+        calendar=TradeCalendar(tuple(days)),
+        bars_by_code={old_code: old_bars, successor: successor_bars},
+        bar_lookup={
+            old_code: {bar.trade_date: bar for bar in old_bars},
+            successor: {bar.trade_date: bar for bar in successor_bars},
+        },
+        index_series=[],
+        corporate_actions_by_date={
+            action_day: (
+                CorporateAction(
+                    code=old_code,
+                    action_date=action_day,
+                    kind="merger",
+                    share_ratio=ratio,
+                    successor_code=successor,
+                    event_key="merger-1",
+                    source="exchange-announcement",
+                ),
+            )
+        },
+    )
+    outcome = backtest.run_backtest_panel(
+        panel,
+        [_info(old_code)],
+        {old_code: [_fundamentals(old_code)]},
+        backtest.BacktestConfig(
+            start=days[300],
+            end=days[-1],
+            initial_signal=True,
+            top_n=1,
+            max_stock_weight=1.0,
+            max_industry_weight=1.0,
+            max_volume_participation=1.0,
+        ),
+    )
+    assert outcome.final_value > 990_000
+    assert any("换为 600002" in warning for warning in outcome.warnings)
 
 
 def test_suspension_blocks_trade() -> None:
@@ -438,6 +663,42 @@ def test_suspension_blocks_trade() -> None:
     assert not ok and "停牌" in reason
     ok, _ = backtest.can_trade(None, 10.0, "sell", 0.098)
     assert not ok
+
+
+def test_real_limit_prices_override_close_return_inference() -> None:
+    """有真实涨跌停价时按开盘是否触板判断，避免用收盘涨停误伤开盘成交。"""
+    opened_normally = StockBar(
+        code="600001",
+        trade_date=START,
+        open=10.5,
+        high=11.0,
+        low=10.4,
+        close=11.0,
+        volume=1e6,
+        amount=1e8,
+        raw_return=0.10,
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    ok, _reason = backtest.can_trade(
+        opened_normally, 10.0, "buy", 0.98
+    )
+    assert ok
+
+    opened_at_limit = StockBar(
+        code="600001",
+        trade_date=START,
+        open=11.0,
+        high=11.0,
+        low=10.8,
+        close=10.9,
+        volume=1e6,
+        amount=1e8,
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    ok, reason = backtest.can_trade(opened_at_limit, 10.0, "buy", 0.98)
+    assert not ok and "真实涨停价" in reason
 
 
 def test_backtest_flat_market_deterministic() -> None:
@@ -502,6 +763,11 @@ def test_backtest_no_lookahead() -> None:
         start=calendar_days[0], end=calendar_days[-1],
         initial_capital=1_000_000.0, top_n=2,
     )
+    last_signal = max(
+        detail_day
+        for detail_day in strategy.month_ends(calendar_days)
+        if detail_day < calendar_days[-1]
+    )
 
     def _targets(bars_by_code: dict[str, list[StockBar]]) -> list[dict[str, float]]:
         panel = backtest.MarketPanel(
@@ -516,14 +782,13 @@ def test_backtest_no_lookahead() -> None:
         outcome = backtest.run_backtest_panel(
             panel, infos, fundamentals_by_code, config
         )
-        return [detail.target for detail in outcome.rebalances]
+        return [
+            detail.target
+            for detail in outcome.rebalances
+            if detail.signal_date <= last_signal
+        ]
 
     base_targets = _targets(_bars(0.0006))
-    last_signal = max(
-        detail_day
-        for detail_day in strategy.month_ends(calendar_days)
-        if detail_day < calendar_days[-1]
-    )
     tampered = _bars(0.0006)
     for code in codes:
         tampered[code] = [
@@ -557,7 +822,7 @@ def test_validation_stats_rank_ic() -> None:
     assert result["quintile_returns"] == []
     assert result["quintile_spread"] is None
 
-    # 样本充足（两个有前瞻收益的信号日 × 6 只 = 12）时：五档 spread 为正
+    # 不能把两个各6只的横截面池化成12只后分档；每期不足10只仍不产出。
     d3 = date(2025, 3, 31)
     scores3 = scores + [(d3, {"a": 3.0, "b": 2.0, "c": 1.0, "d": 0.5, "e": 0.1, "f": -1.0})]
     forwards2 = [
@@ -565,7 +830,27 @@ def test_validation_stats_rank_ic() -> None:
         (d2, {"a": 0.28, "b": 0.18, "c": 0.09, "d": 0.04, "e": 0.02, "f": -0.08}),
     ]
     result2 = backtest.validation_stats(scores3, forwards2)
-    assert result2["quintile_spread"] is not None and result2["quintile_spread"] > 0
+    assert result2["quintile_spread"] is None
+    assert result2["rank_ic_hit_rate"] == pytest.approx(1.0)
+
+    # 每期分别有10只：逐期分档后再汇总，spread 为正。
+    codes = [f"s{index}" for index in range(10)]
+    period_scores = {
+        code: float(index) for index, code in enumerate(codes)
+    }
+    period_returns_1 = {
+        code: index / 100.0 for index, code in enumerate(codes)
+    }
+    period_returns_2 = {
+        code: index / 120.0 for index, code in enumerate(codes)
+    }
+    result3 = backtest.validation_stats(
+        [(d1, period_scores), (d2, period_scores), (d3, period_scores)],
+        [(d1, period_returns_1), (d2, period_returns_2)],
+    )
+    assert result3["quintile_period_count"] == 2
+    assert result3["quintile_spread"] is not None
+    assert result3["quintile_spread"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +927,21 @@ class MockRepository:
             if (start is None or day >= start) and (end is None or day <= end)
         ]
 
+    def universe_members_as_of(
+        self,
+        index_codes: list[str] | tuple[str, ...],
+        as_of_dates: list[date] | tuple[date, ...],
+    ) -> dict[date, UniverseMembership]:
+        members = frozenset(info.code for info in self._infos)
+        return {
+            day: UniverseMembership(
+                as_of=day,
+                members=members,
+                snapshot_dates={index: day for index in index_codes},
+            )
+            for day in as_of_dates
+        }
+
 
 def test_run_backtest_with_mock_repository() -> None:
     """编排层：注入 mock 仓储完成全链路回测（含基准与 validation）。"""
@@ -670,6 +970,81 @@ def test_run_backtest_with_mock_repository() -> None:
     assert len(outcome.equity) == len(outcome.calendar) == len(outcome.benchmark)
     # 等权/指数基准与策略逐日对齐
     assert outcome.benchmark[0] == pytest.approx(1.0)
+
+
+def test_run_backtest_uses_historical_membership_each_signal_date() -> None:
+    """股票调入前、调出后不参与打分，动态股票池不是当前成分静态回放。"""
+    codes = ["600001", "600002"]
+
+    class SwitchingRepository(MockRepository):
+        def universe_members_as_of(
+            self,
+            index_codes: list[str] | tuple[str, ...],
+            as_of_dates: list[date] | tuple[date, ...],
+        ) -> dict[date, UniverseMembership]:
+            return {
+                day: UniverseMembership(
+                    as_of=day,
+                    members=frozenset(
+                        {"600001"} if day <= date(2025, 10, 31) else {"600002"}
+                    ),
+                    snapshot_dates={index: day for index in index_codes},
+                )
+                for day in as_of_dates
+            }
+
+    repo = SwitchingRepository(
+        infos=[_info(code) for code in codes],
+        bars_by_code={code: _make_bars(code, 365, 0.0005) for code in codes},
+        fundamentals_by_code={code: [_fundamentals(code)] for code in codes},
+    )
+    outcome = backtest.run_backtest(
+        config=backtest.BacktestConfig(
+            start=date(2025, 10, 1),
+            end=date(2025, 11, 30),
+            top_n=1,
+        ),
+        repository=repo,
+    )
+    assert [set(scores) for _day, scores in outcome.scores_by_date] == [
+        {"600001"},
+        {"600002"},
+    ]
+    assert any("历史动态股票池已启用" in item for item in outcome.warnings)
+
+
+def test_run_backtest_rejects_incomplete_historical_universe_data() -> None:
+    """历史成员缺少主数据/行情/财务/估值时，不得静默缩小股票池。"""
+
+    class IncompleteRepository(MockRepository):
+        def universe_members_as_of(
+            self,
+            index_codes: list[str] | tuple[str, ...],
+            as_of_dates: list[date] | tuple[date, ...],
+        ) -> dict[date, UniverseMembership]:
+            return {
+                day: UniverseMembership(
+                    as_of=day,
+                    members=frozenset({"600001", "MISSING"}),
+                    snapshot_dates={index: day for index in index_codes},
+                )
+                for day in as_of_dates
+            }
+
+    repo = IncompleteRepository(
+        infos=[_info("600001")],
+        bars_by_code={"600001": _make_bars("600001", 365, 0.0005)},
+        fundamentals_by_code={"600001": [_fundamentals("600001")]},
+    )
+    with pytest.raises(backtest.BacktestError, match="核心数据覆盖"):
+        backtest.run_backtest(
+            config=backtest.BacktestConfig(
+                start=date(2025, 10, 1),
+                end=date(2025, 11, 30),
+                min_universe_data_coverage=0.9,
+            ),
+            repository=repo,
+        )
 
 
 def test_run_backtest_no_repository() -> None:
@@ -941,6 +1316,7 @@ def test_pending_orders_dropped_by_new_signal_warns() -> None:
     config = backtest.BacktestConfig(
         start=calendar_days[0], end=calendar_days[-1],
         initial_capital=1_000_000.0, top_n=1, max_stock_weight=0.05,
+        initial_signal=True,
     )
     outcome = backtest.run_backtest_panel(
         panel, [_info(code)], {code: [_fundamentals(code)]}, config
@@ -972,6 +1348,7 @@ def test_first_period_blocked_buy_eventually_fills() -> None:
     config = backtest.BacktestConfig(
         start=calendar_days[0], end=calendar_days[-1],
         initial_capital=1_000_000.0, top_n=1, max_stock_weight=0.05,
+        initial_signal=True,
     )
     outcome = backtest.run_backtest_panel(
         panel, [_info(code)], {code: [_fundamentals(code)]}, config
@@ -983,7 +1360,7 @@ def test_first_period_blocked_buy_eventually_fills() -> None:
 
 
 def test_turnover_detail_real_values() -> None:
-    """换手率明细真实赋值：建仓 5% 单股 → 首期 turnover = 0.025（Σ|Δw|/2）。"""
+    """换手率按整手实际成交金额计算，而不是按未成交的理论目标权重。"""
     code = "600001"
     bars = _make_bars(code, 320, 0.0005)
     calendar_days = [bar.trade_date for bar in bars[300:308]]
@@ -1001,7 +1378,10 @@ def test_turnover_detail_real_values() -> None:
         panel, [_info(code)], {code: [_fundamentals(code)]}, config
     )
     detail = outcome.rebalances[0]
-    assert detail.turnover == pytest.approx(0.025, abs=1e-4)
+    traded = sum(fill.amount for fill in detail.fills)
+    assert detail.turnover == pytest.approx(
+        0.5 * traded / config.initial_capital, abs=1e-6
+    )
     assert outcome.avg_turnover > 0
 
 

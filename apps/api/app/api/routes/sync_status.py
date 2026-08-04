@@ -4,8 +4,10 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from app.db.session import get_db
+from app.models import DataQualityIssue, PersistentJob
 from app.services import sync_status as sync_status_service
 
 router = APIRouter(prefix="/sync", tags=["sync"])
@@ -31,4 +33,33 @@ def get_sync_status(
         result["next_runs"] = {
             name: run_at.isoformat() for name, run_at in next_run_times().items()
         }
+        failed_jobs = db.scalars(
+            select(PersistentJob)
+            .where(PersistentJob.status == "failed")
+            .order_by(PersistentJob.finished_at.desc())
+            .limit(20)
+        ).all()
+        quality_issues = db.scalars(
+            select(DataQualityIssue)
+            .where(DataQualityIssue.status == "open")
+            .order_by(DataQualityIssue.detected_at.desc())
+            .limit(20)
+        ).all()
+        result["alerts"] = [
+            {
+                "type": "job_failed",
+                "severity": "error",
+                "message": f"{row.job_name}: {row.error or '重试耗尽'}",
+                "correlation_id": row.correlation_id,
+            }
+            for row in failed_jobs
+        ] + [
+            {
+                "type": "data_quality",
+                "severity": row.severity,
+                "message": row.detail,
+                "code": row.code,
+            }
+            for row in quality_issues
+        ]
     return result

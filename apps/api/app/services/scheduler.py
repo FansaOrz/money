@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
@@ -24,12 +25,14 @@ from app.models import (
     CandidatePool,
     CandidatePoolMember,
     Instrument,
+    PersistentJob,
     PortfolioSnapshot,
     StockSyncState,
     SyncRun,
 )
 from app.services.fund_data import backfill_fund_nav_history, sync_fund_navs
 from app.services.sync_status import track_sync_run
+from app.services import job_queue
 from app.timezone import CN_TZ, now_cn
 
 
@@ -49,6 +52,7 @@ logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger(__name__)
 _stock_daily_thread: threading.Thread | None = None
 _SCHEDULED_JOB_NAMES = {
+    "backup_verify",
     "candidate_pool_nav",
     "fund_catalog",
     "fund_nav",
@@ -566,7 +570,30 @@ def next_run_times(now: datetime | None = None) -> dict[str, datetime]:
         "fund_catalog": _next_weekly(now, 6, 2, 30),
         # 候选池历史净值每日低优先级分批回填
         "candidate_pool_nav": _next_daily(now, 3, 23),
+        "backup_verify": _next_weekly(now, 6, 4, 0),
     }
+
+
+def _backup_and_verify() -> None:
+    from app.services.backup import create_backup, verify_backup
+
+    settings = get_settings()
+    destination = (
+        Path(settings.research_data_dir).parent
+        / "backups"
+        / now_cn().strftime("%Y%m%dT%H%M%S")
+    )
+    db = SessionLocal()
+    try:
+        create_backup(
+            db,
+            database_url=settings.database_url,
+            research_data_dir=Path(settings.research_data_dir),
+            destination=destination,
+        )
+        verify_backup(destination)
+    finally:
+        db.close()
 
 
 def _needs_initial_sync() -> bool:
@@ -582,8 +609,73 @@ def _needs_initial_sync() -> bool:
         db.close()
 
 
+def _run_persisted(
+    job_name: str,
+    scheduled_for: datetime,
+    callback: Any,
+    *,
+    depends_on: list[str] | None = None,
+) -> None:
+    """以数据库租约执行一次计划任务；重启后可重试且同一时点不重复。"""
+    db = SessionLocal()
+    try:
+        job = job_queue.enqueue(
+            db,
+            job_name,
+            scheduled_for,
+            depends_on=depends_on,
+        )
+        if job.status == "success":
+            return
+        if depends_on:
+            completed = set(
+                db.scalars(
+                    select(PersistentJob.job_name).where(
+                        PersistentJob.job_name.in_(depends_on),
+                        PersistentJob.status == "success",
+                        PersistentJob.scheduled_for <= scheduled_for,
+                    )
+                ).all()
+            )
+            if not set(depends_on).issubset(completed):
+                job.error = "等待依赖：" + ",".join(
+                    sorted(set(depends_on) - completed)
+                )
+                db.commit()
+                return
+        now = now_cn()
+        if (
+            job.status == "running"
+            and job.locked_until is not None
+            and job.locked_until > now
+        ):
+            return
+        job.status = "running"
+        job.attempt += 1
+        job.locked_by = f"scheduler:{threading.get_ident()}"
+        job.locked_until = now + timedelta(
+            minutes=get_settings().scheduled_stock_sync_timeout_minutes
+        )
+        db.commit()
+        try:
+            callback()
+        except Exception as exc:
+            job_queue.fail(db, job, str(exc))
+            raise
+        else:
+            job_queue.complete(db, job)
+    finally:
+        db.close()
+
+
 def main() -> None:
-    create_tables()
+    if get_settings().auto_create_tables:
+        create_tables()
+    recovery_db = SessionLocal()
+    try:
+        job_queue.recover_expired(recovery_db, now_cn())
+    finally:
+        recovery_db.close()
     _recover_interrupted_runs()
     _recover_stale_stock_daily_run()
     if _needs_initial_sync():
@@ -604,6 +696,7 @@ def main() -> None:
     next_stock_paper = schedule["stock_paper"]
     next_fund_catalog = schedule["fund_catalog"]
     next_candidate_pool_nav = schedule["candidate_pool_nav"]
+    next_backup_verify = schedule["backup_verify"]
 
     logger.info(
         "调度器已启动，持仓净值三轮同步（北京时间）：%s / %s / %s",
@@ -614,43 +707,84 @@ def main() -> None:
     while True:
         now = now_cn()
         if now >= next_news:
-            _sync_news()
+            _run_persisted("news", next_news, _sync_news)
             next_news += timedelta(hours=1)
         if now >= next_market_close:
-            _sync_indices()
+            _run_persisted("indices", next_market_close, _sync_indices)
             next_market_close += timedelta(days=1)
         if now >= next_nav_early:
-            _sync_navs(job_name="fund_nav_early")
+            _run_persisted(
+                "fund_nav_early",
+                next_nav_early,
+                lambda: _sync_navs(job_name="fund_nav_early"),
+            )
             next_nav_early += timedelta(days=1)
         if now >= next_nav:
-            _sync_navs(job_name="fund_nav")
+            _run_persisted(
+                "fund_nav", next_nav, lambda: _sync_navs(job_name="fund_nav")
+            )
             next_nav += timedelta(days=1)
         if now >= next_nav_late:
-            _sync_navs(job_name="fund_nav_late")
-            _run_paper()
+            _run_persisted(
+                "fund_nav_late",
+                next_nav_late,
+                lambda: _sync_navs(job_name="fund_nav_late"),
+            )
+            _run_persisted(
+                "paper", next_nav_late, _run_paper, depends_on=["fund_nav_late"]
+            )
             next_nav_late += timedelta(days=1)
         if now >= next_us_indices:
-            _sync_us_indices()
+            _run_persisted(
+                "us_indices", next_us_indices, lambda: _sync_us_indices()
+            )
             next_us_indices += timedelta(days=1)
         if now >= next_holdings:
-            _sync_holdings()
+            _run_persisted("holdings", next_holdings, _sync_holdings)
             next_holdings = _advance_month(next_holdings)
         if now >= next_stock_daily:
-            _sync_stock_market_close()
-            _launch_stock_daily()
+            _run_persisted(
+                "stock_market_close", next_stock_daily, _sync_stock_market_close
+            )
+            _run_persisted(
+                "stock_daily",
+                next_stock_daily,
+                lambda: _launch_stock_daily(),
+                depends_on=["stock_market_close"],
+            )
             next_stock_daily += timedelta(days=1)
         if now >= next_stock_reference:
-            _sync_stock_reference()
+            _run_persisted(
+                "stock_reference", next_stock_reference, _sync_stock_reference
+            )
             next_stock_reference += timedelta(days=1)
         if now >= next_stock_paper:
-            _run_stock_paper()
+            _run_persisted(
+                "stock_paper",
+                next_stock_paper,
+                _run_stock_paper,
+                depends_on=["stock_daily"],
+            )
             next_stock_paper += timedelta(days=1)
         if now >= next_fund_catalog:
-            _sync_fund_catalog()
+            _run_persisted(
+                "fund_catalog", next_fund_catalog, _sync_fund_catalog
+            )
             next_fund_catalog += timedelta(days=7)
         if now >= next_candidate_pool_nav:
-            _sync_candidate_pool_nav()
+            _run_persisted(
+                "candidate_pool_nav",
+                next_candidate_pool_nav,
+                _sync_candidate_pool_nav,
+            )
             next_candidate_pool_nav += timedelta(days=1)
+        if now >= next_backup_verify:
+            _run_persisted(
+                "backup_verify",
+                next_backup_verify,
+                lambda: _backup_and_verify(),
+            )
+            next_backup_verify += timedelta(days=7)
         time.sleep(30)
 
 

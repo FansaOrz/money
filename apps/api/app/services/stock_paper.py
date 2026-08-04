@@ -13,10 +13,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import platform
+import subprocess
+import sys
 from calendar import monthrange
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 from statistics import fmean
 
 from sqlalchemy import func, select
@@ -31,6 +38,7 @@ from app.models import (
     StockPaperAccount,
     StockPaperNavDaily,
     StockPaperPosition,
+    StockPaperReceivable,
     StockPaperRun,
     StockPaperSignal,
     StockPaperTrade,
@@ -49,7 +57,14 @@ from app.schemas.stock_paper import (
     StockPaperSummary,
 )
 from app.services import quant_stats as stats
-from app.services import stock_backtest, stock_factors, stock_strategy
+from app.services import (
+    stock_backtest,
+    stock_factors,
+    stock_strategy,
+    stock_validation,
+    strategy_lifecycle,
+)
+from app.services.quant_data_governance import save_readiness
 from app.services.stock_repository import (
     StockBar,
     StockInfo,
@@ -59,7 +74,7 @@ from app.services.stock_repository import (
 )
 from app.timezone import now_cn
 
-STRATEGY_NAME = "A股多因子规则V3-全覆盖组合修正版两个月前向验证"
+STRATEGY_NAME = "A股多因子规则V4-全链路治理版两个月前向验证"
 ACCOUNT_NAME = "A股规则策略模拟账户"
 INITIAL_CAPITAL = Decimal("1000000.00")
 TRIAL_MONTHS = 2
@@ -70,6 +85,12 @@ MAX_STOCK_WEIGHT = 0.05
 MAX_INDUSTRY_WEIGHT = 0.20
 MIN_AVG_AMOUNT = 5e7
 PRICE_LIMIT_COEFFICIENT = 0.98
+MAX_VOLUME_PARTICIPATION = 0.10
+MINIMUM_TRADE_WEIGHT = 0.002
+MINIMUM_HOLDINGS = 20
+MAX_ANNUAL_VOLATILITY = 0.25
+MAX_TRACKING_ERROR = 0.15
+REQUIRE_PREVALIDATION = True
 COST = stock_backtest.CostModel(
     commission_rate=0.00025,
     min_commission=5.0,
@@ -86,10 +107,12 @@ METHODOLOGY = (
     "A股规则多因子两个月前向验证：候选池在账户创建时冻结为沪深300+中证500"
     "全部当前成分，且启动前逐只校验日线、行业、财务和PE/PB估值覆盖；"
     "动态剔除ST/停牌/次新/低流动性；"
-    "质量30%、价值25%、12-1动量20%、趋势15%、低波10%，行业内缩尾和标准化；"
-    "月频调仓，单股5%、单行业20%，未用行业基准配额在风险上限内回补，"
-    "容量不足部分持有现金；T日收盘生成信号，"
-    "T+1开盘成交，含佣金最低5元、卖出印花税和0.1%滑点；停牌及涨跌停顺延。"
+    "质量30%（含ROA/应计/稳定性）、价值25%（含SP/股息/FCF）、"
+    "动量20%（12-1/6-1/反转/残差）、趋势15%、低风险10%，"
+    "行业内缩尾和标准化；月频调仓，自由流通市值行业基准，约束单股5%、"
+    "单行业20%、市值/Beta/流动性和ADV容量，持仓保留区与最小交易权重"
+    "降低抖动；T日收盘生成信号，T+1开盘成交，含最低佣金、卖出印花税、"
+    "波动与成交参与率动态滑点；部分成交、公司行为、停牌及涨跌停顺延。"
     "仅用于前向模拟研究，不构成投资建议，不产生真实订单。"
 )
 
@@ -190,7 +213,11 @@ def get_readiness(db: Session) -> StockPaperReadiness:
     financial_ready = (
         db.scalar(
             select(func.count(func.distinct(StockFinancialIndicator.code))).where(
-                StockFinancialIndicator.code.in_(universe)
+                StockFinancialIndicator.code.in_(universe),
+                StockFinancialIndicator.report_date
+                >= latest - timedelta(days=550)
+                if latest is not None
+                else True,
             )
         )
         or 0
@@ -205,6 +232,7 @@ def get_readiness(db: Session) -> StockPaperReadiness:
             .where(
                 StockValuation.code.in_(universe),
                 StockValuation.trade_date <= latest,
+                StockValuation.trade_date >= latest - timedelta(days=10),
                 StockValuation.indicator.in_(("pe_ttm", "pb")),
             )
             .group_by(StockValuation.code)
@@ -264,6 +292,65 @@ def get_readiness(db: Session) -> StockPaperReadiness:
     )
 
 
+def _persist_field_readiness(db: Session, signal_date: date) -> dict[str, object]:
+    """生成逐股、逐必需字段的新鲜度/非空门禁报告。"""
+    universe = _base_universe_codes(db)
+    daily = set(
+        db.scalars(
+            select(StockDailyBar.code).where(
+                StockDailyBar.code.in_(universe),
+                StockDailyBar.last_trade_date >= signal_date - timedelta(days=7),
+            )
+        ).all()
+    )
+    industry = set(
+        db.scalars(
+            select(StockIndustry.code)
+            .where(StockIndustry.code.in_(universe))
+            .distinct()
+        ).all()
+    )
+    financial = set(
+        db.scalars(
+            select(StockFinancialIndicator.code)
+            .where(
+                StockFinancialIndicator.code.in_(universe),
+                StockFinancialIndicator.report_date
+                >= signal_date - timedelta(days=550),
+            )
+            .distinct()
+        ).all()
+    )
+    valuation_rows = db.execute(
+        select(
+            StockValuation.code,
+            func.count(func.distinct(StockValuation.indicator)),
+        )
+        .where(
+            StockValuation.code.in_(universe),
+            StockValuation.trade_date.between(
+                signal_date - timedelta(days=10), signal_date
+            ),
+            StockValuation.indicator.in_(("pe_ttm", "pb")),
+            StockValuation.value.is_not(None),
+        )
+        .group_by(StockValuation.code)
+    ).all()
+    valuation = {
+        code for code, count in valuation_rows if int(count) == 2
+    }
+    rows = {
+        code: {
+            "daily_same_period": code in daily,
+            "industry_sw2021": code in industry,
+            "financial_recent": code in financial,
+            "pe_pb_recent_non_null": code in valuation,
+        }
+        for code in universe
+    }
+    return save_readiness(db, STRATEGY_NAME, signal_date, rows)
+
+
 def _ready_candidate_codes(db: Session, latest: date) -> list[str]:
     universe = _base_universe_codes(db)
     if not universe:
@@ -302,6 +389,10 @@ def _ensure_account(db: Session, data_date: date) -> tuple[StockPaperAccount, St
             )
         )
         if account is not None:
+            if version.status != "paper":
+                raise StockPaperError(
+                    f"策略版本状态为 {version.status}，不是可运行的 paper 状态"
+                )
             return account, version
 
     readiness = get_readiness(db)
@@ -313,44 +404,105 @@ def _ensure_account(db: Session, data_date: date) -> tuple[StockPaperAccount, St
             f"完整覆盖校验失败：日线与行业同时就绪 {len(candidates)} 只，"
             "必须与沪深300+中证500完整候选池一致"
         )
+    repository_root = Path(__file__).resolve().parents[4]
+    git_sha: str | None = None
+    git_status = ""
+    try:
+        git_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        git_status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        pass
+    manifest = repository_root / "data/research/tushare_snapshot/manifest.jsonl"
+    manifest_sha256 = (
+        hashlib.sha256(manifest.read_bytes()).hexdigest()
+        if manifest.exists()
+        else None
+    )
+    candidate_sha256 = hashlib.sha256(
+        json.dumps(
+            candidates, ensure_ascii=False, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
     params = {
         "asset": "cn_stock",
-        "model_version": "stock_rules_v2",
+        "model_version": "stock_rules_v4",
         "purpose": "two_month_forward_paper_validation",
         "indices": list(INDEX_CODES),
         "candidate_count": len(candidates),
+        "candidate_sha256": candidate_sha256,
+        "git_sha": git_sha,
+        "git_worktree_clean": not bool(git_status.strip()),
+        "git_status_sha256": hashlib.sha256(git_status.encode()).hexdigest(),
+        "stocktoday_manifest_sha256": manifest_sha256,
+        "data_as_of": data_date.isoformat(),
         "factor_weights": dict(stock_factors.DEFAULT_FAMILY_WEIGHTS),
         "top_n": TOP_N,
         "max_stock_weight": MAX_STOCK_WEIGHT,
         "max_industry_weight": MAX_INDUSTRY_WEIGHT,
         "min_avg_amount": MIN_AVG_AMOUNT,
         "price_limit_coefficient": PRICE_LIMIT_COEFFICIENT,
+        "max_volume_participation": MAX_VOLUME_PARTICIPATION,
+        "minimum_trade_weight": MINIMUM_TRADE_WEIGHT,
+        "minimum_holdings": MINIMUM_HOLDINGS,
+        "max_annual_volatility": MAX_ANNUAL_VOLATILITY,
+        "max_tracking_error": MAX_TRACKING_ERROR,
         "cost": {
             "commission_rate": COST.commission_rate,
             "min_commission": COST.min_commission,
             "stamp_tax_rate": COST.stamp_tax_rate,
             "slippage_rate": COST.slippage_rate,
+            "market_impact_coefficient": COST.market_impact_coefficient,
+            "volatility_slippage_coefficient": (
+                COST.volatility_slippage_coefficient
+            ),
+            "max_total_slippage": COST.max_total_slippage,
+        },
+        "runtime": {
+            "python": sys.version,
+            "platform": platform.platform(),
         },
         "methodology": METHODOLOGY,
     }
-    version = StrategyVersion(
-        name=STRATEGY_NAME,
-        initial_capital=INITIAL_CAPITAL,
-        rebalance_interval=20,
-        fee_rate=_weight(COST.commission_rate),
-        top_n=TOP_N,
-        params=params,
-        status="paper_testing",
-    )
-    db.add(version)
-    db.flush()
+    if version is None:
+        version = StrategyVersion(
+            name=STRATEGY_NAME,
+            initial_capital=INITIAL_CAPITAL,
+            rebalance_interval=20,
+            fee_rate=_weight(COST.commission_rate),
+            top_n=TOP_N,
+            params=params,
+            status="research" if REQUIRE_PREVALIDATION else "paper",
+        )
+        db.add(version)
+        db.commit()
+        db.refresh(version)
+    if version.status != "paper":
+        raise StockPaperError(
+            f"策略版本 {version.id} 尚处于 {version.status}；请先调用"
+            " /api/stocks/paper/prepare 完成 purged walk-forward、完全留出集"
+            "和实验快照门禁"
+        )
     account = StockPaperAccount(
         strategy_version_id=version.id,
         name=ACCOUNT_NAME,
         initial_capital=INITIAL_CAPITAL,
         cash=INITIAL_CAPITAL,
         benchmark_nav=Decimal("1"),
-        status="paper_testing",
+        status="paper",
         trial_start=data_date,
         trial_end=_add_months(data_date, TRIAL_MONTHS),
         candidate_codes=candidates,
@@ -359,6 +511,201 @@ def _ensure_account(db: Session, data_date: date) -> tuple[StockPaperAccount, St
     db.commit()
     db.refresh(account)
     return account, version
+
+
+def prepare_forward_account(
+    db: Session,
+    *,
+    start: date,
+    end: date,
+    top_n_grid: list[int],
+    max_stock_weight_grid: list[float],
+    embargo_days: int = 21,
+) -> dict[str, object]:
+    """用系统生成的证据晋级 research→validated→paper，并创建空账户。"""
+    if start >= end:
+        raise StockPaperError("验证开始日期必须早于结束日期")
+    readiness = get_readiness(db)
+    if not readiness.ready or readiness.latest_data_date is None:
+        raise StockPaperError("；".join(readiness.blockers))
+    data_date = date.fromisoformat(readiness.latest_data_date)
+    if end > data_date:
+        raise StockPaperError(
+            f"验证结束日 {end.isoformat()} 晚于数据日 {data_date.isoformat()}"
+        )
+
+    version = db.scalar(
+        select(StrategyVersion)
+        .where(StrategyVersion.name == STRATEGY_NAME)
+        .order_by(StrategyVersion.id.desc())
+        .limit(1)
+    )
+    if version is None:
+        try:
+            _ensure_account(db, data_date)
+        except StockPaperError:
+            pass
+        version = db.scalar(
+            select(StrategyVersion)
+            .where(StrategyVersion.name == STRATEGY_NAME)
+            .order_by(StrategyVersion.id.desc())
+            .limit(1)
+        )
+    if version is None:
+        raise StockPaperError("研究策略版本创建失败")
+    if version.status == "paper":
+        account, _ = _ensure_account(db, data_date)
+        validation = dict(version.params or {}).get("validation", {})
+        return {
+            "version_id": version.id,
+            "status": version.status,
+            "account_id": account.id,
+            "data_date": data_date,
+            "validation": validation,
+        }
+    if version.status != "research":
+        raise StockPaperError(
+            f"策略版本已处于 {version.status}，不能重复评估留出集；"
+            "参数变化必须创建新策略名/版本"
+        )
+    if dict(version.params or {}).get("validation_sha256"):
+        raise StockPaperError(
+            "该研究版本已经评估过完全留出集，禁止重复评估；"
+            "参数或数据变化必须创建新策略版本"
+        )
+
+    repository_root = Path(__file__).resolve().parents[4]
+    try:
+        git_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        git_status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise StockPaperError("无法读取 Git 实验快照，拒绝评估留出集") from exc
+    if git_status.strip():
+        changed = [
+            line[3:] for line in git_status.splitlines() if len(line) > 3
+        ]
+        preview = "、".join(changed[:5])
+        suffix = " 等" if len(changed) > 5 else ""
+        raise StockPaperError(
+            "工作区存在未提交改动，无法冻结可复现实验："
+            f"{preview}{suffix}；请提交后重新执行"
+        )
+    params = dict(version.params or {})
+    params.update(
+        {
+            "git_sha": git_sha,
+            "git_worktree_clean": True,
+            "git_status_sha256": hashlib.sha256(
+                git_status.encode()
+            ).hexdigest(),
+        }
+    )
+    version.params = params
+    db.commit()
+
+    repository = _repo(db)
+    base = stock_backtest.BacktestConfig(
+        start=start,
+        end=end,
+        initial_capital=float(INITIAL_CAPITAL),
+        top_n=TOP_N,
+        max_stock_weight=MAX_STOCK_WEIGHT,
+        max_industry_weight=MAX_INDUSTRY_WEIGHT,
+        min_avg_amount=MIN_AVG_AMOUNT,
+        price_limit=PRICE_LIMIT_COEFFICIENT,
+        universe_indices=INDEX_CODES,
+        min_universe_data_coverage=0.95,
+        max_volume_participation=MAX_VOLUME_PARTICIPATION,
+        minimum_trade_weight=MINIMUM_TRADE_WEIGHT,
+        minimum_holdings=MINIMUM_HOLDINGS,
+        max_annual_volatility=MAX_ANNUAL_VOLATILITY,
+        max_tracking_error=MAX_TRACKING_ERROR,
+        cost=COST,
+    )
+    try:
+        validation = stock_validation.run_stock_walk_forward(
+            repository,
+            base,
+            top_n_grid or [TOP_N],
+            max_stock_weight_grid or [MAX_STOCK_WEIGHT],
+            embargo_days,
+        )
+    except (
+        stock_backtest.BacktestError,
+        stock_strategy.IndustryCoverageError,
+    ) as exc:
+        raise StockPaperError(str(exc)) from exc
+    frozen = json.dumps(
+        validation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    params = dict(version.params or {})
+    params["validation"] = validation
+    params["validation_sha256"] = hashlib.sha256(frozen.encode()).hexdigest()
+    version.params = params
+    db.commit()
+
+    holdout = dict(validation.get("holdout", {}))
+    evidence = {
+        "data_coverage": validation.get("minimum_data_coverage", 0.0),
+        "holdout_evaluations": validation.get("holdout_evaluations"),
+        "walkforward_folds": len(validation.get("folds", [])),
+        "holdout_sharpe": holdout.get("sharpe"),
+        "validation_sha256": params["validation_sha256"],
+        "generated_by": "stock_validation.run_stock_walk_forward",
+    }
+    try:
+        version = strategy_lifecycle.transition(
+            db,
+            version.id,
+            "validated",
+            evidence=evidence,
+            actor="system:stock-paper-prepare",
+            reason="系统生成的历史走步与完全留出验证通过",
+        )
+        version = strategy_lifecycle.transition(
+            db,
+            version.id,
+            "paper",
+            evidence={
+                "experiment_snapshot_complete": all(
+                    params.get(key)
+                    for key in (
+                        "git_sha",
+                        "git_worktree_clean",
+                        "candidate_sha256",
+                        "data_as_of",
+                        "validation_sha256",
+                    )
+                ),
+                "validation_sha256": params["validation_sha256"],
+            },
+            actor="system:stock-paper-prepare",
+            reason="参数、代码、候选池、数据与验证结果均已冻结",
+        )
+    except ValueError as exc:
+        raise StockPaperError(str(exc)) from exc
+    account, version = _ensure_account(db, data_date)
+    return {
+        "version_id": version.id,
+        "status": version.status,
+        "account_id": account.id,
+        "data_date": data_date,
+        "validation": validation,
+    }
 
 
 def _repo(db: Session) -> StockRepository:
@@ -379,8 +726,21 @@ def _generate_signal(
     """复用生产因子/组合逻辑生成不可变信号快照。"""
     codes = list(account.candidate_codes)
     infos = repository.list_stocks(codes)
+    industry_fn = getattr(repository, "industries_as_of", None)
+    if callable(industry_fn):
+        historical = industry_fn(codes, [signal_date]).get(signal_date, {})
+        if not historical:
+            raise StockPaperError(
+                f"{signal_date.isoformat()} 缺少申万2021历史行业归属"
+            )
+        infos = [
+            replace(info, industry=historical.get(info.code, "未知"))
+            for info in infos
+        ]
     panel = stock_backtest.build_panel(repository, codes, None, signal_date)
-    fundamentals = stock_backtest.load_fundamentals_by_code(repository, codes)
+    fundamentals = stock_backtest.load_fundamentals_by_code(
+        repository, codes, [signal_date]
+    )
     universe, filters = stock_strategy.build_universe(
         infos,
         panel.bars_by_code,
@@ -404,6 +764,15 @@ def _generate_signal(
         if stock_factors.history_depth(item) >= stock_factors.MIN_HISTORY_DAYS
     ]
     scored = stock_factors.compute_cross_section(contexts, signal_date)
+    positions = _position_rows(db, account.id)
+    _total, values = _portfolio_value(
+        db, account, positions, panel.bars_by_code, signal_date
+    )
+    current_weights = (
+        {code: value / _total for code, value in values.items()}
+        if _total > 0
+        else {}
+    )
     try:
         plan = stock_strategy.build_portfolio(
             scored,
@@ -412,6 +781,12 @@ def _generate_signal(
             top_n=TOP_N,
             max_stock_weight=MAX_STOCK_WEIGHT,
             max_industry_weight=MAX_INDUSTRY_WEIGHT,
+            current_weights=current_weights,
+            portfolio_value=_total,
+            max_adv_participation=MAX_VOLUME_PARTICIPATION,
+            minimum_holdings=MINIMUM_HOLDINGS,
+            max_annual_volatility=MAX_ANNUAL_VOLATILITY,
+            max_tracking_error=MAX_TRACKING_ERROR,
         )
     except stock_strategy.IndustryCoverageError as exc:
         raise StockPaperError(str(exc)) from exc
@@ -425,6 +800,8 @@ def _generate_signal(
             "industry": selected[code].industry,
             "rank": rank[code],
             "composite": round(selected[code].composite, 6),
+            "data_coverage": round(selected[code].data_coverage, 6),
+            "data_warnings": list(selected[code].data_warnings),
             "weight": weight,
             "quality": selected[code].quality,
             "value": selected[code].value,
@@ -438,6 +815,41 @@ def _generate_signal(
     warnings = list(plan.warnings)
     if excluded:
         warnings.append(f"动态股票池过滤剔除 {excluded} 只")
+    filter_by_code = {item.code: item for item in filters}
+    run.result = {
+        **dict(run.result or {}),
+        "factor_snapshot": [
+            {
+                "code": item.code,
+                "name": item.name,
+                "industry": item.industry,
+                "rank": rank[item.code],
+                "selected": item.code in plan.target_weights,
+                "target_weight": plan.target_weights.get(item.code, 0.0),
+                "composite": round(item.composite, 8),
+                "data_coverage": round(item.data_coverage, 6),
+                "eligible": item.eligible,
+                "raw": dict(item.raw),
+                "zscores": dict(item.zscores),
+                "data_warnings": list(item.data_warnings),
+                "filter_reasons": list(
+                    filter_by_code[item.code].reasons
+                    if item.code in filter_by_code
+                    else []
+                ),
+            }
+            for item in ranked
+        ],
+        "filter_snapshot": [
+            {
+                "code": item.code,
+                "passed": item.passed,
+                "reasons": list(item.reasons),
+            }
+            for item in filters
+        ],
+        "portfolio_diagnostics": dict(plan.diagnostics),
+    }
     signal = StockPaperSignal(
         account_id=account.id,
         run_id=run.id,
@@ -448,6 +860,16 @@ def _generate_signal(
         selected_count=len(items),
         invested_weight=_weight(plan.invested_weight),
         target_weights=dict(plan.target_weights),
+        order_state={
+            code: {
+                "target_weight": weight,
+                "status": "pending",
+                "attempts": 0,
+                "filled_shares": 0.0,
+                "events": [],
+            }
+            for code, weight in plan.target_weights.items()
+        },
         items=items,
         methodology=METHODOLOGY,
         warnings=warnings,
@@ -486,6 +908,7 @@ def _position_rows(db: Session, account_id: int) -> dict[str, StockPaperPosition
 
 
 def _portfolio_value(
+    db: Session,
     account: StockPaperAccount,
     positions: dict[str, StockPaperPosition],
     histories: dict[str, list[StockBar]],
@@ -496,7 +919,222 @@ def _portfolio_value(
         price = stock_backtest._last_price_before(histories.get(code, []), day, None)
         if price is not None:
             values[code] = float(position.shares) * price
-    return float(account.cash) + sum(values.values()), values
+    receivables = (
+        db.scalar(
+            select(func.sum(StockPaperReceivable.amount)).where(
+                StockPaperReceivable.account_id == account.id,
+                StockPaperReceivable.status == "receivable",
+            )
+        )
+        or Decimal("0")
+    )
+    return (
+        float(account.cash) + float(receivables) + sum(values.values()),
+        values,
+    )
+
+
+def _apply_corporate_actions(
+    db: Session,
+    repository: StockRepository,
+    account: StockPaperAccount,
+    run: StockPaperRun,
+    day: date,
+) -> None:
+    """把当日公司行为记入模拟账本；run 的日期唯一约束保证幂等。"""
+    positions = _position_rows(db, account.id)
+    action_fn = getattr(repository, "corporate_actions", None)
+    if not callable(action_fn):
+        run.warnings = list(run.warnings) + ["仓储不支持公司行为，需人工核对"]
+        return
+    action_codes = sorted(set(positions) | set(account.candidate_codes))
+    actions = list(action_fn(action_codes, day, day))
+    applied: list[dict[str, object]] = []
+    for action in actions:
+        event_key = action.event_key or (
+            f"{action.code}:{action.action_date.isoformat()}:{action.kind}"
+        )
+        if action.kind == "cash_payment":
+            receivable = db.scalar(
+                select(StockPaperReceivable).where(
+                    StockPaperReceivable.account_id == account.id,
+                    StockPaperReceivable.event_key == event_key,
+                    StockPaperReceivable.status == "receivable",
+                )
+            )
+            if receivable is not None:
+                account.cash = _money(
+                    float(account.cash) + float(receivable.amount)
+                )
+                receivable.status = "paid"
+                receivable.paid_at = day
+                applied.append(
+                    {
+                        "code": action.code,
+                        "kind": "cash_payment",
+                        "amount": float(receivable.amount),
+                        "event_key": event_key,
+                        "source": action.source,
+                    }
+                )
+            continue
+        position = positions.get(action.code)
+        if position is None:
+            continue
+        held = float(position.shares)
+        if action.kind == "terminal":
+            price = action.terminal_price
+            if price is None or price <= 0:
+                bars = repository.daily_bars([action.code], None, day)
+                price = stock_backtest._last_price_before(bars, day, None)
+            if price is None or price <= 0:
+                run.warnings = list(run.warnings) + [
+                    f"{action.code} 终止上市但无清算价格，需人工处理"
+                ]
+                continue
+            account.cash = _money(float(account.cash) + held * price)
+            db.delete(position)
+            applied.append(
+                {
+                    "code": action.code,
+                    "kind": "terminal",
+                    "shares": held,
+                    "price": price,
+                    "source": action.source,
+                }
+            )
+            continue
+        if action.kind == "cash_entitlement":
+            cash_amount = held * action.cash_per_share
+            if action.payment_date is None or action.payment_date <= day:
+                account.cash = _money(float(account.cash) + cash_amount)
+            else:
+                existing = db.scalar(
+                    select(StockPaperReceivable).where(
+                        StockPaperReceivable.account_id == account.id,
+                        StockPaperReceivable.event_key == event_key,
+                    )
+                )
+                if existing is None:
+                    db.add(
+                        StockPaperReceivable(
+                            account_id=account.id,
+                            stock_code=action.code,
+                            event_key=event_key,
+                            entitlement_date=day,
+                            payment_date=action.payment_date,
+                            amount=_money(cash_amount),
+                            status="receivable",
+                            source=action.source,
+                        )
+                    )
+            applied.append(
+                {
+                    "code": action.code,
+                    "kind": "cash_entitlement",
+                    "amount": cash_amount,
+                    "payment_date": (
+                        action.payment_date.isoformat()
+                        if action.payment_date is not None
+                        else None
+                    ),
+                    "event_key": event_key,
+                    "source": action.source,
+                }
+            )
+        elif action.kind == "distribution":
+            cash_amount = held * action.cash_per_share
+            account.cash = _money(float(account.cash) + cash_amount)
+            new_shares = held * action.share_ratio
+            position.shares = _qty(held + new_shares)
+            applied.append(
+                {
+                    "code": action.code,
+                    "kind": "distribution",
+                    "cash": cash_amount,
+                    "new_shares": new_shares,
+                    "source": action.source,
+                }
+            )
+        elif action.kind == "rights_issue":
+            price = action.subscription_price
+            requested = held * max(action.subscription_ratio, 0.0)
+            if price is None or price <= 0 or requested <= 0:
+                run.warnings = list(run.warnings) + [
+                    f"{action.code} 配股事件字段不完整，需人工处理"
+                ]
+                continue
+            subscribed = min(
+                requested, max(float(account.cash) / price, 0.0)
+            )
+            account.cash = _money(float(account.cash) - subscribed * price)
+            position.shares = _qty(held + subscribed)
+            applied.append(
+                {
+                    "code": action.code,
+                    "kind": "rights_issue",
+                    "requested_shares": requested,
+                    "subscribed_shares": subscribed,
+                    "subscription_price": price,
+                    "source": action.source,
+                }
+            )
+            if subscribed + 1e-9 < requested:
+                run.warnings = list(run.warnings) + [
+                    f"{action.code} 配股因现金约束仅认购"
+                    f" {subscribed:.3f}/{requested:.3f} 股"
+                ]
+        elif action.kind in {"merger", "code_change"}:
+            successor = action.successor_code
+            if not successor or action.share_ratio <= 0:
+                run.warnings = list(run.warnings) + [
+                    f"{action.code} 换股合并字段不完整，需人工处理"
+                ]
+                continue
+            converted = held * action.share_ratio
+            successor_position = positions.get(successor)
+            if successor_position is None:
+                successor_position = StockPaperPosition(
+                    account_id=account.id,
+                    stock_code=successor,
+                    shares=_qty(converted),
+                    cost=position.cost,
+                )
+                db.add(successor_position)
+                positions[successor] = successor_position
+            else:
+                successor_position.shares = _qty(
+                    float(successor_position.shares) + converted
+                )
+                successor_position.cost = _money(
+                    float(successor_position.cost) + float(position.cost)
+                )
+            db.delete(position)
+            positions.pop(action.code, None)
+            applied.append(
+                {
+                    "code": action.code,
+                    "kind": "merger",
+                    "successor_code": successor,
+                    "converted_shares": converted,
+                    "share_ratio": action.share_ratio,
+                    "source": action.source,
+                }
+            )
+        else:
+            new_shares = held * action.share_ratio
+            position.shares = _qty(held + new_shares)
+            applied.append(
+                {
+                    "code": action.code,
+                    "kind": "share_distribution",
+                    "new_shares": new_shares,
+                    "source": action.source,
+                }
+            )
+    if applied:
+        run.result = {**dict(run.result or {}), "corporate_actions": applied}
+        db.flush()
 
 
 def _execute_pending(
@@ -531,12 +1169,30 @@ def _execute_pending(
     ).all()
     for row in older:
         row.status = "superseded"
+        state = {
+            code: {**dict(item), "events": list(dict(item).get("events", []))}
+            for code, item in dict(row.order_state or {}).items()
+        }
+        for item in state.values():
+            if item.get("status") not in {"filled", "cancelled", "superseded"}:
+                item["status"] = "superseded"
+                item["last_reason"] = "被新一期目标权重覆盖"
+                item["events"].append(
+                    {
+                        "date": day.isoformat(),
+                        "status": "superseded",
+                        "reason": "被新一期目标权重覆盖",
+                    }
+                )
+        row.order_state = state
 
     positions = _position_rows(db, account.id)
     codes = sorted(set(positions) | set(pending.target_weights))
     infos = {item.code: item for item in repository.list_stocks(codes)}
     current, histories = _bar_maps(repository, codes, day)
-    total_value, _values = _portfolio_value(account, positions, histories, day)
+    total_value, _values = _portfolio_value(
+        db, account, positions, histories, day
+    )
     if total_value <= 0:
         raise StockPaperError("模拟账户总资产无效，无法执行调仓")
 
@@ -551,6 +1207,52 @@ def _execute_pending(
     trade_count = 0
     fee_total = 0.0
     blocked: list[str] = []
+    order_state = {
+        code: {**dict(item), "events": list(dict(item).get("events", []))}
+        for code, item in dict(pending.order_state or {}).items()
+    }
+    attempted: set[str] = set()
+
+    def record_order(
+        code: str,
+        side: str,
+        status_value: str,
+        *,
+        requested: float = 0.0,
+        filled: float = 0.0,
+        reason: str | None = None,
+    ) -> None:
+        item = order_state.setdefault(
+            code,
+            {
+                "target_weight": float(pending.target_weights.get(code, 0.0)),
+                "status": "pending",
+                "attempts": 0,
+                "filled_shares": 0.0,
+                "events": [],
+            },
+        )
+        if code not in attempted:
+            item["attempts"] = int(item.get("attempts", 0)) + 1
+            attempted.add(code)
+        item["status"] = status_value
+        item["side"] = side
+        item["last_requested_shares"] = requested
+        item["last_filled_shares"] = filled
+        item["remaining_shares"] = max(requested - filled, 0.0)
+        item["filled_shares"] = float(item.get("filled_shares", 0.0)) + filled
+        item["last_reason"] = reason
+        item.setdefault("events", []).append(
+            {
+                "date": day.isoformat(),
+                "side": side,
+                "status": status_value,
+                "requested_shares": requested,
+                "filled_shares": filled,
+                "remaining_shares": max(requested - filled, 0.0),
+                "reason": reason,
+            }
+        )
 
     def trade_allowed(code: str, side: str) -> tuple[bool, str, StockBar | None]:
         bar = current.get(code)
@@ -574,6 +1276,7 @@ def _execute_pending(
         bar = current.get(code)
         if bar is None:
             blocked.append(f"{code}: 成交日无行情")
+            record_order(code, "sell", "blocked", reason="成交日无行情")
             continue
         px = stock_backtest.trade_price(bar, "sell", COST.slippage_rate)
         desired_value = float(pending.target_weights.get(code, 0.0)) * total_value
@@ -585,11 +1288,61 @@ def _execute_pending(
         else:
             sell_shares = math.floor(max(sell_shares, 0.0) / 100.0) * 100.0
         if sell_shares <= 1e-6:
+            record_order(
+                code,
+                "sell",
+                "filled",
+                reason="已达到目标权重，无需卖出",
+            )
+            continue
+        if sell_shares * px / total_value < MINIMUM_TRADE_WEIGHT:
+            record_order(
+                code,
+                "sell",
+                "filled",
+                requested=sell_shares,
+                reason="剩余偏差低于最小交易权重",
+            )
             continue
         ok, reason, bar = trade_allowed(code, "sell")
         if not ok or bar is None:
             blocked.append(f"{code}: {reason}")
+            record_order(
+                code, "sell", "blocked", requested=sell_shares, reason=reason
+            )
             continue
+        requested_shares = sell_shares
+        if bar.volume is not None:
+            capacity = (
+                math.floor(
+                    max(bar.volume, 0.0)
+                    * MAX_VOLUME_PARTICIPATION
+                    / stock_backtest.BOARD_LOT
+                )
+                * stock_backtest.BOARD_LOT
+            )
+            if sell_shares > capacity:
+                sell_shares = capacity
+                blocked.append(f"{code}: 超过成交量参与率，卖出部分成交")
+        if sell_shares <= 1e-6:
+            record_order(
+                code,
+                "sell",
+                "blocked",
+                requested=requested_shares,
+                reason="成交容量为零",
+            )
+            continue
+        px = stock_backtest.trade_price(
+            bar,
+            "sell",
+            COST.slippage_rate,
+            shares=sell_shares,
+            volatility=stock_backtest.recent_volatility(histories.get(code, []), day),
+            market_impact_coefficient=COST.market_impact_coefficient,
+            volatility_slippage_coefficient=COST.volatility_slippage_coefficient,
+            max_total_slippage=COST.max_total_slippage,
+        )
         amount = sell_shares * px
         fee = stock_backtest.trade_fee("sell", amount, COST)
         position.shares = _qty(held - sell_shares)
@@ -615,6 +1368,22 @@ def _execute_pending(
         )
         trade_count += 1
         fee_total += fee
+        record_order(
+            code,
+            "sell",
+            (
+                "filled"
+                if sell_shares + 1e-9 >= requested_shares
+                else "partially_filled"
+            ),
+            requested=requested_shares,
+            filled=sell_shares,
+            reason=(
+                None
+                if sell_shares + 1e-9 >= requested_shares
+                else "成交量参与率限制"
+            ),
+        )
 
     db.flush()
     # 再按目标权重买入，A股按100股一手取整。
@@ -625,6 +1394,7 @@ def _execute_pending(
         bar = current.get(code)
         if bar is None:
             blocked.append(f"{code}: 成交日无行情")
+            record_order(code, "buy", "blocked", reason="成交日无行情")
             continue
         px = stock_backtest.trade_price(bar, "buy", COST.slippage_rate)
         held = float(positions.get(code).shares) if code in positions else 0.0
@@ -633,12 +1403,43 @@ def _execute_pending(
         ) * 100.0
         buy_shares = desired_shares - held
         if buy_shares < 100.0:
+            record_order(
+                code,
+                "buy",
+                "filled",
+                reason="整手取整后已达到目标",
+            )
+            continue
+        if buy_shares * px / total_value < MINIMUM_TRADE_WEIGHT:
+            record_order(
+                code,
+                "buy",
+                "filled",
+                requested=buy_shares,
+                reason="剩余偏差低于最小交易权重",
+            )
             continue
         ok, reason, bar = trade_allowed(code, "buy")
         if not ok or bar is None:
             blocked.append(f"{code}: {reason}")
+            record_order(
+                code, "buy", "blocked", requested=buy_shares, reason=reason
+            )
             continue
         buy_shares = math.floor(buy_shares / 100.0) * 100.0
+        requested_shares = buy_shares
+        if bar.volume is not None:
+            capacity = (
+                math.floor(
+                    max(bar.volume, 0.0)
+                    * MAX_VOLUME_PARTICIPATION
+                    / stock_backtest.BOARD_LOT
+                )
+                * stock_backtest.BOARD_LOT
+            )
+            if buy_shares > capacity:
+                buy_shares = capacity
+                blocked.append(f"{code}: 超过成交量参与率，买入部分成交")
         while buy_shares >= 100.0:
             amount = buy_shares * px
             fee = stock_backtest.trade_fee("buy", amount, COST)
@@ -647,6 +1448,39 @@ def _execute_pending(
             buy_shares -= 100.0
         if buy_shares < 100.0:
             blocked.append(f"{code}: 现金不足以买入一手")
+            record_order(
+                code,
+                "buy",
+                "blocked",
+                requested=requested_shares,
+                reason="成交容量或现金不足一手",
+            )
+            continue
+        px = stock_backtest.trade_price(
+            bar,
+            "buy",
+            COST.slippage_rate,
+            shares=buy_shares,
+            volatility=stock_backtest.recent_volatility(histories.get(code, []), day),
+            market_impact_coefficient=COST.market_impact_coefficient,
+            volatility_slippage_coefficient=COST.volatility_slippage_coefficient,
+            max_total_slippage=COST.max_total_slippage,
+        )
+        while buy_shares >= 100.0:
+            amount = buy_shares * px
+            fee = stock_backtest.trade_fee("buy", amount, COST)
+            if amount + fee <= float(account.cash) + 1e-6:
+                break
+            buy_shares -= 100.0
+        if buy_shares < 100.0:
+            blocked.append(f"{code}: 动态冲击后现金不足以买入一手")
+            record_order(
+                code,
+                "buy",
+                "blocked",
+                requested=requested_shares,
+                reason="动态冲击后现金不足一手",
+            )
             continue
         amount = buy_shares * px
         fee = stock_backtest.trade_fee("buy", amount, COST)
@@ -682,8 +1516,37 @@ def _execute_pending(
         )
         trade_count += 1
         fee_total += fee
+        record_order(
+            code,
+            "buy",
+            (
+                "filled"
+                if buy_shares + 1e-9 >= requested_shares
+                else "partially_filled"
+            ),
+            requested=requested_shares,
+            filled=buy_shares,
+            reason=(
+                None
+                if buy_shares + 1e-9 >= requested_shares
+                else "成交量参与率或现金约束"
+            ),
+        )
 
     db.flush()
+    if not blocked:
+        for code, item in order_state.items():
+            if item.get("status") == "pending":
+                item["status"] = "filled"
+                item["last_reason"] = "无剩余可执行偏差"
+                item.setdefault("events", []).append(
+                    {
+                        "date": day.isoformat(),
+                        "status": "filled",
+                        "reason": "无剩余可执行偏差",
+                    }
+                )
+    pending.order_state = order_state
     pending.execute_on = pending.execute_on or day
     if blocked:
         pending.status = "pending"
@@ -697,32 +1560,88 @@ def _execute_pending(
     return trade_count, fee_total, blocked
 
 
-def _benchmark_return(
+def _benchmark_nav(
     repository: StockRepository,
     codes: list[str],
-    previous_day: date | None,
+    entry_date: date | None,
     day: date,
 ) -> float:
-    if previous_day is None:
-        return 0.0
-    bars = repository.daily_bars(codes, previous_day, day)
+    """候选池等权买入持有基准，与策略在首个 execute_on 同时起算。"""
+    if entry_date is None or day < entry_date:
+        return 1.0
+    bars = repository.daily_bars(codes, entry_date, day)
     by_code: dict[str, list[StockBar]] = {}
     for bar in bars:
         if not bar.suspended and bar.close > 0:
             by_code.setdefault(bar.code, []).append(bar)
-    returns: list[float] = []
+    action_fn = getattr(repository, "corporate_actions", None)
+    actions_by_code: dict[str, list[object]] = {}
+    if callable(action_fn):
+        for action in action_fn(codes, entry_date, day):
+            actions_by_code.setdefault(action.code, []).append(action)
+    relatives: list[float] = []
     for values in by_code.values():
         values.sort(key=lambda item: item.trade_date)
-        before = next(
-            (item.close for item in reversed(values) if item.trade_date <= previous_day),
-            None,
+        entry = next(
+            (item for item in values if item.trade_date == entry_date), None
+        )
+        base = (
+            entry.open
+            if entry is not None and entry.open is not None and entry.open > 0
+            else entry.close if entry is not None else None
         )
         now = next(
             (item.close for item in reversed(values) if item.trade_date <= day), None
         )
-        if before and now and before > 0:
-            returns.append(now / before - 1.0)
-    return fmean(returns) if returns else 0.0
+        if base and now and base > 0:
+            shares_count = 1.0 / base
+            cash = 0.0
+            code = values[0].code
+            for action in actions_by_code.get(code, []):
+                if action.kind == "terminal":
+                    cash += shares_count * (action.terminal_price or now)
+                    shares_count = 0.0
+                elif action.kind in {"cash_entitlement", "distribution"}:
+                    cash += shares_count * action.cash_per_share
+                    if action.kind == "distribution":
+                        shares_count *= 1.0 + action.share_ratio
+                elif action.kind == "cash_payment":
+                    continue
+                elif action.kind == "rights_issue":
+                    if (
+                        action.subscription_price is not None
+                        and action.subscription_price > 0
+                    ):
+                        subscribed = (
+                            shares_count * action.subscription_ratio
+                        )
+                        cash -= subscribed * action.subscription_price
+                        shares_count += subscribed
+                elif action.kind in {"merger", "code_change"}:
+                    successor = action.successor_code
+                    if successor and action.share_ratio > 0:
+                        successor_bars = repository.daily_bars(
+                            [successor], entry_date, day
+                        )
+                        successor_price = next(
+                            (
+                                item.close
+                                for item in reversed(successor_bars)
+                                if item.trade_date <= day
+                            ),
+                            None,
+                        )
+                        if successor_price is not None:
+                            cash += (
+                                shares_count
+                                * action.share_ratio
+                                * successor_price
+                            )
+                            shares_count = 0.0
+                else:
+                    shares_count *= 1.0 + action.share_ratio
+            relatives.append(cash + shares_count * now)
+    return fmean(relatives) if relatives else 1.0
 
 
 def _write_nav(
@@ -739,7 +1658,7 @@ def _write_nav(
         for row in repository.list_stocks(list(positions))
     }
     current, histories = _bar_maps(repository, list(positions), day)
-    total, values = _portfolio_value(account, positions, histories, day)
+    total, values = _portfolio_value(db, account, positions, histories, day)
     market_value = sum(values.values())
     previous = db.scalar(
         select(StockPaperNavDaily)
@@ -752,15 +1671,28 @@ def _write_nav(
         if previous is not None and float(previous.total_value) > 0
         else None
     )
-    benchmark_return = _benchmark_return(
+    first_signal = db.scalar(
+        select(StockPaperSignal)
+        .where(
+            StockPaperSignal.account_id == account.id,
+            StockPaperSignal.execute_on.is_not(None),
+        )
+        .order_by(StockPaperSignal.signal_date, StockPaperSignal.id)
+        .limit(1)
+    )
+    benchmark_nav = _benchmark_nav(
         repository,
         list(account.candidate_codes),
-        previous.nav_date if previous else None,
+        first_signal.execute_on if first_signal is not None else None,
         day,
     )
-    account.benchmark_nav = _price(
-        float(account.benchmark_nav) * (1.0 + benchmark_return)
+    previous_benchmark = float(previous.benchmark_nav) if previous else 1.0
+    benchmark_return = (
+        benchmark_nav / previous_benchmark - 1.0
+        if previous_benchmark > 0
+        else 0.0
     )
+    account.benchmark_nav = _price(benchmark_nav)
     snapshot = []
     for code, position in sorted(positions.items()):
         value = values.get(code)
@@ -822,6 +1754,7 @@ def run_cycle(db: Session) -> StockPaperRunResponse:
     if not readiness.ready or not readiness.latest_data_date:
         raise StockPaperError("；".join(readiness.blockers) or "股票数据尚未就绪")
     data_date = date.fromisoformat(readiness.latest_data_date)
+    _persist_field_readiness(db, data_date)
     account, _version = _ensure_account(db, data_date)
     existing = db.scalar(
         select(StockPaperRun).where(
@@ -864,6 +1797,7 @@ def run_cycle(db: Session) -> StockPaperRunResponse:
     db.add(run)
     db.flush()
     repository = _repo(db)
+    _apply_corporate_actions(db, repository, account, run, data_date)
 
     # 首日生成信号等待下一交易日；跨月首日用上月末已记账日生成并当日执行。
     previous_signal = (
@@ -909,14 +1843,146 @@ def run_cycle(db: Session) -> StockPaperRunResponse:
             f"{len(blocked)} 个订单因停牌/涨跌停/现金约束等待后续交易日"
         ]
     nav = _write_nav(db, repository, account, run, data_date, fee_total)
+    run_trades = db.scalars(
+        select(StockPaperTrade).where(StockPaperTrade.run_id == run.id)
+    ).all()
+    traded_codes = sorted({trade.stock_code for trade in run_trades})
+    execution_bars = {
+        bar.code: bar
+        for bar in repository.daily_bars(traded_codes, data_date, data_date)
+    }
+    slippage_cost = 0.0
+    for trade in run_trades:
+        bar = execution_bars.get(trade.stock_code)
+        if bar is None:
+            continue
+        base = bar.open if bar.open is not None and bar.open > 0 else bar.close
+        price = float(trade.price)
+        shares_count = float(trade.shares)
+        slippage_cost += (
+            max(price - base, 0.0) * shares_count
+            if trade.side == "buy"
+            else max(base - price, 0.0) * shares_count
+        )
+    previous_positions = (
+        {
+            str(item.get("code")): dict(item)
+            for item in list(previous.positions or [])
+            if item.get("code")
+        }
+        if previous is not None
+        else {}
+    )
+    prior_codes = sorted(previous_positions)
+    prior_bars = {
+        bar.code: bar
+        for bar in (
+            repository.daily_bars(prior_codes, data_date, data_date)
+            if prior_codes
+            else []
+        )
+    }
+    stock_weights = {
+        code: float(item.get("weight") or 0.0)
+        for code, item in previous_positions.items()
+    }
+    stock_returns = {
+        code: bar.close / float(previous_positions[code]["price"]) - 1.0
+        for code, bar in prior_bars.items()
+        if previous_positions[code].get("price")
+        and float(previous_positions[code]["price"]) > 0
+    }
+    industries = {
+        code: str(item.get("industry") or "未知")
+        for code, item in previous_positions.items()
+    }
+    beta_deviation = 0.0
+    active_signal = db.scalar(
+        select(StockPaperSignal)
+        .where(
+            StockPaperSignal.account_id == account.id,
+            StockPaperSignal.signal_date < data_date,
+        )
+        .order_by(StockPaperSignal.signal_date.desc())
+        .limit(1)
+    )
+    if active_signal is not None and active_signal.run_id is not None:
+        signal_run = db.get(StockPaperRun, active_signal.run_id)
+        diagnostics = (
+            dict(signal_run.result or {}).get("portfolio_diagnostics", {})
+            if signal_run is not None
+            else {}
+        )
+        deviations = (
+            dict(diagnostics).get("exposure_deviations", {})
+            if isinstance(diagnostics, dict)
+            else {}
+        )
+        raw_beta = (
+            dict(deviations).get("beta")
+            if isinstance(deviations, dict)
+            else None
+        )
+        if isinstance(raw_beta, (int, float)) and math.isfinite(raw_beta):
+            beta_deviation = float(raw_beta)
+    attribution = stock_backtest.account_period_attribution(
+        float(previous.total_value) if previous is not None else float(nav.total_value),
+        float(nav.total_value),
+        fee_total,
+        slippage_cost,
+        benchmark_return=float(nav.benchmark_daily_return or 0.0),
+        stock_weights=stock_weights,
+        stock_returns=stock_returns,
+        industries=industries,
+        beta_deviation=beta_deviation,
+        cash_weight=(
+            float(previous.cash) / float(previous.total_value)
+            if previous is not None and float(previous.total_value) > 0
+            else 1.0
+        ),
+    )
     run.result = {
+        **dict(run.result or {}),
         "total_value": float(nav.total_value),
         "nav": float(nav.nav),
         "benchmark_nav": float(nav.benchmark_nav),
         "fee_total": fee_total,
+        "slippage_cost": slippage_cost,
+        "attribution": attribution,
     }
     if data_date >= account.trial_end:
         account.status = "evaluation_due"
+        expiring = db.scalars(
+            select(StockPaperSignal).where(
+                StockPaperSignal.account_id == account.id,
+                StockPaperSignal.status == "pending",
+            )
+        ).all()
+        for signal in expiring:
+            signal.status = "expired"
+            state = {
+                code: {
+                    **dict(item),
+                    "events": list(dict(item).get("events", [])),
+                }
+                for code, item in dict(signal.order_state or {}).items()
+            }
+            for item in state.values():
+                if item.get("status") not in {
+                    "filled",
+                    "cancelled",
+                    "superseded",
+                }:
+                    item["status"] = "expired"
+                    item["last_reason"] = "两个月前向观察期结束"
+                    item["events"].append(
+                        {
+                            "date": data_date.isoformat(),
+                            "status": "expired",
+                            "reason": "两个月前向观察期结束",
+                        }
+                    )
+            signal.order_state = state
     db.commit()
     return _run_response(run, nav, skipped=False)
 
@@ -995,6 +2061,7 @@ def _signal_out(row: StockPaperSignal | None) -> StockPaperSignalOut | None:
         selected_count=row.selected_count,
         invested_weight=float(row.invested_weight),
         items=list(row.items),
+        order_state=dict(row.order_state or {}),
         warnings=list(row.warnings),
     )
 

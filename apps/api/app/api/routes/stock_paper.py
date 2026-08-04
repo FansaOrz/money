@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.schemas.stock_paper import (
+    StockPaperPrepareRequest,
+    StockPaperPrepareResponse,
     StockPaperRunResponse,
     StockPaperSummary,
     StockPaperTradeOut,
@@ -25,6 +27,30 @@ def run(db: Session = Depends(get_db)) -> StockPaperRunResponse:
     """推进到最新真实行情日；同一数据日重复调用幂等。"""
     try:
         return stock_paper.run_cycle(db)
+    except stock_paper.StockPaperError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+
+@router.post("/prepare", response_model=StockPaperPrepareResponse)
+def prepare(
+    payload: StockPaperPrepareRequest,
+    db: Session = Depends(get_db),
+) -> StockPaperPrepareResponse:
+    """执行历史走步/完全留出验证，通过后创建全新的空前向账户。"""
+    try:
+        return StockPaperPrepareResponse(
+            **stock_paper.prepare_forward_account(
+                db,
+                start=payload.start_date,
+                end=payload.end_date,
+                top_n_grid=payload.top_n_grid,
+                max_stock_weight_grid=payload.max_stock_weight_grid,
+                embargo_days=payload.embargo_days,
+            )
+        )
     except stock_paper.StockPaperError as exc:
         db.rollback()
         raise HTTPException(

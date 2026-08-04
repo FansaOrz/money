@@ -1387,6 +1387,13 @@ export interface SyncStatusResponse {
   runs?: SyncRunItem[] | null;
   /** 各任务下次计划运行时间（北京时间 ISO 8601） */
   next_runs?: Record<string, string | null> | null;
+  alerts?: Array<{
+    type?: string | null;
+    severity?: string | null;
+    message?: string | null;
+    code?: string | null;
+    correlation_id?: string | null;
+  }> | null;
   [key: string]: unknown;
 }
 
@@ -1581,6 +1588,7 @@ export interface StockFactorsResponse {
   available_at?: string | null;
   total?: number | string | null;
   warnings?: string[] | null;
+  factor_diagnostics?: Record<string, unknown> | null;
   [key: string]: unknown;
 }
 
@@ -1678,6 +1686,7 @@ export interface StockBacktestResult {
   end_date?: string | null;
   methodology?: string | null;
   warnings?: string[] | null;
+  attribution?: Record<string, number> | null;
   [key: string]: unknown;
 }
 

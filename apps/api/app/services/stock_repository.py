@@ -41,6 +41,8 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import math
+from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -68,6 +70,8 @@ class StockBar:
     amount: float | None = None  # 成交额（元）
     suspended: bool = False  # 停牌（当日无成交，close 通常为前收盘）
     raw_return: float | None = None  # 当日原始涨跌幅（优先用于涨跌停判定）
+    up_limit: float | None = None  # 当日真实涨停价（执行口径）
+    down_limit: float | None = None  # 当日真实跌停价（执行口径）
 
 
 @dataclass(frozen=True)
@@ -83,12 +87,26 @@ class Fundamentals:
     code: str
     available_at: date  # 信息可获得日（PIT 过滤依据）
     period: date | None = None  # 报告期（展示用）
+    valuation_date: date | None = None  # 估值实际交易日（新鲜度门禁）
     roe: float | None = None
     gross_margin: float | None = None
     ocf_to_profit: float | None = None
     debt_ratio: float | None = None
     ep: float | None = None
     bp: float | None = None
+    market_cap: float | None = None  # 信号日总市值（元）
+    float_market_cap: float | None = None
+    roa: float | None = None
+    net_margin: float | None = None
+    revenue: float | None = None
+    net_income: float | None = None
+    operating_cash_flow: float | None = None
+    free_cash_flow: float | None = None
+    total_assets: float | None = None
+    total_equity: float | None = None
+    dividend_yield: float | None = None
+    sales_yield: float | None = None
+    company_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +173,39 @@ class MarketBars:
 
     research_bars: tuple[StockBar, ...]
     exec_bars: tuple[StockBar, ...]
+
+
+@dataclass(frozen=True)
+class UniverseMembership:
+    """一个研究日期的指数成分并集及其实际快照日期。"""
+
+    as_of: date
+    members: frozenset[str]
+    snapshot_dates: dict[str, date]
+    missing_indices: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CorporateAction:
+    """影响原始价持仓口径的公司行为事件。
+
+    share_ratio 为每持有一股新增的股份数；cash_per_share 为每股实际现金；
+    terminal_price 仅用于退市/现金收购等终止持仓事件。event_key 把除权日
+    的应收确认与派息日的现金到账关联起来；配股事件使用 subscription_*。
+    """
+
+    code: str
+    action_date: date
+    kind: str  # cash_dividend / stock_dividend / terminal
+    cash_per_share: float = 0.0
+    share_ratio: float = 0.0
+    terminal_price: float | None = None
+    event_key: str | None = None
+    payment_date: date | None = None
+    subscription_ratio: float = 0.0
+    subscription_price: float | None = None
+    successor_code: str | None = None
+    source: str = "tushare"
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +333,14 @@ class StockRepository(Protocol):
     #     研究(qfq)/执行(raw) 双口径面板；缺失时引擎退化为 raw 单口径。
     # def name_histories(self, codes) -> dict[str, list[NamePeriod]]:
     #     历史名称/ST 区间；缺失时按当前名称判定 ST。
+    # def valuation_snapshots(self, codes, as_of_dates) -> list[Fundamentals]:
+    #     指定信号日的 PIT 估值快照；每个日期只取 trade_date ≤ 日期的最新值。
+    # def universe_members_as_of(self, index_codes, as_of_dates):
+    #     每个信号日的历史指数成分并集，不支持时不得伪装成当前成分。
+    # def corporate_actions(self, codes, start=None, end=None):
+    #     原始价持仓所需的分红送转与终止上市事件。
+    # def industries_as_of(self, codes, as_of_dates):
+    #     申万2021历史行业归属；不存在覆盖时返回「未知」而非当前行业。
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +362,8 @@ def _to_float(value: object) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)  # type: ignore[arg-type]
+        parsed = float(value)  # type: ignore[arg-type]
+        return parsed if math.isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 
@@ -321,6 +381,19 @@ def _to_date(value: object) -> date | None:
         except ValueError:
             return None
     return None
+
+
+def _to_compact_date(value: object) -> date | None:
+    """兼容 Tushare YYYYMMDD 与 ISO 日期。"""
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) >= 8 and text[:8].isdigit():
+        try:
+            return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+        except ValueError:
+            return None
+    return _to_date(value)
 
 
 def _to_bool(value: object) -> bool:
@@ -351,6 +424,8 @@ def coerce_bar(obj: object) -> StockBar | None:
         amount=_to_float(_attr(obj, "amount", "turnover", "money")),
         suspended=_to_bool(_attr(obj, "suspended", "is_suspended", "halt")),
         raw_return=_to_float(_attr(obj, "raw_return", "pct_change", "pct_chg")),
+        up_limit=_to_float(_attr(obj, "up_limit")),
+        down_limit=_to_float(_attr(obj, "down_limit")),
     )
 
 
@@ -386,6 +461,23 @@ def coerce_fundamentals(obj: object) -> Fundamentals | None:
         debt_ratio=_to_float(_attr(obj, "debt_ratio", "debt_to_assets", "leverage")),
         ep=_to_float(_attr(obj, "ep", "earnings_yield", "e_p")),
         bp=_to_float(_attr(obj, "bp", "book_to_price", "b_p")),
+        market_cap=_to_float(_attr(obj, "market_cap", "total_mv")),
+        float_market_cap=_to_float(_attr(obj, "float_market_cap", "circ_mv")),
+        roa=_to_float(_attr(obj, "roa", "roa_dp")),
+        net_margin=_to_float(_attr(obj, "net_margin", "netprofit_margin")),
+        revenue=_to_float(_attr(obj, "revenue", "total_revenue")),
+        net_income=_to_float(_attr(obj, "net_income", "n_income_attr_p")),
+        operating_cash_flow=_to_float(_attr(obj, "operating_cash_flow", "n_cashflow_act")),
+        free_cash_flow=_to_float(_attr(obj, "free_cash_flow", "free_cashflow")),
+        total_assets=_to_float(_attr(obj, "total_assets")),
+        total_equity=_to_float(_attr(obj, "total_equity")),
+        dividend_yield=_to_float(_attr(obj, "dividend_yield", "dv_ttm")),
+        sales_yield=_to_float(_attr(obj, "sales_yield")),
+        company_type=(
+            str(_attr(obj, "company_type", "comp_type"))
+            if _attr(obj, "company_type", "comp_type") is not None
+            else None
+        ),
     )
 
 
@@ -489,13 +581,39 @@ class SqlStockRepository:
     def __init__(self, db: object, data_root: Path | None = None) -> None:
         self._db = db
         self._root = data_root
+        self._external_snapshot_enabled = data_root is not None or (
+            self._database_matches_config()
+        )
         self._warehouse_repo = self._try_warehouse()
         self._industry_map = self._load_industries()
 
     # ---- 可选数据源探测 -------------------------------------------------
 
+    def _database_matches_config(self) -> bool:
+        """只让配置主库自动挂载配置的数据湖，避免临时库串入生产快照。"""
+        try:
+            from sqlalchemy.engine import make_url
+
+            from app.config import get_settings
+
+            configured = make_url(get_settings().database_url)
+            bound = make_url(str(self._db.get_bind().url))  # type: ignore[attr-defined]
+            if configured.get_backend_name() != bound.get_backend_name():
+                return False
+            if configured.get_backend_name() == "sqlite":
+                return Path(configured.database or "").resolve() == Path(
+                    bound.database or ""
+                ).resolve()
+            return configured.render_as_string(hide_password=True) == (
+                bound.render_as_string(hide_password=True)
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     def _try_warehouse(self) -> object | None:
         """DuckDB 研究仓库存在时以只读方式接入；任何失败返回 None。"""
+        if not self._external_snapshot_enabled:
+            return None
         try:
             from app.config import get_settings
 
@@ -580,24 +698,550 @@ class SqlStockRepository:
     def list_stocks(self, codes: list[str] | None = None) -> list[StockInfo]:
         from sqlalchemy import select
 
-        from app.models import StockMaster
+        from app.models import StockMaster, StockUniverseSnapshot
+
+        basic: dict[str, dict[str, object]] = {}
+        if codes and self._external_snapshot_enabled:
+            try:
+                import pyarrow.parquet as pq
+
+                from app.config import get_settings
+
+                research_root = self._root or Path(
+                    get_settings().research_data_dir
+                )
+                wanted = set(codes)
+                directory = (
+                    research_root
+                    / "tushare_snapshot"
+                    / "global"
+                    / "stock_basic_full"
+                )
+                for path in sorted(directory.glob("*.parquet")):
+                    table = pq.read_table(
+                        path,
+                        columns=[
+                            "ts_code",
+                            "name",
+                            "industry",
+                            "list_date",
+                        ],
+                    )
+                    for raw in table.to_pylist():
+                        code = str(raw.get("ts_code") or "").split(".")[0]
+                        if code in wanted:
+                            basic[code] = raw
+            except Exception:  # noqa: BLE001
+                logger.warning("读取 Tushare 完整证券主数据失败", exc_info=True)
 
         stmt = select(StockMaster).order_by(StockMaster.code)
         if codes:
             stmt = stmt.where(StockMaster.code.in_(codes))
         result: list[StockInfo] = []
+        found: set[str] = set()
         for row in self._db.execute(stmt).scalars().all():  # type: ignore[attr-defined]
+            raw = basic.get(row.code, {})
             result.append(
                 StockInfo(
                     code=row.code,
-                    name=row.name,
+                    name=str(raw.get("name") or row.name),
                     industry=self._industry_map.get(row.code, "未知"),
-                    list_date=None,  # master 无上市日期：按行情首日近似（策略层兜底）
+                    list_date=_to_compact_date(raw.get("list_date")),
                 )
             )
-        return result
+            found.add(row.code)
+        missing_codes = set(codes or ()) - found
+        historical_names: dict[str, str] = {}
+        if missing_codes:
+            name_rows = self._db.execute(  # type: ignore[attr-defined]
+                select(
+                    StockUniverseSnapshot.stock_code,
+                    StockUniverseSnapshot.stock_name,
+                    StockUniverseSnapshot.snapshot_date,
+                )
+                .where(StockUniverseSnapshot.stock_code.in_(missing_codes))
+                .order_by(StockUniverseSnapshot.snapshot_date)
+            ).all()
+            historical_names = {
+                str(code): str(name)
+                for code, name, _snapshot_date in name_rows
+                if name
+            }
+        alias_names: dict[str, str] = {}
+        if missing_codes:
+            try:
+                from app.models import QuantDataRecord
+
+                alias_rows = self._db.scalars(  # type: ignore[attr-defined]
+                    select(QuantDataRecord).where(
+                        QuantDataRecord.dataset == "corporate_action",
+                        QuantDataRecord.code.in_(missing_codes),
+                    )
+                ).all()
+                for record in alias_rows:
+                    payload = dict(record.payload or {})
+                    if payload.get("kind") not in {"code_change", "merger"}:
+                        continue
+                    old_name = str(payload.get("old_name") or "").strip()
+                    successor = str(
+                        payload.get("successor_code") or ""
+                    ).split(".")[0]
+                    if old_name:
+                        alias_names[record.code] = old_name
+                    elif successor:
+                        successor_row = self._db.get(  # type: ignore[attr-defined]
+                            StockMaster, successor
+                        )
+                        if successor_row is not None:
+                            alias_names[record.code] = successor_row.name
+            except Exception:  # noqa: BLE001 - 未迁移的旧库尚无规范化表
+                pass
+        for code in sorted(missing_codes):
+            raw = basic.get(code)
+            if (
+                raw is None
+                and code not in historical_names
+                and code not in alias_names
+            ):
+                continue
+            raw = raw or {}
+            result.append(
+                StockInfo(
+                    code=code,
+                    name=str(
+                        alias_names.get(code)
+                        or raw.get("name")
+                        or historical_names.get(code)
+                        or code
+                    ),
+                    industry=self._industry_map.get(
+                        code, str(raw.get("industry") or "未知")
+                    ),
+                    list_date=_to_compact_date(raw.get("list_date")),
+                )
+            )
+        return sorted(result, key=lambda item: item.code)
 
     # ---- 日线行情 ---------------------------------------------------------
+
+    def _stocktoday_file(self, dataset: str, code: str) -> Path | None:
+        """定位当前股票的 StockToday 原始分区文件。"""
+        if not self._external_snapshot_enabled:
+            return None
+        try:
+            from app.config import get_settings
+
+            research_root = self._root or Path(get_settings().research_data_dir)
+            directory = research_root / "tushare_snapshot" / "stocks" / dataset
+            matches = sorted(directory.glob(f"{code}.*.parquet"))
+            return matches[0] if matches else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _execution_overrides(
+        self, code: str, start: date | None, end: date | None
+    ) -> tuple[dict[date, tuple[float | None, float | None]], set[date]]:
+        """读取真实涨跌停价和停牌日；原始文件缺失时返回空覆盖。"""
+        try:
+            import pyarrow.parquet as pq
+
+            limits: dict[date, tuple[float | None, float | None]] = {}
+            limit_path = self._stocktoday_file("stk_limit", code)
+            if limit_path is not None:
+                table = pq.read_table(
+                    limit_path,
+                    columns=["trade_date", "up_limit", "down_limit"],
+                )
+                for raw_day, up, down in zip(
+                    table.column("trade_date").to_pylist(),
+                    table.column("up_limit").to_pylist(),
+                    table.column("down_limit").to_pylist(),
+                    strict=True,
+                ):
+                    text = str(raw_day)
+                    day = _to_date(
+                        f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+                    )
+                    if day is None:
+                        continue
+                    if start is not None and day < start:
+                        continue
+                    if end is not None and day > end:
+                        continue
+                    limits[day] = (_to_float(up), _to_float(down))
+
+            suspended: set[date] = set()
+            suspend_path = self._stocktoday_file("suspend_d", code)
+            if suspend_path is not None:
+                table = pq.read_table(
+                    suspend_path, columns=["trade_date", "suspend_type"]
+                )
+                for raw_day, suspend_type in zip(
+                    table.column("trade_date").to_pylist(),
+                    table.column("suspend_type").to_pylist(),
+                    strict=True,
+                ):
+                    if str(suspend_type).upper() != "S":
+                        continue
+                    text = str(raw_day)
+                    day = _to_date(
+                        f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+                    )
+                    if day is None:
+                        continue
+                    if start is not None and day < start:
+                        continue
+                    if end is not None and day > end:
+                        continue
+                    suspended.add(day)
+            return limits, suspended
+        except Exception:  # noqa: BLE001 - 可选执行数据损坏时退回行情推断
+            logger.warning(
+                "读取 %s 的真实涨跌停/停牌数据失败，回退行情推断",
+                code,
+                exc_info=True,
+            )
+            return {}, set()
+
+    def corporate_actions(
+        self,
+        codes: list[str],
+        start: date | None = None,
+        end: date | None = None,
+    ) -> list[CorporateAction]:
+        """读取实施状态的分红送转，并为已退市证券生成终止持仓事件。
+
+        分红在除权除息日计入持仓权益，避免原始价在除权日制造虚假亏损。
+        当前主数据没有交易所正式退市日字段时，仅对名称含“退”且行情已终止
+        的证券使用最后交易日收盘作为可审计的保守清算口径。
+        """
+        actions: list[CorporateAction] = []
+        try:
+            import pyarrow.parquet as pq
+
+            for code in codes:
+                path = self._stocktoday_file("dividend", code)
+                if path is None:
+                    continue
+                table = pq.read_table(
+                    path,
+                    columns=[
+                        "div_proc",
+                        "stk_div",
+                        "cash_div",
+                        "cash_div_tax",
+                        "record_date",
+                        "ex_date",
+                        "pay_date",
+                        "div_listdate",
+                    ],
+                )
+                for row in table.to_pylist():
+                    if str(row.get("div_proc") or "") != "实施":
+                        continue
+                    action_date = _to_compact_date(row.get("ex_date"))
+                    if action_date is None:
+                        continue
+                    share_ratio = _to_float(row.get("stk_div")) or 0.0
+                    cash = _to_float(row.get("cash_div_tax"))
+                    if cash is None:
+                        cash = _to_float(row.get("cash_div"))
+                    cash = cash or 0.0
+                    if share_ratio <= 0 and cash <= 0:
+                        continue
+                    payment_date = _to_compact_date(row.get("pay_date"))
+                    # 送转权益在除权日已经属于原股东，必须在除权日同步增加
+                    # 经济持仓，不能等到上市日才计入净值而制造期间虚假亏损。
+                    share_date = action_date
+                    event_key = ":".join(
+                        (
+                            code,
+                            str(row.get("record_date") or ""),
+                            str(row.get("ex_date") or ""),
+                            f"{cash:.10g}",
+                            f"{share_ratio:.10g}",
+                        )
+                    )
+                    source = f"tushare:dividend:{path.name}"
+                    if (
+                        share_ratio > 0
+                        and (start is None or share_date >= start)
+                        and (end is None or share_date <= end)
+                    ):
+                        actions.append(
+                            CorporateAction(
+                                code=code,
+                                action_date=share_date,
+                                kind="share_distribution",
+                                share_ratio=max(share_ratio, 0.0),
+                                event_key=event_key,
+                                source=source,
+                            )
+                        )
+                    if (
+                        cash > 0
+                        and (start is None or action_date >= start)
+                        and (end is None or action_date <= end)
+                    ):
+                        actions.append(
+                            CorporateAction(
+                                code=code,
+                                action_date=action_date,
+                                kind="cash_entitlement",
+                                cash_per_share=max(cash, 0.0),
+                                event_key=event_key,
+                                payment_date=payment_date,
+                                source=source,
+                            )
+                        )
+                    if (
+                        cash > 0
+                        and payment_date is not None
+                        and payment_date > action_date
+                        and (start is None or payment_date >= start)
+                        and (end is None or payment_date <= end)
+                    ):
+                        actions.append(
+                            CorporateAction(
+                                code=code,
+                                action_date=payment_date,
+                                kind="cash_payment",
+                                event_key=event_key,
+                                payment_date=payment_date,
+                                source=source,
+                            )
+                        )
+        except Exception:  # noqa: BLE001 - 损坏的原始表必须显式告警
+            logger.warning("读取分红送转公司行为失败", exc_info=True)
+
+        # 规范化层允许补录交易所公告中的配股、合并与现金收购事件。
+        # 原始记录不可修改，payload 必须带明确 kind，因而人工修正仍可追溯。
+        official_terminal_codes: set[str] = set()
+        try:
+            import pyarrow.parquet as pq
+
+            if self._external_snapshot_enabled:
+                from app.config import get_settings
+
+                research_root = self._root or Path(
+                    get_settings().research_data_dir
+                )
+                delisted_path = (
+                    research_root
+                    / "tushare_snapshot"
+                    / "global"
+                    / "stock_basic_full"
+                    / "D.parquet"
+                )
+                if delisted_path.exists():
+                    table = pq.read_table(
+                        delisted_path,
+                        columns=["ts_code", "delist_date"],
+                    )
+                    wanted = set(codes)
+                    for row in table.to_pylist():
+                        code = str(row.get("ts_code") or "").split(".")[0]
+                        terminal_day = _to_compact_date(
+                            row.get("delist_date")
+                        )
+                        if code not in wanted or terminal_day is None:
+                            continue
+                        if start is not None and terminal_day < start:
+                            continue
+                        if end is not None and terminal_day > end:
+                            continue
+                        last_bars = self._bars_from_parquet(
+                            code, None, terminal_day
+                        )
+                        if not last_bars:
+                            last_bars = self._bars_from_stocktoday(
+                                code, None, terminal_day
+                            )
+                        terminal_price = (
+                            last_bars[-1].close if last_bars else None
+                        )
+                        actions.append(
+                            CorporateAction(
+                                code=code,
+                                action_date=terminal_day,
+                                kind="terminal",
+                                terminal_price=terminal_price,
+                                event_key=f"{code}:{terminal_day}:delist",
+                                source=(
+                                    "tushare:stock_basic_full:D:"
+                                    f"{delisted_path.name}"
+                                ),
+                            )
+                        )
+                        official_terminal_codes.add(code)
+        except Exception:  # noqa: BLE001
+            logger.warning("读取交易所退市日期失败", exc_info=True)
+
+        try:
+            from sqlalchemy import select
+
+            from app.models import QuantDataRecord
+
+            statement = select(QuantDataRecord).where(
+                QuantDataRecord.dataset == "corporate_action",
+                QuantDataRecord.code.in_(codes),
+            )
+            if start is not None:
+                statement = statement.where(
+                    QuantDataRecord.effective_date >= start
+                )
+            if end is not None:
+                statement = statement.where(
+                    QuantDataRecord.effective_date <= end
+                )
+            for record in self._db.scalars(statement).all():  # type: ignore[attr-defined]
+                payload = dict(record.payload or {})
+                kind = str(payload.get("kind") or "").strip()
+                if kind not in {
+                    "rights_issue",
+                    "merger",
+                    "code_change",
+                    "share_distribution",
+                    "cash_entitlement",
+                    "cash_payment",
+                    "terminal",
+                }:
+                    continue
+                actions.append(
+                    CorporateAction(
+                        code=record.code,
+                        action_date=record.effective_date,
+                        kind=kind,
+                        cash_per_share=_to_float(payload.get("cash_per_share"))
+                        or 0.0,
+                        share_ratio=_to_float(payload.get("share_ratio")) or 0.0,
+                        terminal_price=_to_float(payload.get("terminal_price")),
+                        event_key=str(payload.get("event_key") or record.id),
+                        payment_date=_to_compact_date(
+                            payload.get("payment_date")
+                        ),
+                        subscription_ratio=(
+                            _to_float(payload.get("subscription_ratio")) or 0.0
+                        ),
+                        subscription_price=_to_float(
+                            payload.get("subscription_price")
+                        ),
+                        successor_code=(
+                            str(payload.get("successor_code")).split(".")[0]
+                            if payload.get("successor_code")
+                            else None
+                        ),
+                        source=(
+                            f"normalized:{record.source}:{record.source_file}:"
+                            f"{record.source_hash}"
+                        ),
+                    )
+                )
+        except Exception:  # noqa: BLE001 - 旧库未迁移时不影响原始源读取
+            logger.warning("读取规范化公司行为失败", exc_info=True)
+
+        try:
+            from sqlalchemy import select
+
+            from app.models import StockDailyBar, StockMaster
+
+            rows = self._db.execute(  # type: ignore[attr-defined]
+                select(
+                    StockMaster.code,
+                    StockMaster.name,
+                    StockDailyBar.last_trade_date,
+                )
+                .join(StockDailyBar, StockDailyBar.code == StockMaster.code)
+                .where(
+                    StockMaster.code.in_(codes),
+                    StockMaster.name.contains("退"),
+                    StockDailyBar.last_trade_date.is_not(None),
+                )
+            ).all()
+            for code, _name, terminal_day in rows:
+                if str(code) in official_terminal_codes:
+                    continue
+                if start is not None and terminal_day < start:
+                    continue
+                if end is not None and terminal_day > end:
+                    continue
+                last_bars = self._bars_from_parquet(
+                    str(code), terminal_day, terminal_day
+                )
+                terminal_price = last_bars[-1].close if last_bars else None
+                actions.append(
+                    CorporateAction(
+                        code=str(code),
+                        action_date=terminal_day,
+                        kind="terminal",
+                        terminal_price=terminal_price,
+                        source="stock_master:退+stock_daily_bars:last_trade_date",
+                    )
+                )
+        except Exception:  # noqa: BLE001 - 旧数据库无相应元数据时仅缺少终止事件
+            logger.warning("读取退市终止事件失败", exc_info=True)
+
+        # 原始源偶有同一实施方案重复行；按自然键去重并保持确定顺序。
+        unique = {
+            (
+                action.code,
+                action.action_date,
+                action.kind,
+                action.cash_per_share,
+                action.share_ratio,
+                action.event_key,
+                action.subscription_ratio,
+                action.subscription_price,
+                action.successor_code,
+            ): action
+            for action in actions
+        }
+        return sorted(
+            unique.values(), key=lambda action: (action.action_date, action.code)
+        )
+
+    def industries_as_of(
+        self,
+        codes: list[str],
+        as_of_dates: list[date] | tuple[date, ...],
+    ) -> dict[date, dict[str, str]]:
+        """按申万2021成员的 in_date/out_date 返回历史一级行业。"""
+        dates = tuple(sorted(set(as_of_dates)))
+        result: dict[date, dict[str, str]] = {day: {} for day in dates}
+        if not dates:
+            return result
+        try:
+            import pyarrow.parquet as pq
+
+            for code in codes:
+                path = self._stocktoday_file("index_member_all", code)
+                if path is None:
+                    continue
+                table = pq.read_table(
+                    path,
+                    columns=["l1_name", "in_date", "out_date"],
+                )
+                periods: list[tuple[date, date | None, str]] = []
+                for row in table.to_pylist():
+                    industry = str(row.get("l1_name") or "").strip()
+                    in_date = _to_compact_date(row.get("in_date"))
+                    out_date = _to_compact_date(row.get("out_date"))
+                    if industry and in_date is not None:
+                        periods.append((in_date, out_date, industry))
+                for day in dates:
+                    active = [
+                        period
+                        for period in periods
+                        if period[0] <= day
+                        and (period[1] is None or day <= period[1])
+                    ]
+                    if active:
+                        result[day][code] = max(
+                            active, key=lambda period: period[0]
+                        )[2]
+        except Exception:  # noqa: BLE001
+            logger.warning("读取申万2021历史行业成员失败", exc_info=True)
+        return result
 
     def _bars_from_parquet(
         self, code: str, start: date | None, end: date | None, layer: str | None = None
@@ -612,6 +1256,12 @@ class SqlStockRepository:
             return []
         if frame is None:
             return []
+        limits: dict[date, tuple[float | None, float | None]] = {}
+        explicit_suspensions: set[date] = set()
+        if layer is None or layer == parquet_store.DAILY_RAW:
+            limits, explicit_suspensions = self._execution_overrides(
+                code, start, end
+            )
         bars: list[StockBar] = []
         for record in frame.to_dict(orient="records"):
             trade_date = _as_date(record.get("trade_date"))
@@ -624,10 +1274,11 @@ class SqlStockRepository:
                 continue
             volume = _to_float(record.get("volume"))
             amount = _to_float(record.get("amount"))
-            suspended = (
+            suspended = trade_date in explicit_suspensions or (
                 (volume is None or volume <= _SUSPEND_EPS)
                 and (amount is None or amount <= _SUSPEND_EPS)
             )
+            up_limit, down_limit = limits.get(trade_date, (None, None))
             bars.append(
                 StockBar(
                     code=code,
@@ -640,9 +1291,134 @@ class SqlStockRepository:
                     amount=amount,
                     suspended=suspended,
                     raw_return=_to_float(record.get("pct_change")),
+                    up_limit=up_limit,
+                    down_limit=down_limit,
                 )
             )
         return bars
+
+    def _bars_from_stocktoday(
+        self, code: str, start: date | None, end: date | None
+    ) -> list[StockBar]:
+        """研究湖缺失时读取 Tushare 原始日线，保持执行价未经复权。"""
+        path = self._stocktoday_file("daily", code)
+        if path is None:
+            return []
+        try:
+            import pyarrow.parquet as pq
+
+            limits, explicit_suspensions = self._execution_overrides(
+                code, start, end
+            )
+            bars: list[StockBar] = []
+            for record in pq.read_table(path).to_pylist():
+                trade_date = _to_compact_date(record.get("trade_date"))
+                close = _to_float(record.get("close"))
+                if trade_date is None or close is None or close <= 0:
+                    continue
+                if start is not None and trade_date < start:
+                    continue
+                if end is not None and trade_date > end:
+                    continue
+                volume = _to_float(record.get("vol"))
+                if volume is None:
+                    volume = _to_float(record.get("volume"))
+                amount = _to_float(record.get("amount"))
+                suspended = trade_date in explicit_suspensions or (
+                    (volume is None or volume <= _SUSPEND_EPS)
+                    and (amount is None or amount <= _SUSPEND_EPS)
+                )
+                up_limit, down_limit = limits.get(trade_date, (None, None))
+                pct_change = _to_float(record.get("pct_chg"))
+                if pct_change is None:
+                    pct_change = _to_float(record.get("pct_change"))
+                bars.append(
+                    StockBar(
+                        code=code,
+                        trade_date=trade_date,
+                        open=_to_float(record.get("open")),
+                        high=_to_float(record.get("high")),
+                        low=_to_float(record.get("low")),
+                        close=close,
+                        volume=volume,
+                        amount=amount,
+                        suspended=suspended,
+                        raw_return=(
+                            pct_change / 100.0
+                            if pct_change is not None
+                            else None
+                        ),
+                        up_limit=up_limit,
+                        down_limit=down_limit,
+                    )
+                )
+            return sorted(bars, key=lambda bar: bar.trade_date)
+        except Exception:  # noqa: BLE001
+            logger.warning("读取 %s 的 Tushare 原始日线失败", code, exc_info=True)
+            return []
+
+    def _adjust_stocktoday_bars(
+        self, code: str, bars: list[StockBar]
+    ) -> list[StockBar]:
+        """用原始 adj_factor 构造前复权研究序列，执行序列保持 raw。"""
+        factor_path = self._stocktoday_file("adj_factor", code)
+        if factor_path is None or not bars:
+            return []
+        try:
+            import pyarrow.parquet as pq
+
+            factors = {
+                day: value
+                for record in pq.read_table(factor_path).to_pylist()
+                if (day := _to_compact_date(record.get("trade_date")))
+                is not None
+                and (value := _to_float(record.get("adj_factor"))) is not None
+                and value > 0
+            }
+            latest_factor = factors.get(bars[-1].trade_date)
+            if latest_factor is None:
+                eligible = [
+                    (day, value)
+                    for day, value in factors.items()
+                    if day <= bars[-1].trade_date
+                ]
+                latest_factor = (
+                    max(eligible, key=lambda item: item[0])[1]
+                    if eligible
+                    else None
+                )
+            if latest_factor is None or latest_factor <= 0:
+                return []
+            adjusted: list[StockBar] = []
+            for bar in bars:
+                factor = factors.get(bar.trade_date)
+                if factor is None:
+                    return []
+                scale = factor / latest_factor
+                adjusted.append(
+                    StockBar(
+                        code=bar.code,
+                        trade_date=bar.trade_date,
+                        open=(
+                            bar.open * scale if bar.open is not None else None
+                        ),
+                        high=(
+                            bar.high * scale if bar.high is not None else None
+                        ),
+                        low=bar.low * scale if bar.low is not None else None,
+                        close=bar.close * scale,
+                        volume=bar.volume,
+                        amount=bar.amount,
+                        suspended=bar.suspended,
+                        raw_return=bar.raw_return,
+                        up_limit=None,
+                        down_limit=None,
+                    )
+                )
+            return adjusted
+        except Exception:  # noqa: BLE001
+            logger.warning("用 adj_factor 复权 %s 失败", code, exc_info=True)
+            return []
 
     def _bars_from_warehouse(
         self, codes: list[str] | None, start: date | None, end: date | None
@@ -691,6 +1467,8 @@ class SqlStockRepository:
         missing: list[str] = []
         for code in codes:
             series = self._bars_from_parquet(code, start, end)
+            if not series:
+                series = self._bars_from_stocktoday(code, start, end)
             if series:
                 bars.extend(series)
             else:
@@ -719,6 +1497,8 @@ class SqlStockRepository:
             research_bars = self._bars_from_parquet(
                 code, start, end, layer=parquet_store.DAILY_QFQ
             )
+            if not research_bars:
+                research_bars = self._adjust_stocktoday_bars(code, exec_bars)
             if not research_bars:
                 research_bars = list(exec_bars)
             elif exec_bars and research_bars[-1].trade_date < exec_bars[-1].trade_date:
@@ -755,6 +1535,8 @@ class SqlStockRepository:
                             amount=raw.amount,
                             suspended=raw.suspended,
                             raw_return=change,
+                            up_limit=raw.up_limit,
+                            down_limit=raw.down_limit,
                         )
                     )
                     previous_raw = raw
@@ -799,7 +1581,47 @@ class SqlStockRepository:
         return result
 
     def trade_calendar(self, start: date | None, end: date | None) -> TradeCalendar:
-        """交易日历：行情日期的并集（数据湖断点表范围内抽样）。"""
+        """交易日历：StockToday SSE 权威日历优先，行情日期推断仅回退。"""
+        try:
+            from app.config import get_settings
+            import pyarrow.parquet as pq
+
+            research_root = self._root or Path(get_settings().research_data_dir)
+            calendar_path = (
+                research_root
+                / "tushare_snapshot"
+                / "global"
+                / "trade_cal"
+                / "SSE.parquet"
+            )
+            if calendar_path.exists():
+                table = pq.read_table(
+                    calendar_path, columns=["cal_date", "is_open"]
+                )
+                days = []
+                for raw_day, is_open in zip(
+                    table.column("cal_date").to_pylist(),
+                    table.column("is_open").to_pylist(),
+                    strict=True,
+                ):
+                    day = _to_date(
+                        f"{str(raw_day)[:4]}-{str(raw_day)[4:6]}-{str(raw_day)[6:8]}"
+                    )
+                    if not is_open or day is None:
+                        continue
+                    if start is not None and day < start:
+                        continue
+                    if end is not None and day > end:
+                        continue
+                    days.append(day)
+                if days:
+                    return TradeCalendar(tuple(sorted(set(days))))
+        except Exception:  # noqa: BLE001 - 原始日历异常时显式告警后回退
+            logger.warning(
+                "StockToday trade_cal 读取失败，交易日历回退为行情日期并集",
+                exc_info=True,
+            )
+
         from sqlalchemy import select
 
         from app.models import StockDailyBar
@@ -808,6 +1630,7 @@ class SqlStockRepository:
         if not codes:
             codes = [info.code for info in self.list_stocks(None)]
         days: set[date] = set()
+        logger.warning("权威 trade_cal 不可用，交易日历由行情日期推断")
         # 抽样若干只高覆盖股票构造日历（全市场逐只读湖代价过高）
         for code in codes[:50]:
             for bar in self._bars_from_parquet(code, start, end):
@@ -818,6 +1641,74 @@ class SqlStockRepository:
             for bar in self._bars_from_warehouse(None, start, end):
                 days.add(bar.trade_date)
         return TradeCalendar(tuple(sorted(days)))
+
+    def universe_members_as_of(
+        self,
+        index_codes: list[str] | tuple[str, ...],
+        as_of_dates: list[date] | tuple[date, ...],
+    ) -> dict[date, UniverseMembership]:
+        """读取每个信号日不晚于该日的最近历史指数成分快照。
+
+        一次装载所需区间的快照后在内存中二分定位，避免按“日期×指数”
+        反复查询数据库。任一指数没有历史快照时会记录 missing_indices，
+        调用方据此拒绝或显式降级，绝不回退到当前成分。
+        """
+        from sqlalchemy import select
+
+        from app.models import StockUniverseSnapshot
+
+        indices = tuple(dict.fromkeys(index_codes))
+        dates = tuple(sorted(set(as_of_dates)))
+        if not indices or not dates:
+            return {}
+        rows = self._db.execute(  # type: ignore[attr-defined]
+            select(
+                StockUniverseSnapshot.index_code,
+                StockUniverseSnapshot.snapshot_date,
+                StockUniverseSnapshot.stock_code,
+            )
+            .where(
+                StockUniverseSnapshot.index_code.in_(indices),
+                StockUniverseSnapshot.snapshot_date <= dates[-1],
+            )
+            .order_by(
+                StockUniverseSnapshot.index_code,
+                StockUniverseSnapshot.snapshot_date,
+                StockUniverseSnapshot.stock_code,
+            )
+        ).all()
+        snapshots: dict[str, dict[date, set[str]]] = {
+            index: {} for index in indices
+        }
+        for index_code, snapshot_date, stock_code in rows:
+            snapshots.setdefault(index_code, {}).setdefault(
+                snapshot_date, set()
+            ).add(stock_code)
+
+        available_dates = {
+            index: sorted(by_date) for index, by_date in snapshots.items()
+        }
+        result: dict[date, UniverseMembership] = {}
+        for as_of in dates:
+            members: set[str] = set()
+            used: dict[str, date] = {}
+            missing: list[str] = []
+            for index in indices:
+                candidates = available_dates.get(index, [])
+                position = bisect_right(candidates, as_of) - 1
+                if position < 0:
+                    missing.append(index)
+                    continue
+                snapshot_date = candidates[position]
+                used[index] = snapshot_date
+                members.update(snapshots[index][snapshot_date])
+            result[as_of] = UniverseMembership(
+                as_of=as_of,
+                members=frozenset(members),
+                snapshot_dates=used,
+                missing_indices=tuple(missing),
+            )
+        return result
 
     # ---- PIT 财务 ----------------------------------------------------------
 
@@ -859,7 +1750,7 @@ class SqlStockRepository:
             func.max(StockValuation.trade_date).label("trade_date"),
         ).where(
             StockValuation.code.in_(codes),
-            StockValuation.indicator.in_(("pe_ttm", "pb")),
+            StockValuation.indicator.in_(("pe_ttm", "pb", "total_mv")),
         )
         if as_of is not None:
             latest_dates = latest_dates.where(
@@ -894,17 +1785,252 @@ class SqlStockRepository:
                 entry[indicator] = (day, number)
         return latest
 
+    def valuation_snapshots(
+        self,
+        codes: list[str],
+        as_of_dates: list[date] | tuple[date, ...],
+    ) -> list[Fundamentals]:
+        """生成指定信号日的独立 PIT 估值快照。
+
+        估值是每日市场数据，不能附着到季度财务报告上。调用方传入实际
+        信号日，本方法逐日选取不晚于该日的 PE(TTM)/PB，并用信号日作为
+        快照可用日。这样既避免未来数据，也只装载策略真正需要的月频观测，
+        不必把数百万条日估值全部放入内存。
+        """
+        if not codes:
+            return []
+        result: list[Fundamentals] = []
+        requested_dates = tuple(sorted(set(as_of_dates)))
+        raw_by_date: dict[date, dict[str, dict[str, float]]] = {
+            day: {} for day in requested_dates
+        }
+        raw_trade_dates: dict[date, dict[str, date]] = {
+            day: {} for day in requested_dates
+        }
+        source_mismatch_counts: dict[str, int] = {}
+        try:
+            import pyarrow.parquet as pq
+
+            research_root = self._root
+            if research_root is None:
+                from app.config import get_settings
+
+                research_root = Path(get_settings().research_data_dir)
+            monthly_directory = (
+                research_root
+                / "tushare_snapshot"
+                / "global"
+                / "daily_basic_monthly"
+            )
+            monthly_files = (
+                sorted(monthly_directory.glob("*.parquet"))
+                if self._external_snapshot_enabled
+                else []
+            )
+            monthly_dates = [
+                _to_compact_date(path.stem) for path in monthly_files
+            ]
+            valid_monthly = [
+                (day, path)
+                for day, path in zip(monthly_dates, monthly_files, strict=True)
+                if day is not None
+            ]
+            chosen_files: dict[Path, list[date]] = {}
+            valid_days = [day for day, _path in valid_monthly]
+            for as_of in requested_dates:
+                position = bisect_right(valid_days, as_of) - 1
+                if position >= 0:
+                    chosen_files.setdefault(
+                        valid_monthly[position][1], []
+                    ).append(as_of)
+            wanted_codes = set(codes)
+            for path, signal_days in chosen_files.items():
+                path_day = _to_compact_date(path.stem)
+                if path_day is None:
+                    continue
+                table = pq.read_table(
+                    path,
+                    columns=[
+                        "ts_code",
+                        "pe_ttm",
+                        "pb",
+                        "ps_ttm",
+                        "dv_ttm",
+                        "total_mv",
+                        "circ_mv",
+                    ],
+                )
+                values_by_code: dict[str, dict[str, float]] = {}
+                for row in table.to_pylist():
+                    code = str(row.get("ts_code") or "").split(".")[0]
+                    if code not in wanted_codes:
+                        continue
+                    values_by_code[code] = {
+                        key: number
+                        for key in (
+                            "pe_ttm",
+                            "pb",
+                            "ps_ttm",
+                            "dv_ttm",
+                            "total_mv",
+                            "circ_mv",
+                        )
+                        if (number := _to_float(row.get(key))) is not None
+                    }
+                for as_of in signal_days:
+                    raw_by_date[as_of].update(values_by_code)
+                    raw_trade_dates[as_of].update(
+                        {code: path_day for code in values_by_code}
+                    )
+
+            for code in codes:
+                path = self._stocktoday_file("daily_basic", code)
+                if path is None:
+                    continue
+                table = pq.read_table(
+                    path,
+                    columns=[
+                        "trade_date",
+                        "pe_ttm",
+                        "pb",
+                        "ps_ttm",
+                        "dv_ttm",
+                        "total_mv",
+                        "circ_mv",
+                    ],
+                )
+                rows = sorted(
+                    (
+                        (_to_compact_date(row.get("trade_date")), row)
+                        for row in table.to_pylist()
+                    ),
+                    key=lambda pair: pair[0] or date.min,
+                )
+                valid_rows = [(day, row) for day, row in rows if day is not None]
+                row_dates = [day for day, _row in valid_rows]
+                for as_of in requested_dates:
+                    position = bisect_right(row_dates, as_of) - 1
+                    if position < 0:
+                        continue
+                    _day, row = valid_rows[position]
+                    values = {
+                        key: number
+                        for key in (
+                            "pe_ttm",
+                            "pb",
+                            "ps_ttm",
+                            "dv_ttm",
+                            "total_mv",
+                            "circ_mv",
+                        )
+                        if (number := _to_float(row.get(key))) is not None
+                    }
+                    raw_by_date[as_of][code] = values
+                    raw_trade_dates[as_of][code] = _day
+        except Exception:  # noqa: BLE001
+            logger.warning("读取 daily_basic PIT 估值失败，回退规范化估值表", exc_info=True)
+
+        for as_of in requested_dates:
+            latest = self._valuation_latest(codes, as_of)
+            for code in set(latest) | set(raw_by_date[as_of]):
+                entry = latest.get(code, {})
+                raw = raw_by_date[as_of].get(code, {})
+                for field_name in ("pe_ttm", "pb"):
+                    raw_value = raw.get(field_name)
+                    legacy_value = (
+                        entry[field_name][1]
+                        if field_name in entry
+                        else None
+                    )
+                    if (
+                        raw_value is not None
+                        and legacy_value is not None
+                        and raw_value != 0
+                    ):
+                        difference = abs(raw_value - legacy_value) / abs(raw_value)
+                        threshold = 0.02 if field_name != "pe_ttm" else 0.05
+                        if difference > threshold:
+                            source_mismatch_counts[field_name] = (
+                                source_mismatch_counts.get(field_name, 0) + 1
+                            )
+                pe = raw.get("pe_ttm") or (
+                    entry["pe_ttm"][1] if "pe_ttm" in entry else None
+                )
+                pb_value = raw.get("pb") or (
+                    entry["pb"][1] if "pb" in entry else None
+                )
+                ep = 1.0 / pe if pe is not None and pe > 0 else None
+                bp = (
+                    1.0 / pb_value
+                    if pb_value is not None and pb_value > 0
+                    else None
+                )
+                market_cap = (
+                    raw["total_mv"] * 10_000.0
+                    if "total_mv" in raw
+                    else entry["total_mv"][1] * 10_000.0
+                    if "total_mv" in entry
+                    else None
+                )
+                float_market_cap = (
+                    raw["circ_mv"] * 10_000.0 if "circ_mv" in raw else None
+                )
+                sales_yield = (
+                    1.0 / raw["ps_ttm"]
+                    if raw.get("ps_ttm") is not None and raw["ps_ttm"] > 0
+                    else None
+                )
+                dividend_yield = (
+                    raw["dv_ttm"] / 100.0
+                    if raw.get("dv_ttm") is not None
+                    else None
+                )
+                if (
+                    ep is None
+                    and bp is None
+                    and market_cap is None
+                    and sales_yield is None
+                    and dividend_yield is None
+                ):
+                    continue
+                valuation_date = raw_trade_dates[as_of].get(code)
+                if valuation_date is None and entry:
+                    valuation_date = max(
+                        item[0] for item in entry.values()
+                    )
+                result.append(
+                    Fundamentals(
+                        code=code,
+                        available_at=as_of,
+                        period=None,
+                        valuation_date=valuation_date,
+                        ep=ep,
+                        bp=bp,
+                        market_cap=market_cap,
+                        float_market_cap=float_market_cap,
+                        sales_yield=sales_yield,
+                        dividend_yield=dividend_yield,
+                    )
+                )
+        if source_mismatch_counts:
+            logger.warning(
+                "估值跨源差异超过阈值（按字段主源 Tushare 取值）：%s",
+                source_mismatch_counts,
+            )
+        return result
+
     def fundamentals(
         self,
         codes: list[str] | None = None,
         as_of: date | None = None,
     ) -> list[Fundamentals]:
-        """PIT 财务快照：财务指标（披露日 PIT）+ 估值（EP/BP）。
+        """PIT 财务快照（仅季度财务指标，不混入每日估值）。
 
         available_at 口径：披露日程的实际披露日优先，缺失回退财务行的
         available_at（入库时间近似）；两者皆无时按报告期法定最晚披露日
         保守估计（statutory_disclosure_deadline）并记 warning。
-        估值（EP/BP）按 as_of 取 trade_date ≤ as_of 的最新一条，无未来数据。
+        每日估值由 valuation_snapshots 按实际信号日独立读取，避免将某个
+        时点的 PE/PB 重复附着到所有历史财务报告。
         """
         from sqlalchemy import select
 
@@ -918,7 +2044,6 @@ class SqlStockRepository:
         stmt = select(StockFinancialIndicator).where(StockFinancialIndicator.code.in_(codes))
         rows = self._db.execute(stmt).scalars().all()  # type: ignore[attr-defined]
         disclosure = self._disclosure_map(codes)
-        valuations = self._valuation_latest(codes, as_of)
 
         result: list[Fundamentals] = []
         estimated_count = 0
@@ -948,9 +2073,6 @@ class SqlStockRepository:
                 and net_profit > 0
             ):
                 ocf_to_profit = ocf / net_profit
-            entry = valuations.get(row.code, {})
-            ep = 1.0 / entry["pe_ttm"][1] if "pe_ttm" in entry else None
-            bp = 1.0 / entry["pb"][1] if "pb" in entry else None
             result.append(
                 Fundamentals(
                     code=row.code,
@@ -962,8 +2084,6 @@ class SqlStockRepository:
                     ),
                     ocf_to_profit=ocf_to_profit,
                     debt_ratio=debt_ratio / 100.0 if debt_ratio is not None else None,
-                    ep=ep,
-                    bp=bp,
                 )
             )
 
@@ -977,7 +2097,205 @@ class SqlStockRepository:
         # DuckDB fundamentals 数据集（长表 metric 口径）回退：仅当 ORM 无该行时
         if not result and self._warehouse_repo is not None:
             result.extend(self._fundamentals_from_warehouse(codes, as_of))
+        # 已下载的三大报表与 fina_indicator 是字段最完整的 PIT 主源。
+        # 同一股票/报告期若主源存在，删除回退源对应期，避免回退源较晚的
+        # 入库时间覆盖真实公告日；同时对关键字段差异做显式质量告警。
+        primary = self._fundamentals_from_tushare(codes, as_of)
+        primary_periods = {
+            (snapshot.code, snapshot.period)
+            for snapshot in primary
+            if snapshot.period is not None
+        }
+        fallback_by_period = {
+            (snapshot.code, snapshot.period): snapshot
+            for snapshot in result
+            if snapshot.period is not None
+        }
+        mismatch_counts: dict[str, int] = {}
+        for snapshot in primary:
+            fallback = fallback_by_period.get((snapshot.code, snapshot.period))
+            if fallback is None:
+                continue
+            for field_name, threshold in (("roe", 0.02),):
+                selected = getattr(snapshot, field_name)
+                other = getattr(fallback, field_name)
+                if selected is None or other is None or selected == 0:
+                    continue
+                difference = abs(selected - other) / abs(selected)
+                if difference > threshold:
+                    mismatch_counts[field_name] = (
+                        mismatch_counts.get(field_name, 0) + 1
+                    )
+        if mismatch_counts:
+            logger.warning(
+                "财务跨源差异超过阈值（按字段主源 Tushare 取值）：%s",
+                mismatch_counts,
+            )
+        result = [
+            snapshot
+            for snapshot in result
+            if (snapshot.code, snapshot.period) not in primary_periods
+        ]
+        result.extend(primary)
+        result.sort(key=lambda snapshot: (snapshot.code, snapshot.available_at))
         return result
+
+    def _fundamentals_from_tushare(
+        self, codes: list[str], as_of: date | None
+    ) -> list[Fundamentals]:
+        """把三大报表按公告日保守合并为 PIT 财务快照。
+
+        同一报告期仅在利润表、资产负债表、现金流和指标表各自最新可得
+        版本中取值；available_at 取参与字段公告日的最大值，确保不会提前
+        使用尚未公开的报表。
+        """
+        try:
+            import pyarrow.parquet as pq
+        except Exception:  # noqa: BLE001
+            return []
+
+        datasets: dict[str, tuple[str, ...]] = {
+            "income": (
+                "ann_date",
+                "f_ann_date",
+                "end_date",
+                "comp_type",
+                "total_revenue",
+                "revenue",
+                "n_income_attr_p",
+                "n_income",
+            ),
+            "balancesheet": (
+                "ann_date",
+                "f_ann_date",
+                "end_date",
+                "total_assets",
+                "total_liab",
+                "total_hldr_eqy_exc_min_int",
+            ),
+            "cashflow": (
+                "ann_date",
+                "f_ann_date",
+                "end_date",
+                "net_profit",
+                "n_cashflow_act",
+                "free_cashflow",
+            ),
+            "fina_indicator": (
+                "ann_date",
+                "end_date",
+                "roe",
+                "roa",
+                "roa_dp",
+                "gross_margin",
+                "grossprofit_margin",
+                "netprofit_margin",
+                "debt_to_assets",
+            ),
+        }
+        snapshots: list[Fundamentals] = []
+        for code in codes:
+            by_period: dict[date, dict[str, object]] = {}
+            available_by_period: dict[date, list[date]] = {}
+            for dataset, columns in datasets.items():
+                path = self._stocktoday_file(dataset, code)
+                if path is None:
+                    continue
+                try:
+                    table = pq.read_table(path, columns=list(columns))
+                except Exception:  # noqa: BLE001
+                    logger.warning("财务原始表损坏：%s", path, exc_info=True)
+                    continue
+                # 同一报告期可能有更正，按公告日保留当时最新公开版本。
+                latest: dict[date, tuple[date, dict[str, object]]] = {}
+                for row in table.to_pylist():
+                    period = _to_compact_date(row.get("end_date"))
+                    available = _to_compact_date(
+                        row.get("f_ann_date") or row.get("ann_date")
+                    )
+                    if period is None or available is None:
+                        continue
+                    if as_of is not None and available > as_of:
+                        continue
+                    current = latest.get(period)
+                    if current is None or available >= current[0]:
+                        latest[period] = (available, row)
+                for period, (available, row) in latest.items():
+                    by_period.setdefault(period, {}).update(row)
+                    available_by_period.setdefault(period, []).append(available)
+            for period, row in by_period.items():
+                availability = available_by_period.get(period, [])
+                if not availability:
+                    continue
+                available = max(availability)
+                roe = _to_float(row.get("roe"))
+                roa = _to_float(row.get("roa")) or _to_float(row.get("roa_dp"))
+                gross_margin = _to_float(row.get("gross_margin"))
+                if gross_margin is None:
+                    gross_margin = _to_float(row.get("grossprofit_margin"))
+                net_margin = _to_float(row.get("netprofit_margin"))
+                debt_ratio = _to_float(row.get("debt_to_assets"))
+                total_assets = _to_float(row.get("total_assets"))
+                total_liab = _to_float(row.get("total_liab"))
+                if (
+                    debt_ratio is None
+                    and total_assets is not None
+                    and total_assets > 0
+                    and total_liab is not None
+                ):
+                    debt_ratio = total_liab / total_assets
+                net_income = _to_float(row.get("n_income_attr_p"))
+                if net_income is None:
+                    net_income = _to_float(row.get("n_income"))
+                if net_income is None:
+                    net_income = _to_float(row.get("net_profit"))
+                ocf = _to_float(row.get("n_cashflow_act"))
+                ocf_to_profit = (
+                    ocf / net_income
+                    if ocf is not None and net_income is not None and net_income > 0
+                    else None
+                )
+                snapshots.append(
+                    Fundamentals(
+                        code=code,
+                        available_at=available,
+                        period=period,
+                        roe=roe / 100.0 if roe is not None else None,
+                        roa=roa / 100.0 if roa is not None else None,
+                        gross_margin=(
+                            gross_margin / 100.0
+                            if gross_margin is not None
+                            else None
+                        ),
+                        net_margin=(
+                            net_margin / 100.0
+                            if net_margin is not None
+                            else None
+                        ),
+                        ocf_to_profit=ocf_to_profit,
+                        debt_ratio=(
+                            debt_ratio / 100.0
+                            if debt_ratio is not None and debt_ratio > 1.5
+                            else debt_ratio
+                        ),
+                        revenue=_to_float(
+                            row.get("total_revenue") or row.get("revenue")
+                        ),
+                        net_income=net_income,
+                        operating_cash_flow=ocf,
+                        free_cash_flow=_to_float(row.get("free_cashflow")),
+                        total_assets=total_assets,
+                        total_equity=_to_float(
+                            row.get("total_hldr_eqy_exc_min_int")
+                        ),
+                        company_type=(
+                            str(row.get("comp_type"))
+                            if row.get("comp_type") is not None
+                            else None
+                        ),
+                    )
+                )
+        return snapshots
 
     def _fundamentals_from_warehouse(
         self, codes: list[str], as_of: date | None

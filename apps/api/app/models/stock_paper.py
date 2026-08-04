@@ -93,6 +93,35 @@ class StockPaperPosition(Base):
     )
 
 
+class StockPaperReceivable(Base):
+    """除权日确认、派息日到账的现金股利应收款。"""
+
+    __tablename__ = "stock_paper_receivables"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "event_key",
+            name="uq_stock_paper_receivable_account_event",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("stock_paper_accounts.id"), nullable=False, index=True
+    )
+    stock_code: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    event_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    entitlement_date: Mapped[date] = mapped_column(Date, nullable=False)
+    payment_date: Mapped[date | None] = mapped_column(Date)
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="receivable")
+    source: Mapped[str] = mapped_column(String(500), nullable=False)
+    paid_at: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class StockPaperRun(Base):
     """某一真实行情日的前向模拟运行记录，按账户和数据日幂等。"""
 
@@ -150,6 +179,9 @@ class StockPaperSignal(Base):
     selected_count: Mapped[int] = mapped_column(Integer, nullable=False)
     invested_weight: Mapped[Decimal] = mapped_column(WEIGHT, nullable=False)
     target_weights: Mapped[dict[str, float]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    order_state: Mapped[dict[str, dict]] = mapped_column(
         JSON, nullable=False, default=dict
     )
     items: Mapped[list[dict]] = mapped_column(JSON, nullable=False, default=list)

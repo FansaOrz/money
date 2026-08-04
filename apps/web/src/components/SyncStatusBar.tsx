@@ -102,6 +102,7 @@ export function SyncStatusBar() {
   const failedCount = view?.jobs.filter((j) => j.status === "failed").length ?? 0;
   const partialCount = view?.jobs.filter((j) => j.status === "partial").length ?? 0;
   const pausedCount = view?.jobs.filter((j) => j.status === "paused").length ?? 0;
+  const alertCount = view?.alerts.length ?? 0;
 
   return (
     <div className="mb-6 rounded-xl border border-slate-200 bg-white text-xs text-slate-500 shadow-sm">
@@ -145,6 +146,11 @@ export function SyncStatusBar() {
             {pausedCount > 0 && (
               <span className="rounded bg-sky-50 px-1.5 py-0.5 font-medium text-sky-700">
                 {pausedCount} 项已暂停
+              </span>
+            )}
+            {alertCount > 0 && (
+              <span className="rounded bg-rose-50 px-1.5 py-0.5 font-medium text-rose-700">
+                {alertCount} 条治理告警
               </span>
             )}
             {latestFinished && (
@@ -191,8 +197,9 @@ export function SyncStatusBar() {
 
       {/* 展开态：各任务明细 */}
       {expanded && view && (
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t border-slate-100 px-3.5 py-2.5">
-          {view.jobs.map((job) => (
+        <div className="border-t border-slate-100 px-3.5 py-2.5">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            {view.jobs.map((job) => (
             <span
               key={job.job}
               title={jobTooltip(job)}
@@ -206,7 +213,22 @@ export function SyncStatusBar() {
                   : STATUS_LABEL[job.status]}
               </span>
             </span>
-          ))}
+            ))}
+          </div>
+          {view.alerts.length > 0 && (
+            <div className="mt-2 space-y-1 border-t border-rose-100 pt-2">
+              {view.alerts.slice(0, 10).map((alert, index) => (
+                <div
+                  key={`${alert.type}-${alert.code ?? ""}-${index}`}
+                  className="text-rose-700"
+                  title={alert.correlationId ? `关联 ID：${alert.correlationId}` : undefined}
+                >
+                  {alert.code ? `${alert.code} · ` : ""}
+                  {alert.message}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

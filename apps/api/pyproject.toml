@@ -19,6 +19,7 @@ dependencies = [
     # 研究数据仓库（DuckDB + Parquet 分区目录）
     "duckdb>=1.0",
     "pyarrow>=14.0",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]

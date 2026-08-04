@@ -1646,6 +1646,13 @@ export interface SyncStatusView {
   /** 服务器当前时间（北京时间 ISO） */
   serverTime: string | null;
   jobs: SyncJobView[];
+  alerts: Array<{
+    type: string;
+    severity: string;
+    message: string;
+    code: string | null;
+    correlationId: string | null;
+  }>;
 }
 
 /** 归一化同步状态：按固定任务顺序输出，接口缺失/字段缺失时宽松容错 */
@@ -1680,6 +1687,23 @@ export function normalizeSyncStatus(
         ? raw.server_time
         : null,
     jobs,
+    alerts:
+      raw && typeof raw === "object" && Array.isArray(raw.alerts)
+        ? raw.alerts
+            .filter((item) => item && typeof item === "object")
+            .map((item) => ({
+              type: typeof item.type === "string" ? item.type : "unknown",
+              severity:
+                typeof item.severity === "string" ? item.severity : "warning",
+              message:
+                typeof item.message === "string" ? item.message : "未知告警",
+              code: typeof item.code === "string" ? item.code : null,
+              correlationId:
+                typeof item.correlation_id === "string"
+                  ? item.correlation_id
+                  : null,
+            }))
+        : [],
   };
 }
 

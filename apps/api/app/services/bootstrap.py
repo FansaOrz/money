@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from app.db.session import SessionLocal
 from app.main import create_tables
+from app.config import get_settings
 from app.services.fund_data import sync_fund_nav_history, sync_fund_navs
 from app.services.importer import commit_import, create_preview
 
@@ -24,7 +25,8 @@ class LocalUpload:
 
 
 def bootstrap() -> None:
-    create_tables()
+    if get_settings().auto_create_tables:
+        create_tables()
     db = SessionLocal()
     try:
         for path in sorted(PDF_DIR.glob("*.pdf"), reverse=True):

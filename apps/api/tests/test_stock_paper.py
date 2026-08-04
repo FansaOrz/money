@@ -63,7 +63,22 @@ class ForwardRepository:
     def fundamentals(
         self, codes: list[str] | None = None, as_of: date | None = None
     ) -> list[Fundamentals]:
-        return []
+        wanted = set(codes) if codes else {item.code for item in self.infos}
+        return [
+            Fundamentals(
+                code=code,
+                available_at=date(2024, 12, 31),
+                roe=0.12,
+                gross_margin=0.30,
+                ocf_to_profit=1.0,
+                debt_ratio=0.45,
+                ep=1 / 12,
+                bp=1 / 1.5,
+                market_cap=10_000_000_000.0,
+                float_market_cap=8_000_000_000.0,
+            )
+            for code in wanted
+        ]
 
     def trade_calendar(
         self, start: date | None, end: date | None
@@ -172,6 +187,7 @@ def test_forward_cycle_generates_then_executes_t_plus_one(
 ) -> None:
     repository, signal_day = _seed_trial(db_session)
     monkeypatch.setattr(stock_paper, "EXPECTED_UNIVERSE_COUNT", 50)
+    monkeypatch.setattr(stock_paper, "REQUIRE_PREVALIDATION", False)
     monkeypatch.setattr(stock_paper, "load_repository", lambda _db: repository)
     monkeypatch.setattr(
         stock_paper,
@@ -193,6 +209,14 @@ def test_forward_cycle_generates_then_executes_t_plus_one(
     assert repeated.skipped is True
     assert db_session.query(StockPaperRun).count() == 1
     assert db_session.query(StockPaperNavDaily).count() == 1
+    first_nav = db_session.scalar(
+        select(StockPaperNavDaily).where(
+            StockPaperNavDaily.nav_date == signal_day
+        )
+    )
+    assert first_nav is not None
+    # 基准不能在策略首个可执行日之前提前产生收益。
+    assert float(first_nav.benchmark_nav) == 1.0
 
     next_day = signal_day + timedelta(days=1)
     for code, rows in repository.bars.items():
@@ -222,8 +246,21 @@ def test_forward_cycle_generates_then_executes_t_plus_one(
     db_session.refresh(signal)
     assert signal.status == "executed"
     assert signal.executed_at == next_day
+    assert signal.order_state
+    assert all(
+        state["status"] in {"filled", "partial", "blocked"}
+        and state["events"]
+        for state in signal.order_state.values()
+    )
     assert db_session.query(StockPaperTrade).count() == second.trade_count
     assert db_session.query(StockPaperNavDaily).count() == 2
+    second_nav = db_session.scalar(
+        select(StockPaperNavDaily).where(
+            StockPaperNavDaily.nav_date == next_day
+        )
+    )
+    assert second_nav is not None
+    assert float(second_nav.benchmark_nav) == 1.0
 
     summary = stock_paper.get_summary(db_session)
     assert summary.started is True
@@ -238,6 +275,7 @@ def test_late_initialization_never_backfills_missed_open(
 ) -> None:
     repository, signal_day = _seed_trial(db_session)
     monkeypatch.setattr(stock_paper, "EXPECTED_UNIVERSE_COUNT", 50)
+    monkeypatch.setattr(stock_paper, "REQUIRE_PREVALIDATION", False)
     monkeypatch.setattr(stock_paper, "load_repository", lambda _db: repository)
     created_day = signal_day + timedelta(days=1)
     monkeypatch.setattr(

@@ -32,6 +32,15 @@ class CostModelConfig(ConfiguredBaseModel):
     min_commission: float = Field(default=5.0, ge=0.0, le=1000.0, description="单笔最低佣金（元）")
     stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.05, description="印花税率（仅卖出）")
     slippage_rate: float = Field(default=0.001, ge=0.0, le=0.05, description="双边滑点率")
+    market_impact_coefficient: float = Field(
+        default=0.002, ge=0.0, le=0.1, description="成交量参与率平方根冲击系数"
+    )
+    volatility_slippage_coefficient: float = Field(
+        default=0.10, ge=0.0, le=1.0, description="近期日波动对滑点的系数"
+    )
+    max_total_slippage: float = Field(
+        default=0.03, ge=0.0, le=0.2, description="单边总滑点上限"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +85,8 @@ class StockFactorRow(ConfiguredBaseModel):
     trend: float | None = None
     lowvol: float | None = None
     composite: float = Field(description="复合分（族权重加权和，缺失族归一化）")
+    data_coverage: float = Field(description="可用因子族权重覆盖率")
+    eligible: bool = Field(description="是否达到组合入选的数据门槛")
     rank: int = Field(description="复合分排名（1 为最高）")
     data_warnings: list[str] = Field(default_factory=list)
 
@@ -91,6 +102,7 @@ class StockFactorsResponse(ConfiguredBaseModel):
     )
     industry_count: int = Field(description="universe 覆盖的行业数")
     factor_weights: dict[str, float] = Field(default_factory=dict)
+    factor_diagnostics: dict[str, object] = Field(default_factory=dict)
     rows: list[StockFactorRow] = Field(
         default_factory=list, description="按复合分降序（规模受控截断）"
     )
@@ -159,7 +171,41 @@ class StockBacktestRequest(ConfiguredBaseModel):
     initial_capital: float = Field(default=1_000_000.0, gt=0, le=1e10)
     candidate_codes: list[str] | None = Field(
         default=None, min_length=1, max_length=5000,
-        description="候选股票池；缺省为全市场动态 universe",
+        description="显式固定候选池；传入后不使用历史指数动态股票池",
+    )
+    universe_indices: list[str] = Field(
+        default_factory=lambda: ["000300", "000905"],
+        max_length=10,
+        description="缺省按这些指数在每个信号日的历史成分并集回测",
+    )
+    initial_signal: bool = Field(
+        default=False,
+        description="是否在非月末区间起点主动建仓；缺省仅真实月末生成信号",
+    )
+    min_universe_data_coverage: float = Field(
+        default=0.95,
+        ge=0.5,
+        le=1.0,
+        description="动态历史股票池每个信号日的核心数据最低覆盖率",
+    )
+    max_volume_participation: float = Field(
+        default=0.10,
+        gt=0,
+        le=0.50,
+        description="单日模拟成交量不得超过当日成交量的比例",
+    )
+    minimum_trade_weight: float = Field(
+        default=0.002,
+        ge=0,
+        le=0.05,
+        description="目标权重变化小于该值时不交易",
+    )
+    minimum_holdings: int = Field(default=20, ge=5, le=200)
+    max_annual_volatility: float = Field(
+        default=0.25, gt=0, le=1.0, description="组合预期年化波动硬上限"
+    )
+    max_tracking_error: float = Field(
+        default=0.15, gt=0, le=1.0, description="相对市值基准预期跟踪误差硬上限"
     )
     top_n: int = Field(default=30, ge=1, le=200)
     max_stock_weight: float = Field(default=0.05, gt=0, le=1.0)
@@ -178,6 +224,8 @@ class StockBacktestRequest(ConfiguredBaseModel):
     def _check_dates(self) -> "StockBacktestRequest":
         if self.start_date > self.end_date:
             raise ValueError("start_date 不能晚于 end_date")
+        if self.candidate_codes:
+            self.universe_indices = []
         return self
 
 
@@ -209,6 +257,10 @@ class StockRebalanceDetail(ConfiguredBaseModel):
     )
     fills: list[StockTradeRecord] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    diagnostics: dict[str, object] = Field(default_factory=dict)
+    order_events: list[dict[str, object]] = Field(
+        default_factory=list, description="逐次下单、阻塞、部分成交、覆盖及过期轨迹"
+    )
 
 
 class StockBacktestSummary(ConfiguredBaseModel):
@@ -227,6 +279,19 @@ class StockValidationStats(ConfiguredBaseModel):
 
     rank_ic_mean: float | None = None
     rank_ic_count: int = 0
+    rank_ic_std: float | None = None
+    rank_ic_ir: float | None = None
+    rank_ic_t_stat: float | None = None
+    rank_ic_hit_rate: float | None = None
+    rank_ic_newey_west_se: float | None = None
+    rank_ic_newey_west_t: float | None = None
+    rank_ic_p_value: float | None = None
+    rank_ic_95_ci: list[float] = Field(default_factory=list)
+    rank_ic_bootstrap_95_ci: list[float] = Field(default_factory=list)
+    ic_decay_autocorrelation: list[float | None] = Field(default_factory=list)
+    mean_rank_turnover: float | None = None
+    multiple_testing_warning: str | None = None
+    quintile_period_count: int = 0
     quintile_returns: list[float | None] = Field(default_factory=list)
     quintile_spread: float | None = None
     quintile_kendall_tau: float | None = None
@@ -237,6 +302,7 @@ class StockBacktestResult(ConfiguredBaseModel):
     """回测响应。"""
 
     params: dict = Field(default_factory=dict)
+    attribution: dict[str, float] = Field(default_factory=dict)
     start_date: str
     end_date: str
     initial_capital: float
@@ -259,6 +325,20 @@ class StockBacktestResult(ConfiguredBaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class StockWalkForwardRequest(StockBacktestRequest):
+    """股票策略训练/验证/完全留出评估。"""
+
+    top_n_grid: list[int] = Field(default_factory=lambda: [20, 30, 40])
+    max_stock_weight_grid: list[float] = Field(
+        default_factory=lambda: [0.03, 0.05]
+    )
+    embargo_days: int = Field(default=21, ge=0, le=126)
+
+
+class StockWalkForwardResult(ConfiguredBaseModel):
+    result: dict[str, object]
+
+
 __all__ = [
     "CostModelConfig",
     "FactorWeightsConfig",
@@ -275,4 +355,6 @@ __all__ = [
     "StockSignalsResponse",
     "StockTradeRecord",
     "StockValidationStats",
+    "StockWalkForwardRequest",
+    "StockWalkForwardResult",
 ]

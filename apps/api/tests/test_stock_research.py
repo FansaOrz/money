@@ -7,7 +7,7 @@ DataFrame，测试全程离线；另覆盖网络失败（返回 None）时的优
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     IndexConstituent,
     IndexMembershipEvent,
+    QuantDataRecord,
     StockDailyBar,
     StockFinancialIndicator,
     StockIndustry,
@@ -1062,7 +1063,7 @@ def _seed_master(db_session: Session, codes: list[str]) -> None:
 
 
 def test_repository_valuation_as_of_filter(db_session: Session) -> None:
-    """估值按 as_of 过滤：未来 PE/PB 不得进入历史快照（无未来估值泄漏）。"""
+    """估值是独立信号日快照，未来 PE/PB 不得进入历史快照。"""
     from app.services.stock_repository import SqlStockRepository
 
     _seed_master(db_session, ["600519"])
@@ -1079,13 +1080,275 @@ def test_repository_valuation_as_of_filter(db_session: Session) -> None:
     db_session.commit()
 
     repo = SqlStockRepository(db_session)
-    snaps = repo.fundamentals(["600519"], as_of=date(2024, 6, 1))
+    financials = repo.fundamentals(["600519"], as_of=date(2024, 6, 1))
+    assert len(financials) == 1
+    assert financials[0].ep is None
+    snaps = repo.valuation_snapshots(["600519"], [date(2024, 6, 1)])
     assert len(snaps) == 1
     # as_of=2024-06-01 只能看到 3-01 的 PE=20 → EP=0.05；9-01 的 PE=5 不可见
     assert snaps[0].ep == pytest.approx(1.0 / 20.0)
-    # 不过滤 as_of 时取最新（9-01, PE=5）→ EP=0.2
-    snaps_all = repo.fundamentals(["600519"], None)
-    assert snaps_all[0].ep == pytest.approx(1.0 / 5.0)
+    assert snaps[0].valuation_date == date(2024, 3, 1)
+    later = repo.valuation_snapshots(["600519"], [date(2024, 10, 1)])
+    assert later[0].ep == pytest.approx(1.0 / 5.0)
+
+
+def test_repository_valuation_snapshots_change_across_signal_dates(
+    db_session: Session,
+) -> None:
+    """不同信号日保存不同估值，不能把最终值复制到整条历史。"""
+    from app.services.stock_repository import SqlStockRepository
+
+    _seed_master(db_session, ["600519"])
+    for day, value in ((date(2024, 3, 1), 20.0), (date(2024, 9, 1), 10.0)):
+        db_session.add(
+            StockValuation(
+                code="600519", trade_date=day, indicator="pe_ttm", value=value
+            )
+        )
+    db_session.commit()
+
+    rows = SqlStockRepository(db_session).valuation_snapshots(
+        ["600519"], [date(2024, 6, 1), date(2024, 10, 1)]
+    )
+    assert [row.available_at for row in rows] == [
+        date(2024, 6, 1),
+        date(2024, 10, 1),
+    ]
+    assert [row.ep for row in rows] == pytest.approx([0.05, 0.1])
+    assert [row.valuation_date for row in rows] == [
+        date(2024, 3, 1),
+        date(2024, 9, 1),
+    ]
+
+
+def test_repository_uses_official_delist_date(db_session, tmp_path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from app.services.stock_repository import SqlStockRepository
+
+    path = (
+        tmp_path
+        / "tushare_snapshot"
+        / "global"
+        / "stock_basic_full"
+        / "D.parquet"
+    )
+    path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "ts_code": "600001.SH",
+                    "name": "历史退市股",
+                    "industry": "工业",
+                    "list_date": "20000101",
+                    "delist_date": "20240630",
+                }
+            ]
+        ),
+        path,
+    )
+    repository = SqlStockRepository(db_session, data_root=tmp_path)
+    actions = repository.corporate_actions(
+        ["600001"], date(2024, 1, 1), date(2024, 12, 31)
+    )
+    assert len(actions) == 1
+    assert actions[0].kind == "terminal"
+    assert actions[0].action_date == date(2024, 6, 30)
+    assert "stock_basic_full" in actions[0].source
+    infos = repository.list_stocks(["600001"])
+    assert infos[0].name == "历史退市股"
+    assert infos[0].list_date == date(2000, 1, 1)
+
+
+def test_repository_uses_tushare_raw_daily_as_execution_fallback(
+    db_session, tmp_path
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from app.services.stock_repository import SqlStockRepository
+
+    path = (
+        tmp_path
+        / "tushare_snapshot"
+        / "stocks"
+        / "daily"
+        / "600001.SH.parquet"
+    )
+    path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "ts_code": "600001.SH",
+                    "trade_date": "20240102",
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.8,
+                    "close": 10.2,
+                    "vol": 1000.0,
+                    "amount": 10200.0,
+                    "pct_chg": 2.0,
+                },
+                {
+                    "ts_code": "600001.SH",
+                    "trade_date": "20240103",
+                    "open": 5.0,
+                    "high": 5.2,
+                    "low": 4.9,
+                    "close": 5.1,
+                    "vol": 2000.0,
+                    "amount": 10200.0,
+                    "pct_chg": 0.0,
+                },
+            ]
+        ),
+        path,
+    )
+    factor_path = (
+        tmp_path
+        / "tushare_snapshot"
+        / "stocks"
+        / "adj_factor"
+        / "600001.SH.parquet"
+    )
+    factor_path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "ts_code": "600001.SH",
+                    "trade_date": "20240102",
+                    "adj_factor": 1.0,
+                },
+                {
+                    "ts_code": "600001.SH",
+                    "trade_date": "20240103",
+                    "adj_factor": 2.0,
+                },
+            ]
+        ),
+        factor_path,
+    )
+    repository = SqlStockRepository(db_session, data_root=tmp_path)
+    rows = repository.daily_bars(
+        ["600001"], date(2024, 1, 1), date(2024, 1, 31)
+    )
+    assert len(rows) == 2
+    assert rows[0].close == pytest.approx(10.2)
+    assert rows[0].raw_return == pytest.approx(0.02)
+    panel = repository.market_bars(
+        ["600001"], date(2024, 1, 1), date(2024, 1, 31)
+    )["600001"]
+    assert panel.exec_bars[0].close == pytest.approx(10.2)
+    assert panel.research_bars[0].close == pytest.approx(5.1)
+    assert panel.research_bars[1].close == pytest.approx(5.1)
+
+
+def test_repository_recovers_historical_master_from_code_change(
+    db_session,
+) -> None:
+    from app.services.stock_repository import SqlStockRepository
+
+    db_session.add(
+        StockMaster(code="302132", name="中航成飞", exchange="sz")
+    )
+    db_session.add(
+        QuantDataRecord(
+            dataset="corporate_action",
+            code="300114",
+            effective_date=date(2025, 2, 17),
+            available_at=datetime(2025, 2, 7, tzinfo=UTC),
+            source="cninfo",
+            source_file="announcement.pdf",
+            source_hash="a" * 64,
+            payload={
+                "kind": "code_change",
+                "old_name": "中航电测",
+                "successor_code": "302132",
+                "share_ratio": 1.0,
+            },
+            imported_at=datetime.now(UTC),
+        )
+    )
+    db_session.commit()
+    rows = SqlStockRepository(db_session).list_stocks(["300114"])
+    assert len(rows) == 1
+    assert rows[0].code == "300114"
+    assert rows[0].name == "中航电测"
+
+
+def test_repository_historical_universe_uses_latest_snapshot_not_after_as_of(
+    db_session: Session,
+) -> None:
+    """历史股票池按信号日向后取最近快照，不得使用未来或当前成分。"""
+    from app.services.stock_repository import SqlStockRepository
+
+    db_session.add_all(
+        [
+            StockUniverseSnapshot(
+                index_code="000300",
+                snapshot_date=date(2024, 1, 31),
+                stock_code="600001",
+                stock_name="旧成分",
+            ),
+            StockUniverseSnapshot(
+                index_code="000300",
+                snapshot_date=date(2024, 2, 29),
+                stock_code="600002",
+                stock_name="新成分",
+            ),
+            StockUniverseSnapshot(
+                index_code="000905",
+                snapshot_date=date(2024, 1, 31),
+                stock_code="000001",
+                stock_name="中证500成分",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    result = SqlStockRepository(db_session).universe_members_as_of(
+        ["000300", "000905"], [date(2024, 2, 15), date(2024, 3, 15)]
+    )
+    assert result[date(2024, 2, 15)].members == frozenset(
+        {"600001", "000001"}
+    )
+    assert result[date(2024, 3, 15)].members == frozenset(
+        {"600002", "000001"}
+    )
+    assert result[date(2024, 2, 15)].snapshot_dates == {
+        "000300": date(2024, 1, 31),
+        "000905": date(2024, 1, 31),
+    }
+
+
+def test_repository_trade_calendar_prefers_stocktoday_source(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """权威 trade_cal 能区分休市日，不从个别股票缺失行情误推交易日。"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from app.services.stock_repository import SqlStockRepository
+
+    path = tmp_path / "tushare_snapshot/global/trade_cal/SSE.parquet"
+    path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "cal_date": ["20240102", "20240103", "20240104"],
+                "is_open": [1, 0, 1],
+            }
+        ),
+        path,
+    )
+    calendar = SqlStockRepository(db_session, data_root=tmp_path).trade_calendar(
+        date(2024, 1, 1), date(2024, 1, 4)
+    )
+    assert calendar.days == (date(2024, 1, 2), date(2024, 1, 4))
 
 
 def test_repository_disclosure_statutory_fallback(

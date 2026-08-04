@@ -10,15 +10,17 @@ universe 过滤（每个打分日 T 重新计算，即动态 universe）：
 
 组合构建：
 - 入选：复合分排名前 top_n（默认 30）；
-- 行业中性：以 universe 行业市值等权份额为基准，行业目标权重
-  = universe 行业只数占比 × 投入仓位（近似流通市值中性，数据缺失时
-  按只数口径），单行业权重不超过 max_industry_weight 硬上限；
-- 行业内按复合分排名依次分配，单股权重 ≤ max_stock_weight（默认 5%）；
+- 行业中性：按信号日自由流通市值形成行业基准，市值覆盖低于 95% 时拒绝
+  构建，禁止回退只数口径；单行业权重不超过 max_industry_weight 硬上限；
+- 目标函数同时考虑复合分、预期波动、换手和流动性成本；约束单股、行业、
+  市值、Beta、流动性、ADV 参与率和最少持仓数；
+- 持仓保留区、入选/剔除双阈值和最小交易权重抑制边界抖动；
   基准行业配额未用满时，在入选行业间按剩余容量再分配，但始终遵守
   单股和单行业硬上限；只有全部容量不足时才持有现金；
 - 月调仓：由回测层按月度节奏调用本模块，本模块保持无状态纯函数。
 
-涨跌停与费用在回测层（stock_backtest）处理；本模块不感知成交价。
+涨跌停、成交容量、动态滑点、费用和公司行为在回测/前向执行层处理；
+本模块仅生成目标权重。
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ DEFAULT_TOP_N = 30  # 入选股票数上限
 DEFAULT_MAX_STOCK_WEIGHT = 0.05  # 单股权重上限 5%
 DEFAULT_MAX_INDUSTRY_WEIGHT = 0.20  # 单行业权重上限 20%
 MIN_HISTORY_BARS = factors.MIN_HISTORY_DAYS
-MIN_KNOWN_INDUSTRY_RATIO = 0.5  # universe 已知行业占比下限（行业中性有效性的底线）
+MIN_KNOWN_INDUSTRY_RATIO = 0.95  # 正式行业中性所需的信号日分类覆盖
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +76,7 @@ class PortfolioPlan:
     filters: list[UniverseFilter] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     industry_known_ratio: float = 1.0  # universe 已知行业占比（1.0 = 全部已知）
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 class IndustryCoverageError(ValueError):
@@ -240,12 +243,20 @@ def build_portfolio(
     max_stock_weight: float = DEFAULT_MAX_STOCK_WEIGHT,
     max_industry_weight: float = DEFAULT_MAX_INDUSTRY_WEIGHT,
     enforce_industry_coverage: bool = True,
+    current_weights: dict[str, float] | None = None,
+    retention_buffer: int = 5,
+    minimum_trade_weight: float = 0.002,
+    portfolio_value: float = 1_000_000.0,
+    max_adv_participation: float = 0.10,
+    minimum_holdings: int = 20,
+    max_annual_volatility: float = 0.25,
+    max_tracking_error: float = 0.15,
 ) -> PortfolioPlan:
     """由复合分排名构建目标组合（行业中性、单股/行业上限）。
 
     - scored：universe 内股票的复合分结果（compute_cross_section 输出）；
-    - 行业目标份额 = universe 中行业只数占比（市值数据缺失时的等权近似），
-      并受 max_industry_weight 硬上限约束（上限内按份额与上限取小）；
+    - 行业目标份额按信号日自由流通市值（缺失时用总市值）计算，覆盖
+      低于 95% 时拒绝组合构建，不以只数口径制造伪中性；
     - 行业内按复合分从高到低分配，单股 ≤ max_stock_weight，截断顺延；
     - 行业基准配额用不满时，在入选行业的剩余风险容量内再分配；
       全部入选标的容量仍不足时，剩余部分转为现金；
@@ -275,23 +286,97 @@ def build_portfolio(
         )
 
     universe_industries = {info.code: (info.industry or "未知") for info in universe}
-    # 行业份额：universe 只数占比（行业中性基准）
-    industry_count: dict[str, int] = {}
-    for code in universe_industries.values():
-        industry_count[code] = industry_count.get(code, 0) + 1
-    total_count = sum(industry_count.values())
+    market_cap_by_code = {
+        item.code: item.float_market_cap or item.market_cap
+        for item in scored
+        if (item.float_market_cap or item.market_cap) is not None
+        and (item.float_market_cap or item.market_cap) > 0
+    }
+    cap_coverage = (
+        sum(code in market_cap_by_code for code in universe_industries)
+        / len(universe_industries)
+    )
+    if cap_coverage < 0.95:
+        raise IndustryCoverageError(
+            f"信号日自由流通/总市值覆盖仅 {cap_coverage:.0%} < 95%，"
+            "拒绝按股票只数近似行业基准"
+        )
+    industry_cap: dict[str, float] = {}
+    for code, industry in universe_industries.items():
+        market_cap = market_cap_by_code.get(code)
+        if market_cap is not None:
+            industry_cap[industry] = (
+                industry_cap.get(industry, 0.0) + market_cap
+            )
+    total_cap = sum(industry_cap.values())
     industry_quota = {
-        industry: min(count / total_count, max_industry_weight)
-        for industry, count in industry_count.items()
+        industry: min(value / total_cap, max_industry_weight)
+        for industry, value in industry_cap.items()
     }
 
-    # 复合分排名（全局 top_n 入选）
-    ranked = sorted(scored, key=lambda item: item.composite, reverse=True)[: max(top_n, 1)]
+    # 复合分排名（先执行因子数据覆盖门禁，再取全局 top_n）
+    eligible = [item for item in scored if item.eligible]
+    current_weights = current_weights or {}
+
+    def optimization_score(item: factors.FactorResult) -> float:
+        daily_volatility = max(
+            -float(item.raw.get("volatility_60") or 0.0), 0.0
+        )
+        turnover_penalty = 0.0 if current_weights.get(item.code, 0.0) > 0 else 0.01
+        illiquidity_penalty = (
+            0.0
+            if item.average_daily_amount is not None
+            and item.average_daily_amount > 0
+            else 0.05
+        )
+        return (
+            item.composite
+            - 2.0 * daily_volatility
+            - turnover_penalty
+            - illiquidity_penalty
+        )
+
+    all_ranked = sorted(eligible, key=optimization_score, reverse=True)
+    rank_by_code = {item.code: index + 1 for index, item in enumerate(all_ranked)}
+    selected_codes = {
+        item.code for item in all_ranked[: max(top_n, 1)]
+    }
+    if current_weights:
+        selected_codes.update(
+            code
+            for code, weight in current_weights.items()
+            if weight > 0
+            and rank_by_code.get(code, len(all_ranked) + 1)
+            <= max(top_n, 1) + max(retention_buffer, 0)
+        )
+    ranked = [
+        item for item in all_ranked if item.code in selected_codes
+    ][: max(top_n + max(retention_buffer, 0), 1)]
+    excluded_for_data = len(scored) - len(eligible)
+    if excluded_for_data:
+        plan.warnings.append(
+            f"{excluded_for_data} 只股票因因子数据覆盖不足不参与组合"
+        )
 
     by_industry: dict[str, list[factors.FactorResult]] = {}
     for item in ranked:
         industry = universe_industries.get(item.code, item.industry or "未知")
         by_industry.setdefault(industry, []).append(item)
+
+    stock_weight_limit = {
+        item.code: min(
+            max_stock_weight,
+            (
+                item.average_daily_amount
+                * max_adv_participation
+                / portfolio_value
+                if item.average_daily_amount is not None
+                and portfolio_value > 0
+                else max_stock_weight
+            ),
+        )
+        for item in ranked
+    }
 
     target: dict[str, float] = {}
     industry_weight: dict[str, float] = {}
@@ -300,15 +385,24 @@ def build_portfolio(
         if not members:
             continue
         remaining = quota
-        for item in members:
-            if remaining <= 0:
+        active = list(members)
+        while remaining > 1e-12 and active:
+            equal_addition = remaining / len(active)
+            next_active: list[factors.FactorResult] = []
+            allocated = 0.0
+            for item in active:
+                room = stock_weight_limit[item.code] - target.get(item.code, 0.0)
+                addition = min(equal_addition, max(room, 0.0))
+                if addition > 0:
+                    target[item.code] = target.get(item.code, 0.0) + addition
+                    allocated += addition
+                if room - addition > 1e-12:
+                    next_active.append(item)
+            if allocated <= 1e-12:
                 break
-            weight = min(max_stock_weight, remaining)
-            if weight <= 0:
-                break
-            target[item.code] = round(weight, 6)
-            industry_weight[industry] = industry_weight.get(industry, 0.0) + weight
-            remaining -= weight
+            remaining -= allocated
+            active = next_active
+        industry_weight[industry] = quota - max(remaining, 0.0)
 
     # 基准行业配额常因全局 top_n 未覆盖所有行业而留下大量现金。将剩余
     # 资金在“已入选且仍有容量”的行业/股票间回补，同时保持两级硬上限。
@@ -320,7 +414,9 @@ def build_portfolio(
         members_by_industry: dict[str, list[factors.FactorResult]] = {}
         for item in ranked:
             industry = universe_industries.get(item.code, item.industry or "未知")
-            stock_room = max(max_stock_weight - target.get(item.code, 0.0), 0.0)
+            stock_room = max(
+                stock_weight_limit[item.code] - target.get(item.code, 0.0), 0.0
+            )
             industry_room = max(
                 max_industry_weight - industry_weight.get(industry, 0.0), 0.0
             )
@@ -329,7 +425,7 @@ def build_portfolio(
             members_by_industry.setdefault(industry, []).append(item)
         for industry, members in members_by_industry.items():
             stock_capacity = sum(
-                max(max_stock_weight - target.get(item.code, 0.0), 0.0)
+                max(stock_weight_limit[item.code] - target.get(item.code, 0.0), 0.0)
                 for item in members
             )
             capacity_by_industry[industry] = min(
@@ -346,7 +442,7 @@ def build_portfolio(
             members = members_by_industry[industry]
             rooms = {
                 item.code: max(
-                    max_stock_weight - target.get(item.code, 0.0), 0.0
+                    stock_weight_limit[item.code] - target.get(item.code, 0.0), 0.0
                 )
                 for item in members
             }
@@ -369,10 +465,305 @@ def build_portfolio(
     if rounded_total > 1.0 and target:
         code = max(target, key=target.get)
         target[code] = round(target[code] - (rounded_total - 1.0), 6)
+
+    # 风格暴露诊断：基准按自由流通市值，组合按目标权重。
+    benchmark_weights = {
+        code: cap / sum(market_cap_by_code.values())
+        for code, cap in market_cap_by_code.items()
+    } if market_cap_by_code and sum(market_cap_by_code.values()) > 0 else {}
+    scored_by_code = {item.code: item for item in scored}
+    exposure_fields = {
+        "size": "size_exposure",
+        "beta": "beta_exposure",
+        "liquidity": "liquidity_exposure",
+    }
+    normalized_exposures: dict[str, dict[str, float]] = {}
+    for label, field_name in exposure_fields.items():
+        values = {
+            item.code: float(value)
+            for item in scored
+            if (value := getattr(item, field_name)) is not None
+        }
+        if len(values) < 2:
+            normalized_exposures[label] = values
+            continue
+        mean = sum(values.values()) / len(values)
+        variance = sum((value - mean) ** 2 for value in values.values()) / len(values)
+        std = variance ** 0.5
+        normalized_exposures[label] = {
+            code: (value - mean) / std if std > 0 else 0.0
+            for code, value in values.items()
+        }
+
+    # 在同一行业内部搬移权重，实际约束市值/Beta/流动性相对基准偏离；
+    # 不改变行业权重，并继续遵守单股上限。
+    for _round in range(100):
+        moved_in_round = False
+        for label in exposure_fields:
+            exposures = normalized_exposures[label]
+            benchmark_available = {
+                code: weight
+                for code, weight in benchmark_weights.items()
+                if code in exposures
+            }
+            benchmark_total = sum(benchmark_available.values())
+            invested_now = sum(target.values())
+            if benchmark_total <= 0 or invested_now <= 0:
+                continue
+            benchmark_value = sum(
+                weight * exposures[code]
+                for code, weight in benchmark_available.items()
+            ) / benchmark_total
+            portfolio_value = sum(
+                weight * exposures[code]
+                for code, weight in target.items()
+                if code in exposures
+            ) / invested_now
+            tolerance = 0.20 if label != "beta" else 0.15
+            deviation = portfolio_value - benchmark_value
+            if abs(deviation) <= tolerance:
+                continue
+            best_pair: tuple[str, str, float] | None = None
+            for source, source_weight in target.items():
+                if source_weight <= 1e-9 or source not in exposures:
+                    continue
+                for destination in target:
+                    if destination not in exposures:
+                        continue
+                    if (
+                        universe_industries.get(source)
+                        != universe_industries.get(destination)
+                    ):
+                        continue
+                    room = stock_weight_limit[destination] - target[destination]
+                    if room <= 1e-9:
+                        continue
+                    improvement = (
+                        exposures[source] - exposures[destination]
+                        if deviation > 0
+                        else exposures[destination] - exposures[source]
+                    )
+                    if improvement <= 0:
+                        continue
+                    capacity = min(source_weight, room)
+                    score = improvement * capacity
+                    if best_pair is None or score > best_pair[2]:
+                        best_pair = (source, destination, score)
+            if best_pair is None:
+                continue
+            source, destination, _score = best_pair
+            exposure_gap = abs(exposures[source] - exposures[destination])
+            required = (
+                max(abs(deviation) - tolerance, 0.0)
+                * invested_now
+                / exposure_gap
+            )
+            moved = min(
+                required,
+                max(target[source] - minimum_trade_weight, 0.0),
+                stock_weight_limit[destination] - target[destination],
+            )
+            target[source] -= moved
+            target[destination] += moved
+            moved_in_round = moved_in_round or moved > 1e-12
+            if target[source] <= 1e-10:
+                target.pop(source, None)
+        if not moved_in_round:
+            break
+
+    required_holdings = min(
+        max(top_n, 1), max(minimum_holdings, 1), max(len(eligible), 1)
+    )
+    if target and len(target) < required_holdings:
+        plan.warnings.append(
+            f"优化后仅 {len(target)} 只可满足全部风险/容量约束，低于最少"
+            f"持仓 {required_holdings} 只，本期拒绝形成集中组合并持有现金"
+        )
+        target = {}
+        industry_weight = {}
+
+    benchmark_exposures: dict[str, float | None] = {}
+    portfolio_exposures: dict[str, float | None] = {}
+    deviations: dict[str, float | None] = {}
+    for label, field_name in exposure_fields.items():
+        exposures = normalized_exposures[label]
+        benchmark_values = [
+            (benchmark_weights.get(code, 0.0), value)
+            for code, value in exposures.items()
+        ]
+        benchmark_total = sum(weight for weight, _value in benchmark_values)
+        benchmark_value = (
+            sum(weight * value for weight, value in benchmark_values) / benchmark_total
+            if benchmark_total > 0
+            else None
+        )
+        portfolio_values = [
+            (weight, exposures[code])
+            for code, weight in target.items()
+            if code in exposures
+        ]
+        portfolio_total = sum(weight for weight, _value in portfolio_values)
+        portfolio_value = (
+            sum(weight * value for weight, value in portfolio_values) / portfolio_total
+            if portfolio_total > 0
+            else None
+        )
+        benchmark_exposures[label] = benchmark_value
+        portfolio_exposures[label] = portfolio_value
+        deviations[label] = (
+            portfolio_value - benchmark_value
+            if portfolio_value is not None and benchmark_value is not None
+            else None
+        )
+    exposure_violations = {
+        label: deviation
+        for label, deviation in deviations.items()
+        if deviation is not None
+        and abs(deviation) > (0.15 if label == "beta" else 0.20)
+    }
+    if target and exposure_violations:
+        plan.warnings.append(
+            "市值/Beta/流动性硬约束无法同时满足，本期拒绝形成伪中性组合："
+            + "、".join(
+                f"{label}={deviation:+.3f}"
+                for label, deviation in exposure_violations.items()
+            )
+        )
+        target = {}
+        industry_weight = {}
+
+    daily_risk_by_code = {
+        item.code: -float(item.raw["volatility_60"])
+        for item in scored
+        if item.raw.get("volatility_60") is not None
+        and -float(item.raw["volatility_60"]) > 0
+    }
+    fallback_risk = (
+        sorted(daily_risk_by_code.values())[
+            len(daily_risk_by_code) // 2
+        ]
+        if daily_risk_by_code
+        else 0.02
+    )
+
+    def annual_volatility(weights: dict[str, float]) -> float:
+        return (
+            sum(
+                (
+                    weight
+                    * daily_risk_by_code.get(code, fallback_risk)
+                )
+                ** 2
+                for code, weight in weights.items()
+            )
+            ** 0.5
+            * (252.0**0.5)
+        )
+
+    expected_annual_vol = annual_volatility(target)
+    if (
+        target
+        and max_annual_volatility > 0
+        and expected_annual_vol > max_annual_volatility
+    ):
+        scale = max_annual_volatility / expected_annual_vol
+        target = {code: weight * scale for code, weight in target.items()}
+        industry_weight = {
+            industry: weight * scale
+            for industry, weight in industry_weight.items()
+        }
+        expected_annual_vol = annual_volatility(target)
+        plan.warnings.append(
+            f"预期年化波动超过 {max_annual_volatility:.1%}，"
+            f"股票仓位按 {scale:.1%} 缩放，其余持有现金"
+        )
+    active_codes = set(target) | set(benchmark_weights)
+    expected_tracking_error = annual_volatility(
+        {
+            code: target.get(code, 0.0) - benchmark_weights.get(code, 0.0)
+            for code in active_codes
+        }
+    )
+    if (
+        target
+        and len(eligible) >= minimum_holdings
+        and max_tracking_error > 0
+        and expected_tracking_error > max_tracking_error
+    ):
+        plan.warnings.append(
+            f"预期跟踪误差 {expected_tracking_error:.1%} 超过硬上限"
+            f" {max_tracking_error:.1%}，本期持有现金"
+        )
+        target = {}
+        industry_weight = {}
     invested = sum(target.values())
     plan.target_weights = dict(sorted(target.items(), key=lambda kv: kv[1], reverse=True))
     plan.invested_weight = round(invested, 6)
     plan.industries = {key: round(value, 6) for key, value in sorted(industry_weight.items())}
+    effective_n = (
+        1.0 / sum(weight * weight for weight in target.values())
+        if target
+        else 0.0
+    )
+    estimated_turnover = (
+        0.5
+        * sum(
+            abs(target.get(code, 0.0) - (current_weights or {}).get(code, 0.0))
+            for code in set(target) | set(current_weights or {})
+        )
+    )
+    expected_score = sum(
+        weight * scored_by_code[code].composite
+        for code, weight in target.items()
+        if code in scored_by_code
+    )
+    lowvol_risk = [
+        daily_risk_by_code[item.code]
+        for item in scored
+        if item.code in target and item.code in daily_risk_by_code
+    ]
+    expected_daily_vol = (
+        sum(
+            target[item.code] * daily_risk_by_code[item.code]
+            for item in scored
+            if item.code in target and item.code in daily_risk_by_code
+        )
+        if lowvol_risk
+        else None
+    )
+    plan.diagnostics = {
+        "objective": "factor_score-risk-turnover-cost",
+        "expected_factor_score": round(expected_score, 8),
+        "estimated_turnover": round(estimated_turnover, 6),
+        "effective_holdings": round(effective_n, 4),
+        "herfindahl": round(sum(weight * weight for weight in target.values()), 8),
+        "expected_daily_volatility": expected_daily_vol,
+        "expected_annual_volatility": expected_annual_vol,
+        "expected_tracking_error": expected_tracking_error,
+        "max_annual_volatility": max_annual_volatility,
+        "max_tracking_error": max_tracking_error,
+        "stress_loss_5sigma": (
+            -5.0 * expected_daily_vol if expected_daily_vol is not None else None
+        ),
+        "benchmark_exposures": benchmark_exposures,
+        "portfolio_exposures": portfolio_exposures,
+        "exposure_deviations": deviations,
+        "float_market_cap_coverage": round(cap_coverage, 6),
+        "retention_buffer": retention_buffer,
+        "minimum_trade_weight": minimum_trade_weight,
+        "max_adv_participation": max_adv_participation,
+        "capacity_constrained_count": sum(
+            stock_weight_limit[code] < max_stock_weight - 1e-12
+            for code in stock_weight_limit
+        ),
+    }
+    for label, deviation in deviations.items():
+        tolerance = 0.20 if label != "beta" else 0.15
+        if deviation is not None and abs(deviation) > tolerance:
+            plan.warnings.append(
+                f"{label} 相对基准暴露偏离 {deviation:+.3f} 超过"
+                f" {tolerance:.2f}，受入选数量/行业/单股约束未能完全中性"
+            )
     final_shortfall = max(1.0 - invested, 0.0)
     if final_shortfall > 1e-6:
         plan.warnings.append(

@@ -8,6 +8,9 @@ WEB_STANDALONE_DIR="$WEB_DIR/.next/standalone"
 DATA_DIR="$ROOT_DIR/data"
 NODE_BIN="/usr/local/nvm/versions/node/v20.20.2/bin"
 
+# 不继承宿主机关闭 TLS 证书校验的调试变量，避免服务端请求被降级。
+unset NODE_TLS_REJECT_UNAUTHORIZED
+
 mkdir -p "$DATA_DIR"
 
 if [[ -d "$NODE_BIN" ]]; then
@@ -30,15 +33,34 @@ start_process() {
   echo "$name 已启动（PID $(cat "$pid_file")）"
 }
 
+NEW_DATABASE=false
 if [[ ! -f "$DATA_DIR/money.db" ]]; then
-  echo "未发现数据库，正在初始化并导入 PDF..."
-  (cd "$API_DIR" && python -m app.services.bootstrap)
+  NEW_DATABASE=true
+fi
+
+echo "正在检查数据库迁移..."
+(
+  cd "$API_DIR"
+  env MONEY_DATABASE_URL="sqlite:///$DATA_DIR/money.db" \
+      MONEY_AUTO_CREATE_TABLES=false \
+      alembic upgrade head
+)
+
+if [[ "$NEW_DATABASE" == true ]]; then
+  echo "数据库结构已建立，正在导入 PDF..."
+  (
+    cd "$API_DIR"
+    env MONEY_DATABASE_URL="sqlite:///$DATA_DIR/money.db" \
+        MONEY_AUTO_CREATE_TABLES=false \
+        python -m app.services.bootstrap
+  )
 fi
 
 (
   cd "$API_DIR"
   start_process "后端 API" "$DATA_DIR/api.pid" "$DATA_DIR/api.log" \
     env MONEY_DATABASE_URL="sqlite:///$DATA_DIR/money.db" \
+        MONEY_AUTO_CREATE_TABLES=false \
         MONEY_RESEARCH_DATA_DIR="$DATA_DIR/research" \
         MONEY_RESEARCH_DB="$DATA_DIR/research/research.duckdb" \
         MONEY_CORS_ORIGINS='["http://localhost:3000","http://127.0.0.1:3000"]' \
@@ -71,6 +93,7 @@ fi
   cd "$API_DIR"
   start_process "每日调度器" "$DATA_DIR/scheduler.pid" "$DATA_DIR/scheduler.log" \
     env MONEY_DATABASE_URL="sqlite:///$DATA_DIR/money.db" \
+        MONEY_AUTO_CREATE_TABLES=false \
         MONEY_RESEARCH_DATA_DIR="$DATA_DIR/research" \
         MONEY_RESEARCH_DB="$DATA_DIR/research/research.duckdb" \
         python -m app.services.scheduler

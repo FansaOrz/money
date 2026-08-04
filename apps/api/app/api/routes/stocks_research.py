@@ -27,20 +27,24 @@ from app.schemas.stocks import (
     StockSignalsResponse,
     StockTradeRecord,
     StockValidationStats,
+    StockWalkForwardRequest,
+    StockWalkForwardResult,
 )
 from app.services import quant_stats as stats
 from app.services import stock_backtest as backtest_service
 from app.services import stock_factors as factors_service
 from app.services import stock_strategy as strategy_service
+from app.services import stock_validation as validation_service
 from app.services.stock_repository import StockRepository, load_repository
 
 router = APIRouter(prefix="/stocks/research", tags=["stocks-research"])
 
 FACTOR_METHODOLOGY = (
     "A股多因子横截面：行业内 1%/99% winsorize 后 z-score（行业中性化），"
-    "五族复合 quality30%（ROE/毛利率/经营现金流利润比/负债率取负）、"
-    "value25%（EP/BP/估值历史分位）、12-1 动量20%、趋势15%（MA20/MA60）、"
-    "低波动10%（60 日日收益波动取负）；缺失族按可用权重归一化。"
+    "五族复合 quality30%（ROE/ROA/现金流/应计/稳定性等，金融业独立）、"
+    "value25%（EP/BP/SP/股息/FCF/估值分位及亏损分类）、动量20%"
+    "（12-1/6-1/反转/残差）、趋势15%、低风险10%"
+    "（60/120日波动、Beta、残差波动和回撤）；"
     "基本面按 available_at ≤ 打分日做 PIT 过滤，行情仅用打分日及之前数据，"
     "无未来数据。universe 动态过滤：ST/停牌/上市未满 120 交易日/"
     "近20日日均成交额不足/历史样本不足。仅为研究输出，不构成投资建议。"
@@ -48,9 +52,10 @@ FACTOR_METHODOLOGY = (
 BACKTEST_METHODOLOGY = (
     "A股多因子月调仓回测：每月最后一个交易日（T）收盘后按复合分构建"
     "行业中性目标组合（单股 ≤5%、单行业 ≤20%），T+1 交易日按开盘价成交"
-    "（缺失回退收盘）；涨跌停（默认 ±9.8%）与停牌不可成交，订单顺延至"
+    "（缺失回退收盘）；真实涨跌停与停牌不可成交，订单顺延至"
     "下一交易日重试；费用含双边佣金（万 2.5，最低 5 元）、卖出印花税"
-    "（0.05%）与双边滑点（0.1%）；停牌日前收盘盯市。基准为 universe 等权"
+    "（0.05%）、波动/参与率动态滑点、ADV部分成交和公司行为；"
+    "停牌日前收盘盯市。基准为含公司行为的 universe 等权"
     "买入持有（B0），指定指数且数据可用时为指数买入持有。walk-forward 口径："
     "每期持仓仅由当期信号日及之前的 PIT 数据决定，持有期为样本外；"
     "validation 统计各期复合分 vs 下一期前瞻收益的 Rank IC 与五档单调性。"
@@ -70,9 +75,8 @@ def get_stock_repository(db: Session = Depends(get_db)) -> StockRepository:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "股票数据仓储不可用：stock data 模块尚未落地。可通过 "
-                "register_repository_factory / app.services.stock_repository."
-                "get_repository 接入，或先同步 stock_master / 日线数据湖。"
+                "股票数据仓储不可用：请检查 SQLite、DuckDB/Parquet 研究仓库"
+                "和数据目录配置，或通过 register_repository_factory 注入仓储。"
             ),
         )
     return repository
@@ -117,7 +121,9 @@ def _score_universe(
     bars_by_code = panel.bars_by_code
     research_by_code = panel.research_bars_by_code or None
 
-    fundamentals_by_code = backtest_service.load_fundamentals_by_code(repository, codes)
+    fundamentals_by_code = backtest_service.load_fundamentals_by_code(
+        repository, codes, [as_of]
+    )
 
     if req.apply_universe_filter:
         universe, filters = strategy_service.build_universe(
@@ -196,6 +202,8 @@ def compute_factors(
             trend=item.trend,
             lowvol=item.lowvol,
             composite=round(item.composite, 6),
+            data_coverage=round(item.data_coverage, 6),
+            eligible=item.eligible,
             rank=index + 1,
             data_warnings=item.data_warnings,
         )
@@ -224,6 +232,21 @@ def compute_factors(
             if payload.weights is not None
             else dict(factors_service.DEFAULT_FAMILY_WEIGHTS)
         ),
+        factor_diagnostics={
+            "correlation_matrix": factors_service.factor_correlation_matrix(ranked),
+            "eligible_count": sum(item.eligible for item in ranked),
+            "market_cap_coverage": (
+                sum(item.market_cap is not None for item in ranked) / len(ranked)
+                if ranked
+                else 0.0
+            ),
+            "liquidity_coverage": (
+                sum(item.liquidity_exposure is not None for item in ranked)
+                / len(ranked)
+                if ranked
+                else 0.0
+            ),
+        },
         rows=rows,
         truncated=truncated,
         methodology=FACTOR_METHODOLOGY,
@@ -455,12 +478,25 @@ def run_backtest(
         min_avg_amount=payload.min_avg_amount,
         price_limit=payload.price_limit,
         candidate_codes=tuple(payload.candidate_codes) if payload.candidate_codes else None,
+        universe_indices=tuple(payload.universe_indices),
+        initial_signal=payload.initial_signal,
+        min_universe_data_coverage=payload.min_universe_data_coverage,
+        max_volume_participation=payload.max_volume_participation,
+        minimum_trade_weight=payload.minimum_trade_weight,
+        minimum_holdings=payload.minimum_holdings,
+        max_annual_volatility=payload.max_annual_volatility,
+        max_tracking_error=payload.max_tracking_error,
         benchmark_index=payload.benchmark_index,
         cost=backtest_service.CostModel(
             commission_rate=payload.cost.commission_rate,
             min_commission=payload.cost.min_commission,
             stamp_tax_rate=payload.cost.stamp_tax_rate,
             slippage_rate=payload.cost.slippage_rate,
+            market_impact_coefficient=payload.cost.market_impact_coefficient,
+            volatility_slippage_coefficient=(
+                payload.cost.volatility_slippage_coefficient
+            ),
+            max_total_slippage=payload.cost.max_total_slippage,
         ),
     )
     try:
@@ -519,6 +555,8 @@ def run_backtest(
                 blocked_codes=detail.blocked_codes,
                 fills=fills,
                 warnings=detail.warnings,
+                diagnostics=detail.diagnostics,
+                order_events=detail.order_events,
             )
         )
         trades.extend(fills)
@@ -532,6 +570,7 @@ def run_backtest(
     ]
 
     return StockBacktestResult(
+        attribution=outcome.attribution,
         params={
             "top_n": payload.top_n,
             "max_stock_weight": payload.max_stock_weight,
@@ -542,6 +581,14 @@ def run_backtest(
             "candidate_codes": (
                 list(payload.candidate_codes) if payload.candidate_codes else None
             ),
+            "universe_indices": list(payload.universe_indices),
+            "initial_signal": payload.initial_signal,
+            "min_universe_data_coverage": payload.min_universe_data_coverage,
+            "max_volume_participation": payload.max_volume_participation,
+            "minimum_trade_weight": payload.minimum_trade_weight,
+            "minimum_holdings": payload.minimum_holdings,
+            "max_annual_volatility": payload.max_annual_volatility,
+            "max_tracking_error": payload.max_tracking_error,
             "cost": payload.cost.model_dump(),
         },
         start_date=outcome.calendar[0].isoformat(),
@@ -608,3 +655,59 @@ def universe_snapshot(
             for f in filters
         ],
     }
+
+
+@router.post("/backtest/walk-forward", response_model=StockWalkForwardResult)
+def run_stock_walk_forward(
+    payload: StockWalkForwardRequest,
+    repository: StockRepository = Depends(get_stock_repository),
+) -> StockWalkForwardResult:
+    """训练段 purged 走步选参，验证集与完全留出集各评估一次。"""
+    base = backtest_service.BacktestConfig(
+        start=_parse_day(payload.start_date, "start_date"),
+        end=_parse_day(payload.end_date, "end_date"),
+        initial_capital=payload.initial_capital,
+        top_n=payload.top_n,
+        max_stock_weight=payload.max_stock_weight,
+        max_industry_weight=payload.max_industry_weight,
+        min_avg_amount=payload.min_avg_amount,
+        price_limit=payload.price_limit,
+        candidate_codes=(
+            tuple(payload.candidate_codes) if payload.candidate_codes else None
+        ),
+        universe_indices=tuple(payload.universe_indices),
+        min_universe_data_coverage=payload.min_universe_data_coverage,
+        max_volume_participation=payload.max_volume_participation,
+        minimum_trade_weight=payload.minimum_trade_weight,
+        minimum_holdings=payload.minimum_holdings,
+        max_annual_volatility=payload.max_annual_volatility,
+        max_tracking_error=payload.max_tracking_error,
+        benchmark_index=payload.benchmark_index,
+        cost=backtest_service.CostModel(
+            commission_rate=payload.cost.commission_rate,
+            min_commission=payload.cost.min_commission,
+            stamp_tax_rate=payload.cost.stamp_tax_rate,
+            slippage_rate=payload.cost.slippage_rate,
+            market_impact_coefficient=payload.cost.market_impact_coefficient,
+            volatility_slippage_coefficient=(
+                payload.cost.volatility_slippage_coefficient
+            ),
+            max_total_slippage=payload.cost.max_total_slippage,
+        ),
+    )
+    try:
+        result = validation_service.run_stock_walk_forward(
+            repository,
+            base,
+            payload.top_n_grid,
+            payload.max_stock_weight_grid,
+            payload.embargo_days,
+        )
+    except (
+        backtest_service.BacktestError,
+        strategy_service.IndustryCoverageError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return StockWalkForwardResult(result=result)

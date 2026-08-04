@@ -36,6 +36,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-interval", type=float, default=0.75)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--request-timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--universe-source",
+        choices=("current", "historical"),
+        default="current",
+        help="current=当前800只；historical=历史指数快照出现过的全部股票",
+    )
+    parser.add_argument(
+        "--datasets",
+        default="all",
+        help="逗号分隔的逐股接口名；all 表示全部",
+    )
+    parser.add_argument(
+        "--retry-empty",
+        action="store_true",
+        help="重新请求已有 empty 标记；用于代理偶发错误空响应的补拉",
+    )
     return parser.parse_args()
 
 
@@ -56,13 +73,18 @@ def load_token(path: Path | None) -> str:
     raise RuntimeError(f"TOKEN assignment not found in {path}")
 
 
-def universe_codes(database: Path) -> list[str]:
+def universe_codes(database: Path, source: str = "current") -> list[str]:
     connection = sqlite3.connect(database)
     try:
+        table = (
+            "stock_universe_snapshots"
+            if source == "historical"
+            else "index_constituents"
+        )
         rows = connection.execute(
-            """
+            f"""
             SELECT DISTINCT stock_code
-            FROM index_constituents
+            FROM {table}
             WHERE index_code IN ('000300', '000905')
             ORDER BY stock_code
             """
@@ -70,6 +92,26 @@ def universe_codes(database: Path) -> list[str]:
     finally:
         connection.close()
     return [str(row[0]).zfill(6) for row in rows]
+
+
+def universe_snapshot_dates(
+    database: Path, start_date: str, end_date: str
+) -> list[str]:
+    """历史指数快照日期就是策略月频估值所需的最小完备日期集合。"""
+    connection = sqlite3.connect(database)
+    try:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT replace(snapshot_date, '-', '')
+            FROM stock_universe_snapshots
+            WHERE replace(snapshot_date, '-', '') BETWEEN ? AND ?
+            ORDER BY snapshot_date
+            """,
+            (start_date, end_date),
+        ).fetchall()
+    finally:
+        connection.close()
+    return [str(row[0]) for row in rows]
 
 
 def ts_code(code: str) -> str:
@@ -89,6 +131,7 @@ class Downloader:
         output_dir: Path,
         min_interval: float,
         retries: int,
+        retry_empty: bool = False,
     ) -> None:
         self.client = client
         self.output_dir = output_dir
@@ -96,6 +139,7 @@ class Downloader:
         self.manifest = self.output_dir / "manifest.jsonl"
         self.min_interval = max(min_interval, 0.0)
         self.retries = max(retries, 0)
+        self.retry_empty = retry_empty
         self.last_call_at = 0.0
         self.rate_lock = threading.Lock()
         self.state_lock = threading.Lock()
@@ -130,8 +174,16 @@ class Downloader:
     ) -> str:
         target = self.output_dir / relative_path
         empty_marker = target.with_suffix(".empty.json")
-        if target.exists() or empty_marker.exists():
+        retry_empty_partition = self.retry_empty and (
+            "stocks" in relative_path.parts
+            or "daily_basic_monthly" in relative_path.parts
+        )
+        if target.exists():
             return "skipped"
+        if empty_marker.exists():
+            if not retry_empty_partition:
+                return "skipped"
+            empty_marker.unlink()
         target.parent.mkdir(parents=True, exist_ok=True)
         started = datetime.now(UTC)
         last_error: Exception | None = None
@@ -146,6 +198,14 @@ class Downloader:
                 if not isinstance(frame, pd.DataFrame):
                     raise TypeError(
                         f"unexpected response type: {type(frame)!r}"
+                    )
+                if (
+                    frame.empty
+                    and retry_empty_partition
+                    and attempt <= self.retries
+                ):
+                    raise RuntimeError(
+                        "代理返回空表，按 --retry-empty 继续重试"
                     )
                 metadata = {
                     "interface": interface,
@@ -207,17 +267,47 @@ def main() -> None:
     sys.path.insert(0, str(scripts))
     from proxy_demo import get_client  # type: ignore[import-not-found]
 
+    client = get_client(token=token)
+    # Tushare SDK 缺省30秒；历史退市代码偶有网关慢响应，允许短超时后记录
+    # failed 并继续其他分区，断点续传时再补，不让一个代码阻塞整个会员窗口。
+    client._DataApi__timeout = max(args.request_timeout, 1.0)
     downloader = Downloader(
-        get_client(token=token),
+        client,
         args.output_dir.resolve(),
         args.min_interval,
         args.retries,
+        args.retry_empty,
     )
-    codes = universe_codes(args.database.resolve())
-    if len(codes) != 800:
-        raise RuntimeError(f"expected 800 index constituents, got {len(codes)}")
+    codes = universe_codes(args.database.resolve(), args.universe_source)
+    if len(codes) < 800:
+        raise RuntimeError(f"expected at least 800 index constituents, got {len(codes)}")
+    requested = (
+        None
+        if args.datasets == "all"
+        else {
+            item.strip() for item in args.datasets.split(",") if item.strip()
+        }
+    )
 
     # Small global datasets and current metadata.
+    stock_basic_fields = ",".join(
+        (
+            "ts_code",
+            "symbol",
+            "name",
+            "area",
+            "industry",
+            "fullname",
+            "market",
+            "exchange",
+            "list_status",
+            "list_date",
+            "delist_date",
+            "is_hs",
+            "act_name",
+            "act_ent_type",
+        )
+    )
     for status in ("L", "D", "P"):
         params = {"exchange": "", "list_status": status}
         downloader.fetch(
@@ -226,6 +316,15 @@ def main() -> None:
             Path("global/stock_basic") / f"{status}.parquet",
             lambda status=status: downloader.client.stock_basic(
                 exchange="", list_status=status
+            ),
+        )
+        full_params = {**params, "fields": stock_basic_fields}
+        downloader.fetch(
+            "stock_basic",
+            full_params,
+            Path("global/stock_basic_full") / f"{status}.parquet",
+            lambda full_params=full_params: downloader.client.stock_basic(
+                **full_params
             ),
         )
     params = {
@@ -246,6 +345,34 @@ def main() -> None:
         Path("global/namechange/all.parquet"),
         lambda: downloader.client.namechange(**params),
     )
+    # 逐股 daily_basic 在部分代理节点会对有效股票错误返回空表；按历史指数
+    # 月末快照日再拉一次全市场横截面，既补齐缺口，也与月频信号口径完全对齐。
+    if requested is None or "daily_basic_monthly" in requested:
+        snapshot_dates = universe_snapshot_dates(
+            args.database.resolve(), args.start_date, args.end_date
+        )
+        for index, trade_date in enumerate(snapshot_dates, start=1):
+            params = {"trade_date": trade_date}
+            downloader.fetch(
+                "daily_basic",
+                params,
+                Path("global/daily_basic_monthly") / f"{trade_date}.parquet",
+                lambda params=params: downloader.client.daily_basic(**params),
+            )
+            if index % 25 == 0 or index == len(snapshot_dates):
+                print(
+                    json.dumps(
+                        {
+                            "phase": "daily_basic_monthly",
+                            "processed": index,
+                            "total": len(snapshot_dates),
+                            "calls": downloader.calls,
+                            "rows": downloader.rows,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
     for index_code in ("000300.SH", "000905.SH"):
         params = {
             "ts_code": index_code,
@@ -385,6 +512,19 @@ def main() -> None:
             lambda code: {"ts_code": code},
         ),
     ]
+    if requested is not None:
+        known = {
+            interface for interface, _make_params in endpoint_specs
+        } | {"daily_basic_monthly"}
+        wanted = requested
+        unknown = wanted - known
+        if unknown:
+            raise RuntimeError(f"unknown datasets: {','.join(sorted(unknown))}")
+        endpoint_specs = [
+            item
+            for item in endpoint_specs
+            if item[0] in wanted and item[0] != "daily_basic_monthly"
+        ]
     for interface, make_params in endpoint_specs:
         completed = 0
         failed = 0

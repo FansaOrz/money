@@ -1,5 +1,7 @@
 """A 股规则策略前向模拟 API schema。"""
 
+from datetime import date
+
 from pydantic import Field
 
 from app.schemas.common import ConfiguredBaseModel
@@ -54,6 +56,7 @@ class StockPaperSignalOut(ConfiguredBaseModel):
     selected_count: int
     invested_weight: float
     items: list[dict] = Field(default_factory=list)
+    order_state: dict[str, dict] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -129,3 +132,19 @@ class StockPaperRunResponse(ConfiguredBaseModel):
     nav: float
     benchmark_nav: float
     warnings: list[str] = Field(default_factory=list)
+
+
+class StockPaperPrepareRequest(ConfiguredBaseModel):
+    start_date: date
+    end_date: date
+    top_n_grid: list[int] = Field(default_factory=lambda: [30])
+    max_stock_weight_grid: list[float] = Field(default_factory=lambda: [0.05])
+    embargo_days: int = Field(default=21, ge=5, le=63)
+
+
+class StockPaperPrepareResponse(ConfiguredBaseModel):
+    version_id: int
+    status: str
+    account_id: int
+    data_date: date
+    validation: dict[str, object] = Field(default_factory=dict)

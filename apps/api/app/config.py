@@ -22,6 +22,11 @@ class Settings(BaseSettings):
 
     app_name: str = "money-api"
     debug: bool = False
+    environment: str = "development"
+    readonly_api_key: SecretStr | None = None
+    admin_api_key: SecretStr | None = None
+    broker_adapter: str = "simulated"
+    broker_api_key: SecretStr | None = None
 
     # 数据库连接串。
     # SQLite（默认开发）: sqlite:///./money.db
@@ -34,7 +39,7 @@ class Settings(BaseSettings):
     # 导入解析结果仅保留在内存中，未确认的预览不落盘
     import_session_ttl_minutes: int = 30
 
-    # 启动时是否自动创建数据表（MVP 阶段免迁移）
+    # 仅本地开发/测试允许；production 必须执行 Alembic migration。
     auto_create_tables: bool = True
 
     # A 股研究数据层：日线 Parquet 数据湖目录（raw/qfq 分区存放）。

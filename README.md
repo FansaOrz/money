@@ -47,25 +47,38 @@ Money 是一个面向个人使用的本地投资管理与研究系统。它从�
 
 - 沪深300 + 中证500当前成分中数据就绪成员，账户创建时冻结候选池；
 - 动态剔除 ST、停牌、次新、低流动性和历史样本不足股票；
-- 质量 30%、价值 25%、12-1 动量 20%、趋势 15%、低波 10%；
-- 行业内缩尾与标准化，单股上限 5%、单行业上限 20%，未分配仓位留现金；
+- 质量 30%（ROE/ROA、现金流质量、应计、盈利稳定性等）、价值 25%
+  （EP/BP/SP、股息率、FCF 收益率）、动量 20%（12-1/6-1/反转/残差）、
+  趋势 15%、低风险 10%（60/120 日波动、Beta、残差波动和回撤）；
+- 行业内缩尾与标准化；行业基准按自由流通市值，约束单股、行业、市值、
+  Beta、流动性和 ADV 容量，并报告偏离、集中度、压力损失及现金；
 - 月频调仓，T 日收盘生成信号，下一交易日开盘成交；
-- 模拟佣金、最低 5 元佣金、卖出印花税、滑点和各板块涨跌停；
-- 信号、未成交订单、成交、持仓、每日净值和等权基准全部落库，可追溯到策略版本。
+- 模拟佣金、最低 5 元佣金、卖出印花税、波动/参与率动态滑点、部分成交、
+  现金应收、分红送转、配股、换股/代码变更、退市清算和各板块真实
+  涨跌停/停牌；
+- 信号、全候选因子快照、未成交订单、成交、持仓、每日净值和等权买入持有
+  基准全部落库，可追溯到代码、数据清单和策略版本。
 
 系统只有在沪深300+中证500全部当前成分的近期日线、行业、财务和 PE/PB 估值逐只
-就绪后才允许创建观察账户，不再使用低覆盖子集提前启动。首次点击“启动
-两个月前向验证”时只固化当日信号，不会当日成交；下一真实
-行情日才模拟建仓。同一行情日重复运行幂等，不重复记账。观察满两个月后，
+就绪，并且系统完成 purged walk-forward、验证集和一次性完全留出评估后，
+才会把新版本从 `research` 晋级到 `validated`、`paper` 并创建空观察账户；
+不能通过手工填写指标绕过冻结证据哈希。正式留出评估还要求 Git 工作区无
+未提交改动，并固化代码提交、候选池、原始数据清单和验证结果哈希。账户首日只固化当日信号，不会当日
+成交；下一真实行情日才模拟建仓。同一行情日重复运行幂等，不重复记账。观察满两个月后，
 应同时检查超额收益、最大回撤、夏普、信息比率、换手和费用，不能只看收益。
 
 主要接口：
 
 - `GET /api/stocks/paper/summary`：数据就绪度、观察进度、持仓、净值和指标
+- `POST /api/stocks/paper/prepare`：历史走步/完全留出验证、冻结版本并创建空账户
 - `POST /api/stocks/paper/run`：手动推进到最新真实行情日
 - `GET /api/stocks/paper/trades`：模拟成交明细
 - `POST /api/stocks/sync/market-close`：收盘全市场快照快速通道
 - `POST /api/stocks/research/backtest`：历史月频规则回测
+- `POST /api/stocks/research/backtest/walk-forward`：purged 走步选参、验证集
+  与一次性完全留出评估
+- `GET /api/health/deep`、`GET /api/metrics`：数据库、研究仓库、数据新鲜度、
+  调度器和前向账户的健康与结构化指标
 
 股票数据采用多源分工而非混合口径：中证接口维护指数成分，新浪历史日线为
 深度主源、东方财富为历史回退；收盘快照优先东方财富、失败自动回退新浪；
@@ -81,16 +94,19 @@ Parquet，使用无 token 的 JSONL 清单记录来源、参数、字段、行�
 已完成分区会自动跳过，因此中断后可直接续传。目前下载范围包括：
 
 - 沪深300、中证500自 2010 年以来的指数日线、权重和真实历史成分；
-- 当前 800 只成分股的日线、复权因子、估值、涨跌停、停牌和曾用名；
+- 当前成分及历史快照出现过的股票的复权因子、估值、涨跌停、停牌和曾用名；
+- 1861 只历史证券的原始日线、三大财务报表和月末横截面估值；退市证券
+  使用 `stock_basic` 正式退市日期，合并/更名事件使用归档公告补录；
 - 申万 2021 三级行业成员关系及同花顺行业目录；
 - 财务指标、利润表、资产负债表、现金流量表和分红记录。
 
 历史权重会物化为 `stock_universe_snapshots`，并推导
 `index_membership_events` 调入调出事件。历史 PE(TTM)/PB 会物化到估值表，
 财务指标按公告日建立 point-in-time 口径，带日期的曾用名记录用于历史 ST
-过滤；规则策略行业中性分组优先使用申万 2021 一级行业。历史回测因此能按
-当时真实股票池和当时已知数据选股，而不是错误地拿
-今天仍在指数中的股票或最终财报回测过去。原始宽表仍完整保留在 Parquet 中。
+过滤；规则策略行业中性分组优先使用申万 2021 一级行业。历史回测按每个
+月末信号日读取当时股票池，并按信号日读取估值；任一期核心数据覆盖低于
+门槛会拒绝运行，不会静默缩小股票池或回退当前成分。原始宽表仍完整保留在
+Parquet 中，`trade_cal`、`stk_limit` 和 `suspend_d` 已用于交易日及执行判断。
 
 续传数据快照（token 文件只在本机读取，不写入仓库或采集清单）：
 
@@ -101,7 +117,8 @@ python scripts/download_stocktoday_snapshot.py \
   --skill-dir ../../tmp/agent_skill_tushare \
   --database ../../data/money.db \
   --output-dir ../../data/research/tushare_snapshot \
-  --start-date 20100101
+  --start-date 20100101 \
+  --universe-source historical
 
 MONEY_DATABASE_URL=sqlite:///../../data/money.db \
 python scripts/import_stocktoday_snapshot.py \
@@ -110,6 +127,18 @@ python scripts/import_stocktoday_snapshot.py \
 python scripts/validate_stocktoday_snapshot.py \
   --database ../../data/money.db \
   --snapshot-dir ../../data/research/tushare_snapshot
+```
+
+三大报表和执行原始表可按研究需要幂等导入 `quant_data_records` 规范化
+PIT 层；高频日线仍直接读取不可变 Parquet，避免把海量行情重复写入业务库。每个
+字段保存来源、原值、规范值和质量状态，原始 Parquet 永不改写：
+
+```bash
+cd apps/api
+PYTHONPATH=. python -c \
+  "from pathlib import Path; from app.db.session import SessionLocal; \
+from app.services.quant_data_governance import import_tushare_snapshot; \
+db=SessionLocal(); print(import_tushare_snapshot(db, Path('../../data/research'))); db.close()"
 ```
 
 ## 技术栈
@@ -175,7 +204,10 @@ bash start.sh
 bash stop.sh
 ```
 
-`start.sh` 会启动 API、生产模式 Web 和常驻调度器。若 `data/money.db` 不存在，它还会自动建库、导入 `tmp/` 下可识别的 PDF，并同步基金历史净值和最新净值。前端尚未构建时会自动执行 `npm run build`。
+`start.sh` 会先执行 `alembic upgrade head`，再启动 API、生产模式 Web 和常驻
+调度器；服务进程关闭自动建表，数据库结构只由迁移推进。若
+`data/money.db` 不存在，它还会通过迁移建库、导入 `tmp/` 下可识别的 PDF，
+并同步基金历史净值和最新净值。前端尚未构建时会自动执行 `npm run build`。
 
 > 自动初始化脚本目前按项目路径 `/root/Src/money` 查找 `tmp/`。若项目放在其他位置，请通过 Web 的“数据导入”页面导入 PDF，或先调整 `apps/api/app/services/bootstrap.py` 中的路径。
 
@@ -221,8 +253,28 @@ bash stop.sh
 | 模拟盘 | 每日 20:30 |
 | 基金底层持仓披露检查 | 每月 1 日 19:05 |
 | 全市场基金目录 | 每周日 02:30 |
+| 数据库/Parquet/策略账本备份与恢复校验 | 每周日 04:00 |
 
-调度器启动时也会按需同步基金净值，并立即同步资讯和市场指数。任务结果写入 `sync_runs`，可通过 `/api/sync/status` 或页面顶部状态栏查看。
+调度任务同时写入 `persistent_jobs`，包含租约锁、依赖、重试和检查点；进程
+重启后会恢复过期任务。失败任务和数据质量问题通过 `/api/sync/status` 的
+`alerts` 返回，并显示在页面顶部状态栏。
+
+数据库结构由 Alembic 管理。开发测试仍可使用 `create_all` 便利建库，生产环境
+设置 `MONEY_ENVIRONMENT=production` 后会禁止该路径，部署前必须执行：
+
+```bash
+cd apps/api
+MONEY_DATABASE_URL=postgresql+psycopg://... alembic upgrade head
+```
+
+备份与恢复演练只恢复到不存在的新目录，禁止覆盖现有数据：
+
+```bash
+cd apps/api
+python -m app.services.backup_job create ../../data/backups/manual-YYYYMMDD
+python -m app.services.backup_job verify ../../data/backups/manual-YYYYMMDD
+python -m app.services.backup_job restore ../../data/backups/manual-YYYYMMDD /tmp/money-restore-check
+```
 
 如需手动增量同步基金最新净值：
 
@@ -341,4 +393,8 @@ make test
 - 数据库不保存姓名或身份证号，日志不会主动输出完整基金账户和订单号。
 - `tmp/`、PDF、数据库和本机运行数据均不应提交到公开仓库。
 - `data/` 中的数据库与研究仓库可能包含个人持仓和研究结果，备份或迁移时请妥善保管。
-- 模拟盘只产生虚拟记录，不涉及真实资金、真实下单或交易指令。
+- API Key、Tushare token 与券商凭据只允许通过环境变量/本机忽略文件读取；
+  生产环境强制 admin/readonly 两级 API Key 并记录修改操作审计。
+- OMS/RMS 默认且目前只启用 `simulated` 适配器，含订单、成交、撤单、资金、
+  持仓、对账、重复下单保护和紧急停止；未安装并配置券商适配器时不会产生
+  任何真实下单副作用。

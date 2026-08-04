@@ -26,6 +26,7 @@ from app.api.routes import (
     positions,
     quant,
     quant_v2,
+    quant_governance,
     research_portfolios,
     research_quality,
     stocks,
@@ -38,10 +39,15 @@ from app.config import get_settings
 from app.db.base import Base
 from app.db.session import engine
 from app import models  # noqa: F401  # 确保所有模型已注册到 Base.metadata
+from app.services.security import ApiSecurityMiddleware
 
 
 def create_tables() -> None:
-    """根据 ORM 元数据创建所有数据表（已存在则跳过）。"""
+    """仅开发/测试的便利建表；生产结构必须由 Alembic 管理。"""
+    if get_settings().environment.lower() == "production":
+        raise RuntimeError(
+            "production 禁止 create_all；请先执行 `alembic upgrade head`"
+        )
     Base.metadata.create_all(bind=engine)
 
 
@@ -57,6 +63,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    app.add_middleware(ApiSecurityMiddleware)
 
     app.add_middleware(
         CORSMiddleware,
@@ -74,6 +81,7 @@ def create_app() -> FastAPI:
     app.include_router(news.router, prefix="/api")
     app.include_router(quant.router, prefix="/api")
     app.include_router(quant_v2.router, prefix="/api")
+    app.include_router(quant_governance.router, prefix="/api")
     app.include_router(holdings.router, prefix="/api")
     app.include_router(funds.router, prefix="/api")
     app.include_router(indices.router, prefix="/api")
