@@ -107,7 +107,16 @@ def metrics(db: Session) -> dict[str, int]:
         "sync_runs_failed_24h": int(
             db.scalar(
                 select(func.count(SyncRun.id)).where(
-                    SyncRun.status.in_(("failed", "partial")),
+                    SyncRun.status == "failed",
+                    SyncRun.started_at >= now - timedelta(days=1),
+                )
+            )
+            or 0
+        ),
+        "sync_runs_partial_24h": int(
+            db.scalar(
+                select(func.count(SyncRun.id)).where(
+                    SyncRun.status == "partial",
                     SyncRun.started_at >= now - timedelta(days=1),
                 )
             )

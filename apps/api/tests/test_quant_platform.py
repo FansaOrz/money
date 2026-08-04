@@ -108,6 +108,8 @@ def test_deep_health_and_structured_metrics_are_queryable(client) -> None:
     metrics = client.get("/api/metrics")
     assert metrics.status_code == 200
     assert "persistent_jobs_queued" in metrics.json()
+    assert "sync_runs_failed_24h" in metrics.json()
+    assert "sync_runs_partial_24h" in metrics.json()
 
 
 def test_tushare_snapshot_import_is_pit_provenanced_and_idempotent(
