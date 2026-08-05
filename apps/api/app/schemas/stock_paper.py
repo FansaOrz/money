@@ -161,6 +161,7 @@ class StockPaperPrepareRequest(ConfiguredBaseModel):
     top_n_grid: list[int] = Field(default_factory=lambda: [30])
     max_stock_weight_grid: list[float] = Field(default_factory=lambda: [0.05])
     embargo_days: int = Field(default=21, ge=5, le=63)
+    create_new_version: bool = False
 
 
 class StockPaperPrepareResponse(ConfiguredBaseModel):

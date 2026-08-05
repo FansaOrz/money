@@ -606,6 +606,7 @@ def prepare_forward_account(
     top_n_grid: list[int],
     max_stock_weight_grid: list[float],
     embargo_days: int = 21,
+    create_new_version: bool = False,
 ) -> dict[str, object]:
     """用系统证据晋级到运行链路模拟；不授予投资有效性或实盘资格。"""
     if start >= end:
@@ -638,7 +639,10 @@ def prepare_forward_account(
         )
     if version is None:
         raise StockPaperError("研究策略版本创建失败")
-    if version.status in {"paper_operational_validation", "paper"}:
+    if (
+        version.status in {"paper_operational_validation", "paper"}
+        and not create_new_version
+    ):
         account, _ = _ensure_account(db, data_date)
         validation = dict(version.params or {}).get("validation", {})
         return {
@@ -648,7 +652,7 @@ def prepare_forward_account(
             "data_date": data_date,
             "validation": validation,
         }
-    if version.status != "research":
+    if version.status != "research" and not create_new_version:
         raise StockPaperError(
             f"策略版本已处于 {version.status}，不能重复评估留出集；"
             "参数变化必须创建新策略名/版本"
@@ -682,6 +686,54 @@ def prepare_forward_account(
             f"{preview}{suffix}；请提交后重新执行"
         )
     params = dict(version.params or {})
+    if create_new_version:
+        predecessor = version
+        successor_params = {
+            key: value
+            for key, value in params.items()
+            if key
+            not in {
+                "validation",
+                "validation_sha256",
+                "operational_validation_evidence",
+                "investment_validation_evidence",
+                "research_experiment_id",
+                "holdout_consumption_id",
+                "holdout_consumption_status",
+                "frozen_adaptive_factor_weights",
+            }
+        }
+        successor_params.update(
+            {
+                "supersedes_version_id": predecessor.id,
+                "created_for": "independent_historical_validation",
+                "validation_period": {
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+            }
+        )
+        mandate = strategy_mandate.operational_validation_mandate(
+            strategy_name=STRATEGY_NAME,
+            initial_capital=INITIAL_CAPITAL,
+            rebalance_days=20,
+            top_n=TOP_N,
+        )
+        version = StrategyVersion(
+            name=STRATEGY_NAME,
+            initial_capital=INITIAL_CAPITAL,
+            rebalance_interval=20,
+            fee_rate=_weight(COST.commission_rate),
+            top_n=TOP_N,
+            params=successor_params,
+            mandate=mandate,
+            mandate_sha256=strategy_mandate.mandate_sha256(mandate),
+            status="research",
+        )
+        db.add(version)
+        db.commit()
+        db.refresh(version)
+        params = successor_params
     if params.get("validation_sha256"):
         if params.get("git_sha") == git_sha:
             raise StockPaperError(

@@ -84,7 +84,9 @@ Money 是一个面向个人使用的本地投资管理与研究系统。它从�
 主要接口：
 
 - `GET /api/stocks/paper/summary`：数据就绪度、观察进度、持仓、净值和指标
-- `POST /api/stocks/paper/prepare`：历史走步/完全留出验证、冻结版本并创建空账户
+- `POST /api/stocks/paper/prepare`：历史走步/完全留出验证、冻结版本并创建空账户；
+  显式传入 `create_new_version: true` 时从当前版本派生全新的研究版本，旧版本
+  的验证证据不会被覆盖
 - `POST /api/stocks/paper/run`：手动推进到最新真实行情日
 - `GET /api/stocks/paper/trades`：模拟成交明细
 - `POST /api/stocks/sync/market-close`：收盘全市场快照快速通道

@@ -15,12 +15,13 @@ def interval_history(
     interval_start: date,
     interval_end: date,
 ) -> list[HoldoutConsumption]:
+    """返回与给定区间存在任意日期重叠的永久查看记录。"""
     return list(
         db.scalars(
             select(HoldoutConsumption)
             .where(
-                HoldoutConsumption.interval_start == interval_start,
-                HoldoutConsumption.interval_end == interval_end,
+                HoldoutConsumption.interval_start <= interval_end,
+                HoldoutConsumption.interval_end >= interval_start,
             )
             .order_by(HoldoutConsumption.consumed_at, HoldoutConsumption.id)
         ).all()
@@ -34,10 +35,16 @@ def assert_pristine(
 ) -> None:
     history = interval_history(db, interval_start, interval_end)
     if history:
-        experiments = ",".join(str(row.experiment_id) for row in history)
+        overlaps = "、".join(
+            (
+                f"实验{row.experiment_id}:"
+                f"{row.interval_start.isoformat()}~{row.interval_end.isoformat()}"
+            )
+            for row in history
+        )
         raise ValueError(
-            "完全留出区间已经永久消耗，不能再声明为 pristine；"
-            f"历史实验={experiments}"
+            "完全留出区间与已经永久消耗的区间重叠，"
+            f"不能再声明为 pristine；重叠记录={overlaps}"
         )
 
 

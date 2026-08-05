@@ -51,6 +51,7 @@ def prepare(
                 top_n_grid=payload.top_n_grid,
                 max_stock_weight_grid=payload.max_stock_weight_grid,
                 embargo_days=payload.embargo_days,
+                create_new_version=payload.create_new_version,
             )
         )
     except stock_paper.StockPaperError as exc:
