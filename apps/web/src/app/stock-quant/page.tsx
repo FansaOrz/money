@@ -110,6 +110,18 @@ export default function StockQuantPage() {
     void load();
   }, [load]);
 
+  const frozenEvidence = useMemo(() => {
+    const raw = summary?.strategy?.params?.operational_validation_evidence;
+    return raw && typeof raw === "object"
+      ? (raw as Record<string, unknown>)
+      : null;
+  }, [summary]);
+  const evidenceNumber = (name: string): number | null => {
+    const value = frozenEvidence?.[name];
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+  };
+  const gateFailures = frozenEvidence?.gate_failures;
+
   const run = useCallback(async () => {
     setRunning(true);
     setError(null);
@@ -138,7 +150,7 @@ export default function StockQuantPage() {
     <>
       <PageHeader
         title="A 股量化"
-        description="规则多因子选股、月频调仓与两个月真实前向模拟；不会产生真实订单"
+        description="规则多因子选股与两个月运行链路模拟；不会产生真实订单，也不用于证明 Alpha"
       />
 
       {error && (
@@ -149,6 +161,25 @@ export default function StockQuantPage() {
 
       {summary && (
         <>
+          {!summary.strategy?.investment_approval_eligible && (
+            <Card className="mb-4 border-2 border-rose-400 bg-rose-50 px-4 py-4 sm:px-5">
+              <h2 className="text-sm font-bold text-rose-900">
+                投资有效性门禁失败：当前版本不得批准或实盘
+              </h2>
+              <div className="mt-3 grid gap-3 text-xs sm:grid-cols-2 xl:grid-cols-5">
+                <div><span className="text-rose-700">冻结基准</span><p className="font-semibold">{String(frozenEvidence?.benchmark_kind ?? "未提供")}</p></div>
+                <div><span className="text-rose-700">净超额收益</span><p className="font-semibold">{pct(evidenceNumber("excess_return"))}</p></div>
+                <div><span className="text-rose-700">主动 Sharpe / IR</span><p className="font-semibold">{num(evidenceNumber("active_sharpe") ?? evidenceNumber("information_ratio"))}</p></div>
+                <div><span className="text-rose-700">Rank IC 置信区间下界</span><p className="font-semibold">{num(evidenceNumber("rank_ic_ci_lower"))}</p></div>
+                <div><span className="text-rose-700">门禁结果</span><p className="font-semibold">FAILED</p></div>
+              </div>
+              <p className="mt-3 text-xs leading-relaxed text-rose-900">
+                {Array.isArray(gateFailures) && gateFailures.length
+                  ? gateFailures.join("；")
+                  : summary.strategy?.approval_blocker ?? "缺少可支持投资有效性的冻结证据。"}
+              </p>
+            </Card>
+          )}
           <Card className="mb-4 px-4 py-4 sm:px-5">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div>
@@ -165,6 +196,11 @@ export default function StockQuantPage() {
                   >
                     {summary.readiness.ready ? "数据可启动" : "数据待补齐"}
                   </span>
+                  {summary.strategy?.validation_scope === "operational_only" && (
+                    <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[11px] font-semibold text-rose-800">
+                      仅运行验证 · 禁止实盘批准
+                    </span>
+                  )}
                 </div>
                 <p className="mt-1 text-xs text-slate-500">
                   行情日 {summary.readiness.latest_data_date ?? "—"} ·
@@ -184,9 +220,22 @@ export default function StockQuantPage() {
                   ? "正在推进…"
                   : summary.started
                     ? "推进到最新行情日"
-                    : "启动两个月前向验证"}
+                    : "启动两个月运行验证"}
               </button>
             </div>
+
+            {summary.strategy?.validation_scope === "operational_only" && (
+              <div className="mt-4 rounded-lg border-2 border-rose-300 bg-rose-50 px-3.5 py-3 text-xs leading-relaxed text-rose-900">
+                <p className="font-semibold">本页面只验收运行可靠性，不证明策略有效。</p>
+                <p className="mt-1">{summary.strategy.result_interpretation}</p>
+                {summary.strategy.approval_blocker && (
+                  <p className="mt-1">实盘阻断：{summary.strategy.approval_blocker}</p>
+                )}
+                <p className="mt-1 font-mono text-[10px] text-rose-700">
+                  Mandate {summary.strategy.mandate_version} · {summary.strategy.mandate_sha256.slice(0, 12)}
+                </p>
+              </div>
+            )}
 
             {summary.strategy && (
               <div className="mt-4">
@@ -238,7 +287,7 @@ export default function StockQuantPage() {
               <NavChart points={summary.history} />
             </Card>
             <Card className="px-4 py-4 sm:px-5">
-              <h2 className="mb-3 text-sm font-semibold text-slate-800">评估口径</h2>
+              <h2 className="mb-3 text-sm font-semibold text-slate-800">运行观察指标（非 Alpha 验收）</h2>
               <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
                 {[
                   ["真实交易日", String(summary.metrics.trading_days)],

@@ -1737,6 +1737,12 @@ export interface StockPaperStrategy {
   calendar_days_remaining: number;
   observation_progress: number;
   candidate_count: number;
+  validation_scope: string;
+  investment_approval_eligible: boolean;
+  mandate_version: string;
+  mandate_sha256: string;
+  result_interpretation: string;
+  approval_blocker?: string | null;
   params: Record<string, unknown>;
 }
 

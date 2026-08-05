@@ -4,6 +4,13 @@ Money 是一个面向个人使用的本地投资管理与研究系统。它从�
 
 系统默认在本机运行，业务数据存入 SQLite，研究数据使用 DuckDB + Parquet。所有分析、信号和模拟交易仅供研究参考，不构成投资建议。
 
+能力状态统一使用四种术语：`已实现框架` 表示代码路径存在；`已用于正式版本`
+表示已进入冻结策略证据；`已通过统计验收` 表示满足预注册样本外门禁；
+`已完成生产演练` 表示在 PostgreSQL、券商沙箱、告警和灾备环境中实际演练。
+当前版本 7 只属于运行链路验证，主动收益与统计门禁失败，既未通过投资有效性
+验收，也未完成真实资金生产演练。第二轮边界和逐项证据见
+[`docs/股票量化平台第二轮对抗性审查TODO清单.md`](docs/股票量化平台第二轮对抗性审查TODO清单.md)。
+
 ## 主要功能
 
 ### 资产管理
@@ -115,12 +122,13 @@ Parquet，使用无 token 的 JSONL 清单记录来源、参数、字段、行�
 门槛会拒绝运行，不会静默缩小股票池或回退当前成分。原始宽表仍完整保留在
 Parquet 中，`trade_cal`、`stk_limit` 和 `suspend_d` 已用于交易日及执行判断。
 
-续传数据快照（token 文件只在本机读取，不写入仓库或采集清单）：
+续传数据快照（凭据只允许通过当前进程环境注入，不写入文件、命令参数或采集清单）：
 
 ```bash
 cd apps/api
+read -rsp "Tushare token: " TUSHARE_TOKEN && export TUSHARE_TOKEN
+echo
 python scripts/download_stocktoday_snapshot.py \
-  --token-file ../../tmp/tushare.py \
   --skill-dir ../../tmp/agent_skill_tushare \
   --database ../../data/money.db \
   --output-dir ../../data/research/tushare_snapshot \
