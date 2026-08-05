@@ -167,6 +167,8 @@ class StockPaperPrepareRequest(ConfiguredBaseModel):
 class StockPaperPrepareResponse(ConfiguredBaseModel):
     version_id: int
     status: str
-    account_id: int
+    account_id: int | None = None
+    forward_account_created: bool = False
     data_date: date
     validation: dict[str, object] = Field(default_factory=dict)
+    readiness_blockers: list[str] = Field(default_factory=list)

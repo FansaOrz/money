@@ -612,8 +612,8 @@ def prepare_forward_account(
     if start >= end:
         raise StockPaperError("验证开始日期必须早于结束日期")
     readiness = get_readiness(db)
-    if not readiness.ready or readiness.latest_data_date is None:
-        raise StockPaperError("；".join(readiness.blockers))
+    if readiness.latest_data_date is None:
+        raise StockPaperError("没有可用于历史验证的股票行情数据")
     data_date = date.fromisoformat(readiness.latest_data_date)
     if end > data_date:
         raise StockPaperError(
@@ -649,8 +649,56 @@ def prepare_forward_account(
             "version_id": version.id,
             "status": version.status,
             "account_id": account.id,
+            "forward_account_created": True,
             "data_date": data_date,
             "validation": validation,
+            "readiness_blockers": [],
+        }
+    if version.status == "operational_validated" and not create_new_version:
+        params = dict(version.params or {})
+        validation = dict(params.get("validation") or {})
+        if not readiness.ready:
+            return {
+                "version_id": version.id,
+                "status": version.status,
+                "account_id": None,
+                "forward_account_created": False,
+                "data_date": data_date,
+                "validation": validation,
+                "readiness_blockers": readiness.blockers,
+            }
+        try:
+            version = strategy_lifecycle.transition(
+                db,
+                version.id,
+                "paper_operational_validation",
+                evidence={
+                    "experiment_snapshot_complete": all(
+                        params.get(key)
+                        for key in (
+                            "git_sha",
+                            "git_worktree_clean",
+                            "candidate_sha256",
+                            "data_as_of",
+                            "validation_sha256",
+                        )
+                    ),
+                    "validation_sha256": params.get("validation_sha256"),
+                },
+                actor="system:stock-paper-prepare",
+                reason="当前数据就绪门禁恢复，沿用已冻结历史验证证据创建前向账户",
+            )
+        except ValueError as exc:
+            raise StockPaperError(str(exc)) from exc
+        account, version = _ensure_account(db, data_date)
+        return {
+            "version_id": version.id,
+            "status": version.status,
+            "account_id": account.id,
+            "forward_account_created": True,
+            "data_date": data_date,
+            "validation": validation,
+            "readiness_blockers": [],
         }
     if version.status != "research" and not create_new_version:
         raise StockPaperError(
@@ -1054,6 +1102,16 @@ def prepare_forward_account(
                 "该结果不代表投资Alpha有效"
             ),
         )
+        if not readiness.ready:
+            return {
+                "version_id": version.id,
+                "status": version.status,
+                "account_id": None,
+                "forward_account_created": False,
+                "data_date": data_date,
+                "validation": validation,
+                "readiness_blockers": readiness.blockers,
+            }
         version = strategy_lifecycle.transition(
             db,
             version.id,
@@ -1084,8 +1142,10 @@ def prepare_forward_account(
         "version_id": version.id,
         "status": version.status,
         "account_id": account.id,
+        "forward_account_created": True,
         "data_date": data_date,
         "validation": validation,
+        "readiness_blockers": [],
     }
 
 
