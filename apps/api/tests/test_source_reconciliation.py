@@ -58,4 +58,3 @@ def test_material_difference_blocks_until_reviewed(
     assert resolved.status == "resolved"
     assert selected_value(resolved) == 2.0
     assert db_session.query(DataSourceReconciliation).count() == 1
-

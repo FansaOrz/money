@@ -53,4 +53,3 @@ def test_replaced_or_unregistered_file_cannot_silently_rerun(
         row.status for row in db_session.query(DataFileAccessLog).all()
     }
     assert statuses == {"verified", "hash_mismatch", "unregistered"}
-

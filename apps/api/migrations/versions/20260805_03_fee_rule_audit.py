@@ -60,4 +60,3 @@ def downgrade() -> None:
     with op.batch_alter_table("stock_paper_trades") as batch:
         batch.drop_column("fee_breakdown")
         batch.drop_column("fee_rule_version")
-

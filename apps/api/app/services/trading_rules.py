@@ -182,4 +182,3 @@ def quantity_rule(code: str, trade_date: date) -> QuantityRule:
     if normalized.startswith(("00", "001", "002", "003")):
         return _MAIN_SZSE
     raise ValueError(f"无法识别证券 {code} 的交易板块")
-

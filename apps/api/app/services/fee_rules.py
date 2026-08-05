@@ -83,7 +83,6 @@ def fee_schedule(code: str, trade_date: date) -> FeeSchedule:
         transfer_fee_rate=transfer_rate,
     )
 
-
 def calculate_fee(
     *,
     code: str,
@@ -118,4 +117,3 @@ def calculate_fee(
         transfer_fee=transfer_fee,
         total=total,
     )
-

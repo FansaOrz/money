@@ -70,4 +70,3 @@ def test_uncertain_unit_blocks_formal_factor_and_restatement_is_tagged() -> None
     assert result.formal_factor_usable is False
     assert result.correction_status == "restated"
     assert any("单位定义缺失" in reason for reason in result.errors)
-

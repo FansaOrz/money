@@ -50,4 +50,3 @@ def test_injected_anomaly_creates_issue_and_correction_without_overwrite(
     assert correction.affected_strategy_versions == [7, 8]
     assert len(correction.evidence_sha256) == 64
     assert issue.status == "resolved"
-

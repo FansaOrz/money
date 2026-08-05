@@ -170,9 +170,7 @@ def assess_statement_bundle(
         report_period_kind=period_kind,
     )
 
-
 def market_cap_to_cny(value: float) -> float:
     return value * float(
         UNIT_REGISTRY["daily_basic"]["market_cap_scale_to_cny"]
     )
-

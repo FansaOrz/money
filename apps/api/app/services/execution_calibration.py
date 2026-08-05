@@ -189,4 +189,3 @@ def calibrate_and_persist(db: Session) -> dict[str, object]:
         )
         db.commit()
     return {**result, "source_hash": source_hash}
-
