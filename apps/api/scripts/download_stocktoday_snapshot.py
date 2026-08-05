@@ -1,7 +1,6 @@
 """Download a resumable StockToday/Tushare snapshot without persisting its token.
 
-The token is read from a small Python file (an assignment named ``TOKEN``) or
-``TUSHARE_TOKEN``. Every successful response is stored as Parquet and every
+The token is read only from ``TUSHARE_TOKEN``. Every successful response is stored as Parquet and every
 request is recorded in a token-free JSONL manifest. Existing outputs are
 skipped, so restarting the command resumes from the last completed partition.
 """
@@ -9,7 +8,6 @@ skipped, so restarting the command resumes from the last completed partition.
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import os
 import sqlite3
@@ -27,7 +25,6 @@ import pandas as pd
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--token-file", type=Path)
     parser.add_argument("--skill-dir", type=Path, required=True)
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -56,21 +53,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_token(path: Path | None) -> str:
+def load_token() -> str:
     token = os.getenv("TUSHARE_TOKEN")
     if token:
         return token.strip()
-    if path is None:
-        raise RuntimeError("TUSHARE_TOKEN or --token-file is required")
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if any(isinstance(target, ast.Name) and target.id == "TOKEN" for target in node.targets):
-            value = ast.literal_eval(node.value)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    raise RuntimeError(f"TOKEN assignment not found in {path}")
+    raise RuntimeError("必须通过 TUSHARE_TOKEN 安全注入数据源凭据")
 
 
 def universe_codes(database: Path, source: str = "current") -> list[str]:
@@ -262,12 +249,12 @@ class Downloader:
 
 def main() -> None:
     args = parse_args()
-    token = load_token(args.token_file)
+    load_token()
     scripts = (args.skill_dir / "scripts").resolve()
     sys.path.insert(0, str(scripts))
     from proxy_demo import get_client  # type: ignore[import-not-found]
 
-    client = get_client(token=token)
+    client = get_client()
     # Tushare SDK 缺省30秒；历史退市代码偶有网关慢响应，允许短超时后记录
     # failed 并继续其他分区，断点续传时再补，不让一个代码阻塞整个会员窗口。
     client._DataApi__timeout = max(args.request_timeout, 1.0)

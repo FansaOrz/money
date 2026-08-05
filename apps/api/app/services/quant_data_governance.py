@@ -23,7 +23,11 @@ from app.models import (
 SOURCE_PRIORITY = {
     "tushare": 100,
     "csindex": 90,
+    "stocktoday_sw2021": 95,
+    "cninfo": 90,
     "akshare": 70,
+    "baidu": 65,
+    "sina": 60,
     "eastmoney": 60,
     "derived": 20,
 }
@@ -169,9 +173,7 @@ def import_tushare_snapshot(
                 if exists is not None:
                     skipped += 1
                     continue
-                payload = {
-                    key: _json_value(value) for key, value in raw.items()
-                }
+                payload = {key: _json_value(value) for key, value in raw.items()}
                 imported += 1
                 if dry_run:
                     continue
@@ -243,6 +245,7 @@ def register_corporate_action(
         "share_distribution",
         "rights_issue",
         "merger",
+        "cash_acquisition",
         "code_change",
         "terminal",
     }
@@ -271,19 +274,91 @@ def register_corporate_action(
         source=source,
         source_file=str(source_file),
         source_hash=checksum,
-        payload={
-            key: _json_value(value) for key, value in payload.items()
-        },
+        payload={key: _json_value(value) for key, value in payload.items()},
         imported_at=datetime.now(UTC),
     )
     db.add(record)
     db.flush()
     for field_name, value in record.payload.items():
-        encoded = (
-            json.dumps(value, ensure_ascii=False)
-            if value is not None
-            else None
+        encoded = json.dumps(value, ensure_ascii=False) if value is not None else None
+        db.add(
+            DataFieldProvenance(
+                record_id=record.id,
+                field_name=field_name,
+                source=source,
+                source_priority=SOURCE_PRIORITY.get(source, 100),
+                quality_status="missing" if value is None else "valid",
+                original_value=encoded,
+                normalized_value=encoded,
+            )
         )
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+FINANCIAL_SECTOR_FIELDS = {
+    "bank_net_interest_margin",
+    "bank_npl_ratio",
+    "bank_provision_coverage_ratio",
+    "bank_capital_adequacy_ratio",
+    "bank_loan_deposit_ratio",
+    "broker_proprietary_risk_ratio",
+    "broker_leverage_ratio",
+    "broker_net_capital_ratio",
+    "insurance_solvency_ratio",
+    "insurance_combined_ratio",
+    "insurance_reserve_coverage_ratio",
+}
+
+
+def register_financial_sector_metrics(
+    db: Session,
+    *,
+    code: str,
+    report_period: date,
+    available_at: datetime,
+    metrics: dict[str, object],
+    source: str,
+    source_file: Path,
+) -> QuantDataRecord:
+    """登记监管披露的银行/券商/保险专用指标并保留 PIT 与字段血缘。"""
+    unknown = set(metrics) - FINANCIAL_SECTOR_FIELDS
+    if unknown:
+        raise ValueError(f"未知金融专用字段：{','.join(sorted(unknown))}")
+    if not metrics:
+        raise ValueError("专用指标不能为空")
+    if not source_file.is_file():
+        raise FileNotFoundError(source_file)
+    checksum = hashlib.sha256(source_file.read_bytes()).hexdigest()
+    normalized_code = code.split(".")[0]
+    existing = db.scalar(
+        select(QuantDataRecord).where(
+            QuantDataRecord.dataset == "financial_sector_metric",
+            QuantDataRecord.code == normalized_code,
+            QuantDataRecord.effective_date == report_period,
+            QuantDataRecord.available_at == available_at,
+            QuantDataRecord.source == source,
+        )
+    )
+    if existing is not None:
+        return existing
+    payload = {field: _json_value(value) for field, value in metrics.items()}
+    record = QuantDataRecord(
+        dataset="financial_sector_metric",
+        code=normalized_code,
+        effective_date=report_period,
+        available_at=available_at,
+        source=source,
+        source_file=str(source_file),
+        source_hash=checksum,
+        payload=payload,
+        imported_at=datetime.now(UTC),
+    )
+    db.add(record)
+    db.flush()
+    for field_name, value in payload.items():
+        encoded = json.dumps(value, ensure_ascii=False) if value is not None else None
         db.add(
             DataFieldProvenance(
                 record_id=record.id,
@@ -305,30 +380,66 @@ def save_readiness(
     strategy_name: str,
     signal_date: date,
     rows: dict[str, dict[str, object]],
+    *,
+    strategy_version_id: int | None = None,
+    data_snapshot_sha256: str = "",
 ) -> dict[str, object]:
     """持久化逐股逐字段门禁，旧报告按自然键覆盖。"""
     generated_at = datetime.now(UTC)
     ready_count = 0
-    for code, field_status in rows.items():
-        ready = all(bool(value) for value in field_status.values())
-        ready_count += int(ready)
-        existing = db.scalar(
+    existing_by_code = {
+        row.code: row
+        for row in db.scalars(
             select(DataReadinessReport).where(
                 DataReadinessReport.strategy_name == strategy_name,
+                DataReadinessReport.strategy_version_id
+                == strategy_version_id,
                 DataReadinessReport.signal_date == signal_date,
-                DataReadinessReport.code == code,
+                DataReadinessReport.code.in_(rows),
             )
-        )
+        ).all()
+    }
+    for code, field_status in rows.items():
+        boolean_gates = [
+            bool(value)
+            for value in field_status.values()
+            if isinstance(value, bool)
+        ]
+        ready = bool(boolean_gates) and all(boolean_gates)
+        ready_count += int(ready)
+        report_payload = {
+            "strategy_name": strategy_name,
+            "strategy_version_id": strategy_version_id,
+            "signal_date": signal_date.isoformat(),
+            "code": code,
+            "ready": ready,
+            "field_status": field_status,
+            "data_snapshot_sha256": data_snapshot_sha256,
+        }
+        report_sha256 = hashlib.sha256(
+            json.dumps(
+                report_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        existing = existing_by_code.get(code)
         row = existing or DataReadinessReport(
             strategy_name=strategy_name,
+            strategy_version_id=strategy_version_id,
             signal_date=signal_date,
             code=code,
             ready=ready,
             field_status=field_status,
+            data_snapshot_sha256=data_snapshot_sha256,
+            report_sha256=report_sha256,
             generated_at=generated_at,
         )
         row.ready = ready
         row.field_status = field_status
+        row.data_snapshot_sha256 = data_snapshot_sha256
+        row.report_sha256 = report_sha256
         row.generated_at = generated_at
         db.add(row)
     db.commit()
@@ -375,15 +486,35 @@ def apply_correction(
     corrected_value: object,
     correction_rule: str,
     actor: str,
+    affected_strategy_versions: list[int] | None = None,
 ) -> DataCorrection:
     """记录修正但绝不改写原始 payload；规范化消费者读取修正日志。"""
+    corrected_encoded = json.dumps(corrected_value, ensure_ascii=False)
+    affected = sorted(set(affected_strategy_versions or []))
+    evidence_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "issue_id": issue.id,
+                "original_value": issue.original_value,
+                "corrected_value": corrected_encoded,
+                "correction_rule": correction_rule,
+                "actor": actor,
+                "affected_strategy_versions": affected,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     correction = DataCorrection(
         issue_id=issue.id,
         original_value=issue.original_value,
-        corrected_value=json.dumps(corrected_value, ensure_ascii=False),
+        corrected_value=corrected_encoded,
         correction_rule=correction_rule,
         source=issue.source,
         actor=actor,
+        affected_strategy_versions=affected,
+        evidence_sha256=evidence_sha256,
         corrected_at=datetime.now(UTC),
     )
     issue.status = "resolved"

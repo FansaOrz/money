@@ -52,6 +52,10 @@ class StockPaperAccount(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     cash: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    frozen_cash: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+    settled_cash: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     benchmark_nav: Mapped[Decimal] = mapped_column(
         PRICE, nullable=False, default=Decimal("1")
     )
@@ -85,6 +89,16 @@ class StockPaperPosition(Base):
     stock_code: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
     shares: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
     cost: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    lots: Mapped[list[dict]] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="tradable")
+    restricted_shares: Mapped[Decimal] = mapped_column(
+        QUANTITY, nullable=False, default=Decimal("0")
+    )
+    restricted_value: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+    restriction_reason: Mapped[str | None] = mapped_column(String(500))
+    sellable_after: Mapped[date | None] = mapped_column(Date)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -114,9 +128,75 @@ class StockPaperReceivable(Base):
     entitlement_date: Mapped[date] = mapped_column(Date, nullable=False)
     payment_date: Mapped[date | None] = mapped_column(Date)
     amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="receivable")
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="receivable"
+    )
     source: Mapped[str] = mapped_column(String(500), nullable=False)
     paid_at: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class StockPaperCashSettlement(Base):
+    """卖出款 T 日可交易、T+1 转为可取资金的结算明细。"""
+
+    __tablename__ = "stock_paper_cash_settlements"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "reference",
+            name="uq_stock_paper_cash_settlement_reference",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("stock_paper_accounts.id"), nullable=False, index=True
+    )
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    settle_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    reference: Mapped[str] = mapped_column(String(160), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    settled_at: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class StockPaperDividendTaxLiability(Base):
+    """按分红事件和 FIFO 持仓批次跟踪的个人股息税追缴义务。"""
+
+    __tablename__ = "stock_paper_dividend_tax_liabilities"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "event_key",
+            "lot_id",
+            name="uq_stock_paper_dividend_tax_event_lot",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("stock_paper_accounts.id"), nullable=False, index=True
+    )
+    stock_code: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    event_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    lot_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    acquired_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entitlement_date: Mapped[date] = mapped_column(Date, nullable=False)
+    remaining_shares: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
+    gross_cash_per_share: Mapped[Decimal] = mapped_column(PRICE, nullable=False)
+    withheld_at_payment: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+    tax_paid: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+    rule_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -143,9 +223,7 @@ class StockPaperRun(Base):
     )
     rebalanced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     trade_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    status: Mapped[str] = mapped_column(
-        String(30), nullable=False, default="completed"
-    )
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="completed")
     result: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     warnings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
@@ -172,9 +250,7 @@ class StockPaperSignal(Base):
     )
     signal_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     execute_on: Mapped[date | None] = mapped_column(Date, nullable=True)
-    status: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="pending"
-    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     universe_count: Mapped[int] = mapped_column(Integer, nullable=False)
     selected_count: Mapped[int] = mapped_column(Integer, nullable=False)
     invested_weight: Mapped[Decimal] = mapped_column(WEIGHT, nullable=False)
@@ -215,8 +291,33 @@ class StockPaperTrade(Base):
     price: Mapped[Decimal] = mapped_column(PRICE, nullable=False)
     amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     fee: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    fee_rule_version: Mapped[str] = mapped_column(
+        String(100), nullable=False, default="LEGACY_UNDATED_COST_MODEL"
+    )
+    fee_breakdown: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    lot_consumption: Mapped[list[dict]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
     target_weight: Mapped[Decimal] = mapped_column(WEIGHT, nullable=False)
     reason: Mapped[str] = mapped_column(String(300), nullable=False)
+    arrival_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    open_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    decision_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    market_vwap: Mapped[Decimal | None] = mapped_column(PRICE)
+    close_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    participation_rate: Mapped[Decimal | None] = mapped_column(WEIGHT)
+    implementation_shortfall: Mapped[Decimal | None] = mapped_column(WEIGHT)
+    recent_volatility: Mapped[Decimal | None] = mapped_column(WEIGHT)
+    liquidity_adv: Mapped[Decimal | None] = mapped_column(QUANTITY)
+    execution_session: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="open"
+    )
+    slippage_model_version: Mapped[str] = mapped_column(
+        String(100), nullable=False, default="OPEN_ADV_SQRT_V1"
+    )
+    cost_scenario: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="baseline"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -241,6 +342,20 @@ class StockPaperNavDaily(Base):
     )
     nav_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     cash: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    frozen_cash: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+    receivable_cash: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+    settled_cash: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    cash_interest: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+    cash_ledger: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    cash_conservation_error: Mapped[Decimal] = mapped_column(
+        Numeric(18, 8), nullable=False, default=Decimal("0")
+    )
     market_value: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     total_value: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     nav: Mapped[Decimal] = mapped_column(PRICE, nullable=False)

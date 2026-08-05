@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import logging
 from datetime import UTC, date, datetime, time
@@ -23,7 +24,12 @@ import pandas as pd
 from sqlalchemy import delete, insert, select
 from sqlalchemy.orm import Session
 
-from app.models import IndexConstituent, IndexMembershipEvent, StockUniverseSnapshot
+from app.models import (
+    IndexConstituent,
+    IndexMembershipEvent,
+    QuantDataRecord,
+    StockUniverseSnapshot,
+)
 from app.services.research import ak_fetch
 from app.services.research.stock_data import (
     _begin_task,
@@ -217,10 +223,15 @@ def import_stocktoday_index_weights(
         except Exception as exc:
             errors.append(f"{path.name}: {exc}")
             continue
-        required = {"index_code", "con_code", "trade_date"}
+        required = {"index_code", "con_code", "trade_date", "weight"}
         if frame.empty or not required.issubset(frame.columns):
             continue
-        frames.append(frame[list(required)])
+        selected = frame[list(required)].copy()
+        selected["source_file"] = str(
+            Path(snapshot_root.name) / path.relative_to(snapshot_root)
+        )
+        selected["source_hash"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        frames.append(selected)
     if not frames:
         return {
             "status": "failed",
@@ -239,9 +250,68 @@ def import_stocktoday_index_weights(
     combined["snapshot_date"] = pd.to_datetime(
         combined["trade_date"], errors="coerce"
     ).dt.date
-    combined = combined.dropna(subset=["snapshot_date"]).drop_duplicates(
+    combined["weight"] = pd.to_numeric(combined["weight"], errors="coerce")
+    combined = combined.dropna(
+        subset=["snapshot_date", "weight"]
+    ).drop_duplicates(
         subset=["index_code", "snapshot_date", "stock_code"], keep="last"
     )
+    group_sums = combined.groupby(["index_code", "snapshot_date"])[
+        "weight"
+    ].sum()
+    invalid_sums = group_sums[(group_sums < 99.5) | (group_sums > 100.5)]
+    if not invalid_sums.empty:
+        preview = "、".join(
+            f"{index_code}@{snapshot_date}={total:.4f}%"
+            for (index_code, snapshot_date), total in invalid_sums.head(5).items()
+        )
+        return {
+            "status": "failed",
+            "snapshots_imported": 0,
+            "events_imported": 0,
+            "weights_imported": 0,
+            "errors": [f"指数权重和不在 99.5%～100.5%：{preview}"],
+        }
+
+    existing_weight_keys = set(
+        db.execute(
+            select(
+                QuantDataRecord.code,
+                QuantDataRecord.effective_date,
+                QuantDataRecord.source,
+            ).where(QuantDataRecord.dataset == "index_weight")
+        ).all()
+    )
+    imported_at = datetime.now(UTC)
+    weight_payloads: list[dict[str, Any]] = []
+    for row in combined.itertuples(index=False):
+        source = f"tushare:index_weight:{str(row.source_hash)[:12]}"
+        record_code = f"{row.index_code}:{row.stock_code}"
+        key = (record_code, row.snapshot_date, source)
+        if key in existing_weight_keys:
+            continue
+        available_at = datetime.combine(
+            row.snapshot_date, time(15, 0), tzinfo=CN_TZ
+        ).astimezone(UTC)
+        weight_payloads.append(
+            {
+                "dataset": "index_weight",
+                "code": record_code,
+                "effective_date": row.snapshot_date,
+                "available_at": available_at,
+                "source": source,
+                "source_file": str(row.source_file),
+                "source_hash": str(row.source_hash),
+                "payload": {
+                    "index_code": row.index_code,
+                    "stock_code": row.stock_code,
+                    "weight_percent": float(row.weight),
+                    "weight_unit": "percent",
+                    "composition_method": "official_constituent_weight",
+                },
+                "imported_at": imported_at,
+            }
+        )
 
     existing_snapshot_keys = set(
         db.execute(
@@ -333,6 +403,12 @@ def import_stocktoday_index_weights(
             event_payloads[offset : offset + 5_000],
         )
         db.commit()
+    for offset in range(0, len(weight_payloads), 5_000):
+        db.execute(
+            insert(QuantDataRecord),
+            weight_payloads[offset : offset + 5_000],
+        )
+        db.commit()
     return {
         "status": "success" if not errors else "partial",
         "files": len(files),
@@ -341,6 +417,10 @@ def import_stocktoday_index_weights(
         ),
         "snapshots_imported": len(snapshot_payloads),
         "events_imported": len(event_payloads),
+        "weights_imported": len(weight_payloads),
+        "weight_source_hashes": sorted(
+            set(combined["source_hash"].astype(str))
+        ),
         "errors": errors,
     }
 

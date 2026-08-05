@@ -21,7 +21,9 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    event,
     func,
+    inspect,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -52,12 +54,41 @@ class StrategyVersion(Base):
     fee_rate: Mapped[Decimal] = mapped_column(WEIGHT, nullable=False)
     top_n: Mapped[int] = mapped_column(Integer, nullable=False)
     params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # 投资任务书随策略版本冻结；修改任务书必须创建新 StrategyVersion。
+    mandate: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    mandate_sha256: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=""
+    )
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="research")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     accounts: Mapped[list["PaperAccount"]] = relationship(back_populates="strategy_version")
+
+
+@event.listens_for(StrategyVersion, "before_update")
+def _prevent_mandate_mutation(_mapper, _connection, target: StrategyVersion) -> None:
+    """应用层禁止原地修改任务书；数据库迁移不经过 ORM 事件。"""
+
+    state = inspect(target)
+    if state.attrs.mandate.history.has_changes():
+        raise ValueError("投资任务书不可原地修改，必须创建新策略版本")
+    if state.attrs.mandate_sha256.history.has_changes():
+        raise ValueError("投资任务书哈希不可原地修改，必须创建新策略版本")
+
+
+@event.listens_for(StrategyVersion, "before_insert")
+def _require_mandate(_mapper, _connection, target: StrategyVersion) -> None:
+    """所有新策略版本必须在创建时绑定任务书和匹配哈希。"""
+
+    from app.services.strategy_mandate import validate_mandate
+
+    failures = validate_mandate(
+        dict(target.mandate or {}), str(target.mandate_sha256 or "")
+    )
+    if failures:
+        raise ValueError("新策略版本必须绑定有效投资任务书：" + "；".join(failures))
 
 
 class PaperAccount(Base):

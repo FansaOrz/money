@@ -39,13 +39,14 @@ SqlStockRepository 的数据来源（全部为已存在的数据层，动态降�
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import logging
 import math
 from bisect import bisect_right
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import date, datetime, time
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -91,6 +92,8 @@ class Fundamentals:
     roe: float | None = None
     gross_margin: float | None = None
     ocf_to_profit: float | None = None
+    cash_conversion_assets: float | None = None
+    profit_classification: str | None = None
     debt_ratio: float | None = None
     ep: float | None = None
     bp: float | None = None
@@ -101,12 +104,37 @@ class Fundamentals:
     revenue: float | None = None
     net_income: float | None = None
     operating_cash_flow: float | None = None
+    capital_expenditure: float | None = None
     free_cash_flow: float | None = None
+    free_cash_flow_definition: str | None = None
     total_assets: float | None = None
     total_equity: float | None = None
     dividend_yield: float | None = None
+    dividend_yield_status: str | None = None
+    dividend_yield_reason: str | None = None
+    dividend_event_count: int = 0
+    dividend_source_hashes: tuple[str, ...] = ()
     sales_yield: float | None = None
     company_type: str | None = None
+    bank_net_interest_margin: float | None = None
+    bank_npl_ratio: float | None = None
+    bank_provision_coverage_ratio: float | None = None
+    bank_capital_adequacy_ratio: float | None = None
+    bank_loan_deposit_ratio: float | None = None
+    broker_proprietary_risk_ratio: float | None = None
+    broker_leverage_ratio: float | None = None
+    broker_net_capital_ratio: float | None = None
+    insurance_solvency_ratio: float | None = None
+    insurance_combined_ratio: float | None = None
+    insurance_reserve_coverage_ratio: float | None = None
+    sector_metric_sources: tuple[str, ...] = ()
+    formal_factor_usable: bool = True
+    financial_quality_reasons: tuple[str, ...] = ()
+    unit_policy: str | None = None
+    flow_basis: str | None = None
+    audit_opinion: str | None = None
+    correction_status: str | None = None
+    ttm_component_periods: tuple[date, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -186,6 +214,42 @@ class UniverseMembership:
 
 
 @dataclass(frozen=True)
+class BenchmarkSeries:
+    """带数据血缘和完整性摘要的指数净值序列。"""
+
+    code: str
+    name: str
+    return_kind: str
+    points: tuple[tuple[date, float], ...]
+    source: str
+    source_files: tuple[str, ...]
+    source_hashes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class IndexWeightSnapshot:
+    """某指数在指定历史时点可用的完整官方成分权重截面。"""
+
+    index_code: str
+    as_of: date
+    snapshot_date: date
+    weights: tuple[tuple[str, float], ...]
+    weight_sum_percent: float
+    source_files: tuple[str, ...]
+    source_hashes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CombinedIndexWeights:
+    """沪深300与中证500固定 50/50 袖套合成权重。"""
+
+    as_of: date
+    method: str
+    weights: tuple[tuple[str, float], ...]
+    component_snapshots: tuple[IndexWeightSnapshot, ...]
+
+
+@dataclass(frozen=True)
 class CorporateAction:
     """影响原始价持仓口径的公司行为事件。
 
@@ -205,6 +269,19 @@ class CorporateAction:
     subscription_ratio: float = 0.0
     subscription_price: float | None = None
     successor_code: str | None = None
+    record_date: date | None = None
+    terminal_type: str | None = None
+    consideration_status: str = "unknown"
+    restricted_valuation_per_share: float = 0.0
+    review_status: str = "unreviewed"
+    rights_tradable: bool = False
+    right_market_price: float | None = None
+    subscription_deadline: date | None = None
+    successor_listing_date: date | None = None
+    cash_compensation_per_fraction: float | None = None
+    fractional_handling: str = "cash_if_official_else_restricted"
+    source_hash: str | None = None
+    revision: int = 1
     source: str = "tushare"
 
 
@@ -269,7 +346,9 @@ def one_word_limit(bar: StockBar, move: float, limit: float) -> bool:
 
 
 def st_status_as_of(
-    current_name: str, periods: list[NamePeriod] | tuple[NamePeriod, ...] | None, as_of: date
+    current_name: str,
+    periods: list[NamePeriod] | tuple[NamePeriod, ...] | None,
+    as_of: date,
 ) -> bool:
     """as_of 当日的 ST 状态：名称历史优先（区间命中以其 is_st 为准），
     无历史记录覆盖该日时回退当前名称判定。"""
@@ -326,6 +405,25 @@ class StockRepository(Protocol):
         end: date | None = None,
     ) -> list[tuple[date, float]]:
         """指数收盘点位序列（升序），用作指数基准；不支持时返回 []。"""
+        ...
+
+    def benchmark_series(
+        self,
+        index_code: str,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> BenchmarkSeries | None:
+        """返回受治理的官方基准序列；不可验证时返回 None。"""
+        ...
+
+    def index_weight_snapshot(
+        self, index_code: str, as_of: date
+    ) -> IndexWeightSnapshot:
+        """查询不晚于 as_of 的最新完整官方权重截面。"""
+        ...
+
+    def combined_csi800_weights(self, as_of: date) -> CombinedIndexWeights:
+        """以固定 50/50 袖套法合成 300+500 权重。"""
         ...
 
     # ---- 可选扩展（duck-typed，缺失时服务层自动降级）----------------------
@@ -457,7 +555,9 @@ def coerce_fundamentals(obj: object) -> Fundamentals | None:
         period=_to_date(_attr(obj, "period", "report_date", "end_date")),
         roe=_to_float(_attr(obj, "roe", "roe_ttm")),
         gross_margin=_to_float(_attr(obj, "gross_margin", "grossprofit_margin")),
-        ocf_to_profit=_to_float(_attr(obj, "ocf_to_profit", "ocf_to_np", "cash_to_profit")),
+        ocf_to_profit=_to_float(
+            _attr(obj, "ocf_to_profit", "ocf_to_np", "cash_to_profit")
+        ),
         debt_ratio=_to_float(_attr(obj, "debt_ratio", "debt_to_assets", "leverage")),
         ep=_to_float(_attr(obj, "ep", "earnings_yield", "e_p")),
         bp=_to_float(_attr(obj, "bp", "book_to_price", "b_p")),
@@ -467,7 +567,9 @@ def coerce_fundamentals(obj: object) -> Fundamentals | None:
         net_margin=_to_float(_attr(obj, "net_margin", "netprofit_margin")),
         revenue=_to_float(_attr(obj, "revenue", "total_revenue")),
         net_income=_to_float(_attr(obj, "net_income", "n_income_attr_p")),
-        operating_cash_flow=_to_float(_attr(obj, "operating_cash_flow", "n_cashflow_act")),
+        operating_cash_flow=_to_float(
+            _attr(obj, "operating_cash_flow", "n_cashflow_act")
+        ),
         free_cash_flow=_to_float(_attr(obj, "free_cash_flow", "free_cashflow")),
         total_assets=_to_float(_attr(obj, "total_assets")),
         total_equity=_to_float(_attr(obj, "total_equity")),
@@ -477,6 +579,35 @@ def coerce_fundamentals(obj: object) -> Fundamentals | None:
             str(_attr(obj, "company_type", "comp_type"))
             if _attr(obj, "company_type", "comp_type") is not None
             else None
+        ),
+        bank_net_interest_margin=_to_float(
+            _attr(obj, "bank_net_interest_margin")
+        ),
+        bank_npl_ratio=_to_float(_attr(obj, "bank_npl_ratio")),
+        bank_provision_coverage_ratio=_to_float(
+            _attr(obj, "bank_provision_coverage_ratio")
+        ),
+        bank_capital_adequacy_ratio=_to_float(
+            _attr(obj, "bank_capital_adequacy_ratio")
+        ),
+        bank_loan_deposit_ratio=_to_float(
+            _attr(obj, "bank_loan_deposit_ratio")
+        ),
+        broker_proprietary_risk_ratio=_to_float(
+            _attr(obj, "broker_proprietary_risk_ratio")
+        ),
+        broker_leverage_ratio=_to_float(_attr(obj, "broker_leverage_ratio")),
+        broker_net_capital_ratio=_to_float(
+            _attr(obj, "broker_net_capital_ratio")
+        ),
+        insurance_solvency_ratio=_to_float(
+            _attr(obj, "insurance_solvency_ratio")
+        ),
+        insurance_combined_ratio=_to_float(
+            _attr(obj, "insurance_combined_ratio")
+        ),
+        insurance_reserve_coverage_ratio=_to_float(
+            _attr(obj, "insurance_reserve_coverage_ratio")
         ),
     )
 
@@ -488,19 +619,33 @@ def coerce_fundamentals(obj: object) -> Fundamentals | None:
 # 财务 payload（新浪原始 JSON）中候选中文字段名 → 归一化字段
 _PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
     "gross_margin": (
-        "销售毛利率(%)", "销售毛利率", "gross_margin", "grossprofit_margin",
-        "XSMLL", "sale_gross_margin",
+        "销售毛利率(%)",
+        "销售毛利率",
+        "gross_margin",
+        "grossprofit_margin",
+        "XSMLL",
+        "sale_gross_margin",
     ),
     "debt_ratio": (
-        "资产负债率(%)", "资产负债率", "debt_ratio", "debt_to_assets",
-        "ZCFZL", "assets_debt_ratio",
+        "资产负债率(%)",
+        "资产负债率",
+        "debt_ratio",
+        "debt_to_assets",
+        "ZCFZL",
+        "assets_debt_ratio",
     ),
     "net_profit": (
-        "净利润(元)", "净利润", "归属于母公司所有者的净利润(元)",
-        "归属于母公司所有者的净利润", "net_profit", "PARENTNETPROFIT",
+        "净利润(元)",
+        "净利润",
+        "归属于母公司所有者的净利润(元)",
+        "归属于母公司所有者的净利润",
+        "net_profit",
+        "PARENTNETPROFIT",
     ),
     "ocf": (
-        "经营活动产生的现金流量净额(元)", "经营活动产生的现金流量净额", "ocf",
+        "经营活动产生的现金流量净额(元)",
+        "经营活动产生的现金流量净额",
+        "ocf",
     ),
     "ocf_to_profit": ("ocf_to_profit", "NCO_NETPROFIT"),
 }
@@ -517,7 +662,11 @@ _METRIC_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 # 行业模型候选（未来接入申万/中信行业时的探测名单）
-_INDUSTRY_MODELS = ("StockIndustry", "StockIndustryMember", "StockIndustryClassification")
+_INDUSTRY_MODELS = (
+    "StockIndustry",
+    "StockIndustryMember",
+    "StockIndustryClassification",
+)
 
 # 停牌判定：成交量/成交额同时非正视为停牌（数据源无显式标记时的近似）
 _SUSPEND_EPS = 1e-9
@@ -584,10 +733,29 @@ class SqlStockRepository:
         self._external_snapshot_enabled = data_root is not None or (
             self._database_matches_config()
         )
+        self._accessed_files: dict[str, dict[str, object]] = {}
         self._warehouse_repo = self._try_warehouse()
         self._industry_map = self._load_industries()
 
     # ---- 可选数据源探测 -------------------------------------------------
+
+    def _record_file(self, path: Path) -> Path:
+        """在实际读取前记录相对路径、大小和内容哈希。"""
+        if not path.is_file():
+            return path
+        resolved = path.resolve()
+        key = str(resolved)
+        if key in self._accessed_files:
+            return path
+        from app.config import get_settings
+        from app.services.file_access_manifest import file_observation
+
+        root = self._root or Path(get_settings().research_data_dir)
+        self._accessed_files[key] = file_observation(resolved, root)
+        return path
+
+    def accessed_file_records(self) -> list[dict[str, object]]:
+        return list(self._accessed_files.values())
 
     def _database_matches_config(self) -> bool:
         """只让配置主库自动挂载配置的数据湖，避免临时库串入生产快照。"""
@@ -601,9 +769,10 @@ class SqlStockRepository:
             if configured.get_backend_name() != bound.get_backend_name():
                 return False
             if configured.get_backend_name() == "sqlite":
-                return Path(configured.database or "").resolve() == Path(
-                    bound.database or ""
-                ).resolve()
+                return (
+                    Path(configured.database or "").resolve()
+                    == Path(bound.database or "").resolve()
+                )
             return configured.render_as_string(hide_password=True) == (
                 bound.render_as_string(hide_password=True)
             )
@@ -645,7 +814,11 @@ class SqlStockRepository:
         if model is None:
             return {}
         code_col = next(
-            (getattr(model, c) for c in ("code", "stock_code", "symbol") if hasattr(model, c)),
+            (
+                getattr(model, c)
+                for c in ("code", "stock_code", "symbol")
+                if hasattr(model, c)
+            ),
             None,
         )
         industry_col = next(
@@ -687,9 +860,7 @@ class SqlStockRepository:
                 current = selected.get(str(code))
                 if current is None or score > current[0]:
                     selected[str(code)] = (score, str(industry))
-            return {
-                code: industry for code, (_score, industry) in selected.items()
-            }
+            return {code: industry for code, (_score, industry) in selected.items()}
         except Exception:  # noqa: BLE001 - 表结构不符预期时降级
             return {}
 
@@ -707,17 +878,13 @@ class SqlStockRepository:
 
                 from app.config import get_settings
 
-                research_root = self._root or Path(
-                    get_settings().research_data_dir
-                )
+                research_root = self._root or Path(get_settings().research_data_dir)
                 wanted = set(codes)
                 directory = (
-                    research_root
-                    / "tushare_snapshot"
-                    / "global"
-                    / "stock_basic_full"
+                    research_root / "tushare_snapshot" / "global" / "stock_basic_full"
                 )
                 for path in sorted(directory.glob("*.parquet")):
+                    self._record_file(path)
                     table = pq.read_table(
                         path,
                         columns=[
@@ -763,9 +930,7 @@ class SqlStockRepository:
                 .order_by(StockUniverseSnapshot.snapshot_date)
             ).all()
             historical_names = {
-                str(code): str(name)
-                for code, name, _snapshot_date in name_rows
-                if name
+                str(code): str(name) for code, name, _snapshot_date in name_rows if name
             }
         alias_names: dict[str, str] = {}
         if missing_codes:
@@ -783,9 +948,7 @@ class SqlStockRepository:
                     if payload.get("kind") not in {"code_change", "merger"}:
                         continue
                     old_name = str(payload.get("old_name") or "").strip()
-                    successor = str(
-                        payload.get("successor_code") or ""
-                    ).split(".")[0]
+                    successor = str(payload.get("successor_code") or "").split(".")[0]
                     if old_name:
                         alias_names[record.code] = old_name
                     elif successor:
@@ -798,11 +961,7 @@ class SqlStockRepository:
                 pass
         for code in sorted(missing_codes):
             raw = basic.get(code)
-            if (
-                raw is None
-                and code not in historical_names
-                and code not in alias_names
-            ):
+            if raw is None and code not in historical_names and code not in alias_names:
                 continue
             raw = raw or {}
             result.append(
@@ -834,7 +993,7 @@ class SqlStockRepository:
             research_root = self._root or Path(get_settings().research_data_dir)
             directory = research_root / "tushare_snapshot" / "stocks" / dataset
             matches = sorted(directory.glob(f"{code}.*.parquet"))
-            return matches[0] if matches else None
+            return self._record_file(matches[0]) if matches else None
         except Exception:  # noqa: BLE001
             return None
 
@@ -859,9 +1018,7 @@ class SqlStockRepository:
                     strict=True,
                 ):
                     text = str(raw_day)
-                    day = _to_date(
-                        f"{text[:4]}-{text[4:6]}-{text[6:8]}"
-                    )
+                    day = _to_date(f"{text[:4]}-{text[4:6]}-{text[6:8]}")
                     if day is None:
                         continue
                     if start is not None and day < start:
@@ -884,9 +1041,7 @@ class SqlStockRepository:
                     if str(suspend_type).upper() != "S":
                         continue
                     text = str(raw_day)
-                    day = _to_date(
-                        f"{text[:4]}-{text[4:6]}-{text[6:8]}"
-                    )
+                    day = _to_date(f"{text[:4]}-{text[4:6]}-{text[6:8]}")
                     if day is None:
                         continue
                     if start is not None and day < start:
@@ -943,9 +1098,11 @@ class SqlStockRepository:
                     if action_date is None:
                         continue
                     share_ratio = _to_float(row.get("stk_div")) or 0.0
-                    cash = _to_float(row.get("cash_div_tax"))
+                    # 账户税务必须从税前分红出发，不能把源数据的统一税后
+                    # 口径误当成每个 FIFO 批次的最终个人税负。
+                    cash = _to_float(row.get("cash_div"))
                     if cash is None:
-                        cash = _to_float(row.get("cash_div"))
+                        cash = _to_float(row.get("cash_div_tax"))
                     cash = cash or 0.0
                     if share_ratio <= 0 and cash <= 0:
                         continue
@@ -991,6 +1148,7 @@ class SqlStockRepository:
                                 cash_per_share=max(cash, 0.0),
                                 event_key=event_key,
                                 payment_date=payment_date,
+                                record_date=_to_compact_date(row.get("record_date")),
                                 source=source,
                             )
                         )
@@ -1023,9 +1181,7 @@ class SqlStockRepository:
             if self._external_snapshot_enabled:
                 from app.config import get_settings
 
-                research_root = self._root or Path(
-                    get_settings().research_data_dir
-                )
+                research_root = self._root or Path(get_settings().research_data_dir)
                 delisted_path = (
                     research_root
                     / "tushare_snapshot"
@@ -1041,35 +1197,26 @@ class SqlStockRepository:
                     wanted = set(codes)
                     for row in table.to_pylist():
                         code = str(row.get("ts_code") or "").split(".")[0]
-                        terminal_day = _to_compact_date(
-                            row.get("delist_date")
-                        )
+                        terminal_day = _to_compact_date(row.get("delist_date"))
                         if code not in wanted or terminal_day is None:
                             continue
                         if start is not None and terminal_day < start:
                             continue
                         if end is not None and terminal_day > end:
                             continue
-                        last_bars = self._bars_from_parquet(
-                            code, None, terminal_day
-                        )
-                        if not last_bars:
-                            last_bars = self._bars_from_stocktoday(
-                                code, None, terminal_day
-                            )
-                        terminal_price = (
-                            last_bars[-1].close if last_bars else None
-                        )
                         actions.append(
                             CorporateAction(
                                 code=code,
                                 action_date=terminal_day,
                                 kind="terminal",
-                                terminal_price=terminal_price,
+                                terminal_price=None,
+                                terminal_type="unknown",
+                                consideration_status="unknown",
+                                restricted_valuation_per_share=0.0,
+                                review_status="open",
                                 event_key=f"{code}:{terminal_day}:delist",
                                 source=(
-                                    "tushare:stock_basic_full:D:"
-                                    f"{delisted_path.name}"
+                                    f"tushare:stock_basic_full:D:{delisted_path.name}"
                                 ),
                             )
                         )
@@ -1087,14 +1234,40 @@ class SqlStockRepository:
                 QuantDataRecord.code.in_(codes),
             )
             if start is not None:
-                statement = statement.where(
-                    QuantDataRecord.effective_date >= start
-                )
+                statement = statement.where(QuantDataRecord.effective_date >= start)
             if end is not None:
-                statement = statement.where(
-                    QuantDataRecord.effective_date <= end
+                statement = statement.where(QuantDataRecord.effective_date <= end)
+            candidate_records = self._db.scalars(statement).all()  # type: ignore[attr-defined]
+            chosen_records: dict[tuple[str, date, str, str], object] = {}
+            for record in candidate_records:
+                candidate_payload = dict(record.payload or {})
+                if candidate_payload.get("resolution_status") in {
+                    "conflict",
+                    "rejected",
+                    "superseded",
+                }:
+                    continue
+                candidate_key = (
+                    record.code,
+                    record.effective_date,
+                    str(candidate_payload.get("kind") or ""),
+                    str(candidate_payload.get("event_key") or record.effective_date),
                 )
-            for record in self._db.scalars(statement).all():  # type: ignore[attr-defined]
+                previous = chosen_records.get(candidate_key)
+                if previous is None or (
+                    int(candidate_payload.get("revision") or 1),
+                    record.available_at,
+                    record.id,
+                ) > (
+                    int(
+                        dict(previous.payload or {}).get("revision")  # type: ignore[union-attr]
+                        or 1
+                    ),
+                    previous.available_at,  # type: ignore[union-attr]
+                    previous.id,  # type: ignore[union-attr]
+                ):
+                    chosen_records[candidate_key] = record
+            for record in chosen_records.values():
                 payload = dict(record.payload or {})
                 kind = str(payload.get("kind") or "").strip()
                 if kind not in {
@@ -1105,32 +1278,64 @@ class SqlStockRepository:
                     "cash_entitlement",
                     "cash_payment",
                     "terminal",
+                    "cash_acquisition",
                 }:
                     continue
+                normalized_kind = "terminal" if kind == "cash_acquisition" else kind
                 actions.append(
                     CorporateAction(
                         code=record.code,
                         action_date=record.effective_date,
-                        kind=kind,
-                        cash_per_share=_to_float(payload.get("cash_per_share"))
-                        or 0.0,
+                        kind=normalized_kind,
+                        cash_per_share=_to_float(payload.get("cash_per_share")) or 0.0,
                         share_ratio=_to_float(payload.get("share_ratio")) or 0.0,
                         terminal_price=_to_float(payload.get("terminal_price")),
                         event_key=str(payload.get("event_key") or record.id),
-                        payment_date=_to_compact_date(
-                            payload.get("payment_date")
-                        ),
+                        payment_date=_to_compact_date(payload.get("payment_date")),
                         subscription_ratio=(
                             _to_float(payload.get("subscription_ratio")) or 0.0
                         ),
-                        subscription_price=_to_float(
-                            payload.get("subscription_price")
-                        ),
+                        subscription_price=_to_float(payload.get("subscription_price")),
                         successor_code=(
                             str(payload.get("successor_code")).split(".")[0]
                             if payload.get("successor_code")
                             else None
                         ),
+                        record_date=_to_compact_date(payload.get("record_date")),
+                        terminal_type=(
+                            str(payload.get("terminal_type"))
+                            if payload.get("terminal_type")
+                            else (
+                                "cash_acquisition"
+                                if kind == "cash_acquisition"
+                                else None
+                            )
+                        ),
+                        consideration_status=str(
+                            payload.get("consideration_status") or "unknown"
+                        ),
+                        restricted_valuation_per_share=(
+                            _to_float(payload.get("restricted_valuation_per_share"))
+                            or 0.0
+                        ),
+                        review_status=str(payload.get("review_status") or "unreviewed"),
+                        rights_tradable=bool(payload.get("rights_tradable", False)),
+                        right_market_price=_to_float(payload.get("right_market_price")),
+                        subscription_deadline=_to_compact_date(
+                            payload.get("subscription_deadline")
+                        ),
+                        successor_listing_date=_to_compact_date(
+                            payload.get("successor_listing_date")
+                        ),
+                        cash_compensation_per_fraction=_to_float(
+                            payload.get("cash_compensation_per_fraction")
+                        ),
+                        fractional_handling=str(
+                            payload.get("fractional_handling")
+                            or "cash_if_official_else_restricted"
+                        ),
+                        source_hash=record.source_hash,
+                        revision=int(payload.get("revision") or 1),
                         source=(
                             f"normalized:{record.source}:{record.source_file}:"
                             f"{record.source_hash}"
@@ -1165,22 +1370,36 @@ class SqlStockRepository:
                     continue
                 if end is not None and terminal_day > end:
                     continue
-                last_bars = self._bars_from_parquet(
-                    str(code), terminal_day, terminal_day
-                )
-                terminal_price = last_bars[-1].close if last_bars else None
                 actions.append(
                     CorporateAction(
                         code=str(code),
                         action_date=terminal_day,
                         kind="terminal",
-                        terminal_price=terminal_price,
+                        terminal_price=None,
+                        terminal_type="unknown",
+                        consideration_status="unknown",
+                        restricted_valuation_per_share=0.0,
+                        review_status="open",
+                        event_key=f"{code}:{terminal_day}:unverified_delist",
                         source="stock_master:退+stock_daily_bars:last_trade_date",
                     )
                 )
         except Exception:  # noqa: BLE001 - 旧数据库无相应元数据时仅缺少终止事件
             logger.warning("读取退市终止事件失败", exc_info=True)
 
+        # 规范化主数据存在时优先消费其版本，禁止和静态 Parquet 同一事件
+        # 重复入账；静态源只作为尚未完成规范化导入时的可追溯降级。
+        normalized_keys = {
+            (action.code, action.action_date, action.kind)
+            for action in actions
+            if action.source.startswith("normalized:")
+        }
+        actions = [
+            action
+            for action in actions
+            if action.source.startswith("normalized:")
+            or (action.code, action.action_date, action.kind) not in normalized_keys
+        ]
         # 原始源偶有同一实施方案重复行；按自然键去重并保持确定顺序。
         unique = {
             (
@@ -1232,13 +1451,10 @@ class SqlStockRepository:
                     active = [
                         period
                         for period in periods
-                        if period[0] <= day
-                        and (period[1] is None or day <= period[1])
+                        if period[0] <= day and (period[1] is None or day <= period[1])
                     ]
                     if active:
-                        result[day][code] = max(
-                            active, key=lambda period: period[0]
-                        )[2]
+                        result[day][code] = max(active, key=lambda period: period[0])[2]
         except Exception:  # noqa: BLE001
             logger.warning("读取申万2021历史行业成员失败", exc_info=True)
         return result
@@ -1249,6 +1465,13 @@ class SqlStockRepository:
         try:
             from app.services.research import parquet_store
 
+            path = parquet_store.daily_path(
+                code,
+                layer or parquet_store.DAILY_RAW,
+                self._root,
+            )
+            if path.is_file():
+                self._record_file(path)
             frame = parquet_store.read_daily(
                 code, layer or parquet_store.DAILY_RAW, self._root
             )
@@ -1259,9 +1482,7 @@ class SqlStockRepository:
         limits: dict[date, tuple[float | None, float | None]] = {}
         explicit_suspensions: set[date] = set()
         if layer is None or layer == parquet_store.DAILY_RAW:
-            limits, explicit_suspensions = self._execution_overrides(
-                code, start, end
-            )
+            limits, explicit_suspensions = self._execution_overrides(code, start, end)
         bars: list[StockBar] = []
         for record in frame.to_dict(orient="records"):
             trade_date = _as_date(record.get("trade_date"))
@@ -1307,9 +1528,7 @@ class SqlStockRepository:
         try:
             import pyarrow.parquet as pq
 
-            limits, explicit_suspensions = self._execution_overrides(
-                code, start, end
-            )
+            limits, explicit_suspensions = self._execution_overrides(code, start, end)
             bars: list[StockBar] = []
             for record in pq.read_table(path).to_pylist():
                 trade_date = _to_compact_date(record.get("trade_date"))
@@ -1344,9 +1563,7 @@ class SqlStockRepository:
                         amount=amount,
                         suspended=suspended,
                         raw_return=(
-                            pct_change / 100.0
-                            if pct_change is not None
-                            else None
+                            pct_change / 100.0 if pct_change is not None else None
                         ),
                         up_limit=up_limit,
                         down_limit=down_limit,
@@ -1370,8 +1587,7 @@ class SqlStockRepository:
             factors = {
                 day: value
                 for record in pq.read_table(factor_path).to_pylist()
-                if (day := _to_compact_date(record.get("trade_date")))
-                is not None
+                if (day := _to_compact_date(record.get("trade_date"))) is not None
                 and (value := _to_float(record.get("adj_factor"))) is not None
                 and value > 0
             }
@@ -1383,9 +1599,7 @@ class SqlStockRepository:
                     if day <= bars[-1].trade_date
                 ]
                 latest_factor = (
-                    max(eligible, key=lambda item: item[0])[1]
-                    if eligible
-                    else None
+                    max(eligible, key=lambda item: item[0])[1] if eligible else None
                 )
             if latest_factor is None or latest_factor <= 0:
                 return []
@@ -1399,12 +1613,8 @@ class SqlStockRepository:
                     StockBar(
                         code=bar.code,
                         trade_date=bar.trade_date,
-                        open=(
-                            bar.open * scale if bar.open is not None else None
-                        ),
-                        high=(
-                            bar.high * scale if bar.high is not None else None
-                        ),
+                        open=(bar.open * scale if bar.open is not None else None),
+                        high=(bar.high * scale if bar.high is not None else None),
                         low=bar.low * scale if bar.low is not None else None,
                         close=bar.close * scale,
                         volume=bar.volume,
@@ -1491,9 +1701,7 @@ class SqlStockRepository:
             exec_map.setdefault(bar.code, []).append(bar)
         panel: dict[str, MarketBars] = {}
         for code in codes:
-            exec_bars = sorted(
-                exec_map.get(code, []), key=lambda bar: bar.trade_date
-            )
+            exec_bars = sorted(exec_map.get(code, []), key=lambda bar: bar.trade_date)
             research_bars = self._bars_from_parquet(
                 code, start, end, layer=parquet_store.DAILY_QFQ
             )
@@ -1595,9 +1803,8 @@ class SqlStockRepository:
                 / "SSE.parquet"
             )
             if calendar_path.exists():
-                table = pq.read_table(
-                    calendar_path, columns=["cal_date", "is_open"]
-                )
+                self._record_file(calendar_path)
+                table = pq.read_table(calendar_path, columns=["cal_date", "is_open"])
                 days = []
                 for raw_day, is_open in zip(
                     table.column("cal_date").to_pylist(),
@@ -1677,13 +1884,11 @@ class SqlStockRepository:
                 StockUniverseSnapshot.stock_code,
             )
         ).all()
-        snapshots: dict[str, dict[date, set[str]]] = {
-            index: {} for index in indices
-        }
+        snapshots: dict[str, dict[date, set[str]]] = {index: {} for index in indices}
         for index_code, snapshot_date, stock_code in rows:
-            snapshots.setdefault(index_code, {}).setdefault(
-                snapshot_date, set()
-            ).add(stock_code)
+            snapshots.setdefault(index_code, {}).setdefault(snapshot_date, set()).add(
+                stock_code
+            )
 
         available_dates = {
             index: sorted(by_date) for index, by_date in snapshots.items()
@@ -1753,9 +1958,7 @@ class SqlStockRepository:
             StockValuation.indicator.in_(("pe_ttm", "pb", "total_mv")),
         )
         if as_of is not None:
-            latest_dates = latest_dates.where(
-                StockValuation.trade_date <= as_of
-            )
+            latest_dates = latest_dates.where(StockValuation.trade_date <= as_of)
         latest_dates = latest_dates.group_by(
             StockValuation.code, StockValuation.indicator
         ).subquery()
@@ -1817,19 +2020,14 @@ class SqlStockRepository:
 
                 research_root = Path(get_settings().research_data_dir)
             monthly_directory = (
-                research_root
-                / "tushare_snapshot"
-                / "global"
-                / "daily_basic_monthly"
+                research_root / "tushare_snapshot" / "global" / "daily_basic_monthly"
             )
             monthly_files = (
                 sorted(monthly_directory.glob("*.parquet"))
                 if self._external_snapshot_enabled
                 else []
             )
-            monthly_dates = [
-                _to_compact_date(path.stem) for path in monthly_files
-            ]
+            monthly_dates = [_to_compact_date(path.stem) for path in monthly_files]
             valid_monthly = [
                 (day, path)
                 for day, path in zip(monthly_dates, monthly_files, strict=True)
@@ -1840,14 +2038,15 @@ class SqlStockRepository:
             for as_of in requested_dates:
                 position = bisect_right(valid_days, as_of) - 1
                 if position >= 0:
-                    chosen_files.setdefault(
-                        valid_monthly[position][1], []
-                    ).append(as_of)
+                    chosen_files.setdefault(valid_monthly[position][1], []).append(
+                        as_of
+                    )
             wanted_codes = set(codes)
             for path, signal_days in chosen_files.items():
                 path_day = _to_compact_date(path.stem)
                 if path_day is None:
                     continue
+                self._record_file(path)
                 table = pq.read_table(
                     path,
                     columns=[
@@ -1928,7 +2127,59 @@ class SqlStockRepository:
                     raw_by_date[as_of][code] = values
                     raw_trade_dates[as_of][code] = _day
         except Exception:  # noqa: BLE001
-            logger.warning("读取 daily_basic PIT 估值失败，回退规范化估值表", exc_info=True)
+            logger.warning(
+                "读取 daily_basic PIT 估值失败，回退规范化估值表", exc_info=True
+            )
+
+        # trailing dividend yield 的分母必须是信号日当时可成交的 raw 收盘价。
+        prices_by_date: dict[date, dict[str, float]] = {
+            day: {} for day in requested_dates
+        }
+        dividend_coverage = {
+            code: self._stocktoday_file("dividend", code) is not None
+            for code in codes
+        }
+        from app.services.dividend_yield import (
+            calculate_trailing_dividend_yield,
+            load_normalized_dividend_events,
+        )
+
+        bars_by_code: dict[str, list[StockBar]] = {}
+        if requested_dates:
+            all_bars = self.daily_bars(
+                codes,
+                start=requested_dates[0] - timedelta(days=15),
+                end=requested_dates[-1],
+            )
+            for bar in all_bars:
+                if bar.close > 0:
+                    bars_by_code.setdefault(bar.code, []).append(bar)
+            for code, series in bars_by_code.items():
+                series.sort(key=lambda item: item.trade_date)
+                days = [item.trade_date for item in series]
+                for as_of in requested_dates:
+                    position = bisect_right(days, as_of) - 1
+                    if (
+                        position >= 0
+                        and (as_of - series[position].trade_date).days <= 15
+                    ):
+                        prices_by_date[as_of][code] = series[position].close
+        try:
+            all_dividend_events: list[object] = load_normalized_dividend_events(
+                self._db,  # type: ignore[arg-type]
+                codes=codes,
+                as_of=requested_dates[-1],
+                lookback_days=(
+                    365 + (requested_dates[-1] - requested_dates[0]).days
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("读取规范化分红主数据失败", exc_info=True)
+            all_dividend_events = []
+        dividend_events_by_code: dict[str, list[object]] = {}
+        for event in all_dividend_events:
+            event_code = str(getattr(event, "code", ""))
+            dividend_events_by_code.setdefault(event_code, []).append(event)
 
         for as_of in requested_dates:
             latest = self._valuation_latest(codes, as_of)
@@ -1937,11 +2188,7 @@ class SqlStockRepository:
                 raw = raw_by_date[as_of].get(code, {})
                 for field_name in ("pe_ttm", "pb"):
                     raw_value = raw.get(field_name)
-                    legacy_value = (
-                        entry[field_name][1]
-                        if field_name in entry
-                        else None
-                    )
+                    legacy_value = entry[field_name][1] if field_name in entry else None
                     if (
                         raw_value is not None
                         and legacy_value is not None
@@ -1956,35 +2203,49 @@ class SqlStockRepository:
                 pe = raw.get("pe_ttm") or (
                     entry["pe_ttm"][1] if "pe_ttm" in entry else None
                 )
-                pb_value = raw.get("pb") or (
-                    entry["pb"][1] if "pb" in entry else None
-                )
+                pb_value = raw.get("pb") or (entry["pb"][1] if "pb" in entry else None)
                 ep = 1.0 / pe if pe is not None and pe > 0 else None
-                bp = (
-                    1.0 / pb_value
-                    if pb_value is not None and pb_value > 0
-                    else None
+                bp = 1.0 / pb_value if pb_value is not None and pb_value > 0 else None
+                from app.services.financial_statement_quality import (
+                    market_cap_to_cny,
                 )
+
                 market_cap = (
-                    raw["total_mv"] * 10_000.0
+                    market_cap_to_cny(raw["total_mv"])
                     if "total_mv" in raw
-                    else entry["total_mv"][1] * 10_000.0
+                    else market_cap_to_cny(entry["total_mv"][1])
                     if "total_mv" in entry
                     else None
                 )
                 float_market_cap = (
-                    raw["circ_mv"] * 10_000.0 if "circ_mv" in raw else None
+                    market_cap_to_cny(raw["circ_mv"])
+                    if "circ_mv" in raw
+                    else None
                 )
                 sales_yield = (
                     1.0 / raw["ps_ttm"]
                     if raw.get("ps_ttm") is not None and raw["ps_ttm"] > 0
                     else None
                 )
-                dividend_yield = (
-                    raw["dv_ttm"] / 100.0
-                    if raw.get("dv_ttm") is not None
-                    else None
+                dividend_result = calculate_trailing_dividend_yield(
+                    dividend_events_by_code.get(code, []),
+                    code=code,
+                    as_of=as_of,
+                    price=prices_by_date[as_of].get(code),
+                    source_covered=dividend_coverage.get(code, False),
                 )
+                dividend_yield = dividend_result.value
+                # 规范化事件不可用时保留供应商直接计算值，但明确标记回退。
+                if (
+                    dividend_yield is None
+                    and raw.get("dv_ttm") is not None
+                ):
+                    dividend_yield = raw["dv_ttm"] / 100.0
+                    dividend_status = "provider_fallback"
+                    dividend_reason = "规范化事件或价格缺失，回退 daily_basic.dv_ttm"
+                else:
+                    dividend_status = dividend_result.status
+                    dividend_reason = dividend_result.reason
                 if (
                     ep is None
                     and bp is None
@@ -1995,9 +2256,7 @@ class SqlStockRepository:
                     continue
                 valuation_date = raw_trade_dates[as_of].get(code)
                 if valuation_date is None and entry:
-                    valuation_date = max(
-                        item[0] for item in entry.values()
-                    )
+                    valuation_date = max(item[0] for item in entry.values())
                 result.append(
                     Fundamentals(
                         code=code,
@@ -2010,6 +2269,10 @@ class SqlStockRepository:
                         float_market_cap=float_market_cap,
                         sales_yield=sales_yield,
                         dividend_yield=dividend_yield,
+                        dividend_yield_status=dividend_status,
+                        dividend_yield_reason=dividend_reason,
+                        dividend_event_count=dividend_result.event_count,
+                        dividend_source_hashes=dividend_result.source_hashes,
                     )
                 )
         if source_mismatch_counts:
@@ -2041,7 +2304,9 @@ class SqlStockRepository:
         if not codes:
             return []
 
-        stmt = select(StockFinancialIndicator).where(StockFinancialIndicator.code.in_(codes))
+        stmt = select(StockFinancialIndicator).where(
+            StockFinancialIndicator.code.in_(codes)
+        )
         rows = self._db.execute(stmt).scalars().all()  # type: ignore[attr-defined]
         disclosure = self._disclosure_map(codes)
 
@@ -2063,9 +2328,7 @@ class SqlStockRepository:
             debt_ratio = _payload_value(row.payload, _PAYLOAD_KEYS["debt_ratio"])
             net_profit = _payload_value(row.payload, _PAYLOAD_KEYS["net_profit"])
             ocf = _payload_value(row.payload, _PAYLOAD_KEYS["ocf"])
-            ocf_to_profit = _payload_value(
-                row.payload, _PAYLOAD_KEYS["ocf_to_profit"]
-            )
+            ocf_to_profit = _payload_value(row.payload, _PAYLOAD_KEYS["ocf_to_profit"])
             if (
                 ocf_to_profit is None
                 and ocf is not None
@@ -2101,6 +2364,17 @@ class SqlStockRepository:
         # 同一股票/报告期若主源存在，删除回退源对应期，避免回退源较晚的
         # 入库时间覆盖真实公告日；同时对关键字段差异做显式质量告警。
         primary = self._fundamentals_from_tushare(codes, as_of)
+        sector_metrics = self._financial_sector_metrics(codes, as_of)
+        primary = [
+            replace(
+                snapshot,
+                **sector_metrics.get(
+                    (snapshot.code, snapshot.period),
+                    {},
+                ),
+            )
+            for snapshot in primary
+        ]
         primary_periods = {
             (snapshot.code, snapshot.period)
             for snapshot in primary
@@ -2123,9 +2397,7 @@ class SqlStockRepository:
                     continue
                 difference = abs(selected - other) / abs(selected)
                 if difference > threshold:
-                    mismatch_counts[field_name] = (
-                        mismatch_counts.get(field_name, 0) + 1
-                    )
+                    mismatch_counts[field_name] = mismatch_counts.get(field_name, 0) + 1
         if mismatch_counts:
             logger.warning(
                 "财务跨源差异超过阈值（按字段主源 Tushare 取值）：%s",
@@ -2139,6 +2411,63 @@ class SqlStockRepository:
         result.extend(primary)
         result.sort(key=lambda snapshot: (snapshot.code, snapshot.available_at))
         return result
+
+    def _financial_sector_metrics(
+        self,
+        codes: list[str],
+        as_of: date | None,
+    ) -> dict[tuple[str, date | None], dict[str, object]]:
+        """读取监管/行业专用指标的不可变 PIT 规范记录。"""
+        from sqlalchemy import select
+
+        from app.models import QuantDataRecord
+
+        allowed = {
+            "bank_net_interest_margin",
+            "bank_npl_ratio",
+            "bank_provision_coverage_ratio",
+            "bank_capital_adequacy_ratio",
+            "bank_loan_deposit_ratio",
+            "broker_proprietary_risk_ratio",
+            "broker_leverage_ratio",
+            "broker_net_capital_ratio",
+            "insurance_solvency_ratio",
+            "insurance_combined_ratio",
+            "insurance_reserve_coverage_ratio",
+        }
+        statement = select(QuantDataRecord).where(
+            QuantDataRecord.dataset == "financial_sector_metric",
+            QuantDataRecord.code.in_(codes),
+        )
+        rows = self._db.scalars(statement).all()  # type: ignore[attr-defined]
+        latest: dict[
+            tuple[str, date], tuple[datetime, int, dict[str, object]]
+        ] = {}
+        for row in rows:
+            available = row.available_at
+            available_day = (
+                available.date() if isinstance(available, datetime) else available
+            )
+            if as_of is not None and available_day > as_of:
+                continue
+            payload = dict(row.payload or {})
+            key = (row.code, row.effective_date)
+            candidate = (
+                available,
+                row.id,
+                {
+                    **{
+                        field: _to_float(payload.get(field))
+                        for field in allowed
+                        if payload.get(field) is not None
+                    },
+                    "sector_metric_sources": (row.source_hash,),
+                },
+            )
+            previous = latest.get(key)
+            if previous is None or candidate[:2] > previous[:2]:
+                latest[key] = candidate
+        return {key: value[2] for key, value in latest.items()}
 
     def _fundamentals_from_tushare(
         self, codes: list[str], as_of: date | None
@@ -2159,7 +2488,10 @@ class SqlStockRepository:
                 "ann_date",
                 "f_ann_date",
                 "end_date",
+                "report_type",
                 "comp_type",
+                "end_type",
+                "update_flag",
                 "total_revenue",
                 "revenue",
                 "n_income_attr_p",
@@ -2169,16 +2501,30 @@ class SqlStockRepository:
                 "ann_date",
                 "f_ann_date",
                 "end_date",
+                "report_type",
+                "comp_type",
+                "end_type",
+                "update_flag",
                 "total_assets",
                 "total_liab",
                 "total_hldr_eqy_exc_min_int",
+                "total_hldr_eqy_inc_min_int",
+                "total_liab_hldr_eqy",
             ),
             "cashflow": (
                 "ann_date",
                 "f_ann_date",
                 "end_date",
+                "report_type",
+                "comp_type",
+                "end_type",
+                "update_flag",
                 "net_profit",
                 "n_cashflow_act",
+                "c_pay_acq_const_fiolta",
+                "n_incr_cash_cash_equ",
+                "c_cash_equ_beg_period",
+                "c_cash_equ_end_period",
                 "free_cashflow",
             ),
             "fina_indicator": (
@@ -2221,7 +2567,12 @@ class SqlStockRepository:
                     if current is None or available >= current[0]:
                         latest[period] = (available, row)
                 for period, (available, row) in latest.items():
-                    by_period.setdefault(period, {}).update(row)
+                    combined = by_period.setdefault(period, {})
+                    statement_rows = combined.setdefault(
+                        "_statement_rows", {}
+                    )
+                    statement_rows[dataset] = dict(row)  # type: ignore[index]
+                    combined.update(row)
                     available_by_period.setdefault(period, []).append(available)
             for period, row in by_period.items():
                 availability = available_by_period.get(period, [])
@@ -2255,6 +2606,14 @@ class SqlStockRepository:
                     if ocf is not None and net_income is not None and net_income > 0
                     else None
                 )
+                from app.services.financial_statement_quality import (
+                    assess_statement_bundle,
+                )
+
+                assessment = assess_statement_bundle(
+                    period=period,
+                    rows=dict(row.get("_statement_rows") or {}),
+                )
                 snapshots.append(
                     Fundamentals(
                         code=code,
@@ -2263,14 +2622,10 @@ class SqlStockRepository:
                         roe=roe / 100.0 if roe is not None else None,
                         roa=roa / 100.0 if roa is not None else None,
                         gross_margin=(
-                            gross_margin / 100.0
-                            if gross_margin is not None
-                            else None
+                            gross_margin / 100.0 if gross_margin is not None else None
                         ),
                         net_margin=(
-                            net_margin / 100.0
-                            if net_margin is not None
-                            else None
+                            net_margin / 100.0 if net_margin is not None else None
                         ),
                         ocf_to_profit=ocf_to_profit,
                         debt_ratio=(
@@ -2283,19 +2638,30 @@ class SqlStockRepository:
                         ),
                         net_income=net_income,
                         operating_cash_flow=ocf,
+                        capital_expenditure=_to_float(
+                            row.get("c_pay_acq_const_fiolta")
+                        ),
                         free_cash_flow=_to_float(row.get("free_cashflow")),
                         total_assets=total_assets,
-                        total_equity=_to_float(
-                            row.get("total_hldr_eqy_exc_min_int")
-                        ),
+                        total_equity=_to_float(row.get("total_hldr_eqy_exc_min_int")),
                         company_type=(
                             str(row.get("comp_type"))
                             if row.get("comp_type") is not None
                             else None
                         ),
+                        formal_factor_usable=assessment.formal_factor_usable,
+                        financial_quality_reasons=(
+                            assessment.errors + assessment.warnings
+                        ),
+                        unit_policy=assessment.unit_policy,
+                        flow_basis=assessment.flow_basis,
+                        audit_opinion=assessment.audit_opinion,
+                        correction_status=assessment.correction_status,
                     )
                 )
-        return snapshots
+        from app.services.financial_ttm import build_pit_ttm
+
+        return build_pit_ttm(snapshots)
 
     def _fundamentals_from_warehouse(
         self, codes: list[str], as_of: date | None
@@ -2356,6 +2722,164 @@ class SqlStockRepository:
         return result
 
     # ---- 指数基准 ----------------------------------------------------------
+
+    def _verify_governed_files(
+        self, source_files: tuple[str, ...], source_hashes: tuple[str, ...]
+    ) -> None:
+        from app.config import get_settings
+
+        root = self._root or Path(get_settings().research_data_dir)
+        file_hashes: set[str] = set()
+        for relative in source_files:
+            path = root / relative
+            if not path.is_file():
+                raise ValueError(f"受治理源文件不存在：{relative}")
+            self._record_file(path)
+            file_hashes.add(hashlib.sha256(path.read_bytes()).hexdigest())
+        if file_hashes != set(source_hashes):
+            raise ValueError("受治理源文件哈希与规范化记录不一致")
+
+    def index_weight_snapshot(
+        self, index_code: str, as_of: date
+    ) -> IndexWeightSnapshot:
+        """返回最新官方权重截面；缺失、权重和异常或源文件损坏均硬失败。"""
+        from sqlalchemy import func, select
+
+        from app.models import QuantDataRecord
+
+        prefix = f"{index_code}:%"
+        snapshot_date = self._db.scalar(  # type: ignore[attr-defined]
+            select(func.max(QuantDataRecord.effective_date)).where(
+                QuantDataRecord.dataset == "index_weight",
+                QuantDataRecord.code.like(prefix),
+                QuantDataRecord.effective_date <= as_of,
+                QuantDataRecord.available_at <= datetime.combine(as_of, time.max),
+            )
+        )
+        if snapshot_date is None:
+            raise ValueError(f"{index_code} 在 {as_of} 没有可用官方权重")
+        rows = list(
+            self._db.scalars(  # type: ignore[attr-defined]
+                select(QuantDataRecord)
+                .where(
+                    QuantDataRecord.dataset == "index_weight",
+                    QuantDataRecord.code.like(prefix),
+                    QuantDataRecord.effective_date == snapshot_date,
+                )
+                .order_by(QuantDataRecord.code, QuantDataRecord.imported_at)
+            ).all()
+        )
+        latest = {row.code: row for row in rows}
+        weights: list[tuple[str, float]] = []
+        for row in latest.values():
+            payload = dict(row.payload or {})
+            weight = _to_float(payload.get("weight_percent"))
+            stock_code = str(payload.get("stock_code") or "")
+            if not stock_code or weight is None or weight <= 0:
+                raise ValueError(f"{index_code} {snapshot_date} 存在无效成分权重")
+            weights.append((stock_code, weight))
+        expected_minimum = 280 if index_code == "000300" else 450
+        if len(weights) < expected_minimum:
+            raise ValueError(
+                f"{index_code} {snapshot_date} 仅 {len(weights)} 只成分，"
+                f"低于完整性门槛 {expected_minimum}"
+            )
+        weight_sum = sum(weight for _code, weight in weights)
+        if not 99.5 <= weight_sum <= 100.5:
+            raise ValueError(
+                f"{index_code} {snapshot_date} 权重和 {weight_sum:.6f}% 异常"
+            )
+        source_files = tuple(sorted({row.source_file for row in latest.values()}))
+        source_hashes = tuple(sorted({row.source_hash for row in latest.values()}))
+        self._verify_governed_files(source_files, source_hashes)
+        return IndexWeightSnapshot(
+            index_code=index_code,
+            as_of=as_of,
+            snapshot_date=snapshot_date,
+            weights=tuple(sorted(weights)),
+            weight_sum_percent=weight_sum,
+            source_files=source_files,
+            source_hashes=source_hashes,
+        )
+
+    def combined_csi800_weights(self, as_of: date) -> CombinedIndexWeights:
+        """用固定的 50% 沪深300 + 50% 中证500袖套合成透明比较权重。"""
+        components = tuple(
+            self.index_weight_snapshot(index_code, as_of)
+            for index_code in ("000300", "000905")
+        )
+        combined: dict[str, float] = {}
+        for snapshot in components:
+            normalizer = snapshot.weight_sum_percent
+            for code, weight_percent in snapshot.weights:
+                combined[code] = combined.get(code, 0.0) + (
+                    0.5 * weight_percent / normalizer
+                )
+        if abs(sum(combined.values()) - 1.0) > 1e-10:
+            raise ValueError("300+500 合成权重未归一到 100%")
+        return CombinedIndexWeights(
+            as_of=as_of,
+            method="equal_sleeve_50_50_official_weights_v1",
+            weights=tuple(sorted(combined.items())),
+            component_snapshots=components,
+        )
+
+    def benchmark_series(
+        self,
+        index_code: str,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> BenchmarkSeries | None:
+        """读取规范化官方基准并逐个校验版本化源文件哈希。"""
+        try:
+            from sqlalchemy import select
+
+            from app.models import QuantDataRecord
+
+            statement = select(QuantDataRecord).where(
+                QuantDataRecord.dataset == "index_total_return",
+                QuantDataRecord.code == index_code,
+            )
+            if start is not None:
+                statement = statement.where(QuantDataRecord.effective_date >= start)
+            if end is not None:
+                statement = statement.where(QuantDataRecord.effective_date <= end)
+            rows = list(
+                self._db.scalars(  # type: ignore[attr-defined]
+                    statement.order_by(
+                        QuantDataRecord.effective_date,
+                        QuantDataRecord.imported_at,
+                    )
+                ).all()
+            )
+            if not rows:
+                return None
+            latest = {row.effective_date: row for row in rows}
+            selected = [latest[day] for day in sorted(latest)]
+            source_files = tuple(sorted({row.source_file for row in selected}))
+            source_hashes = tuple(sorted({row.source_hash for row in selected}))
+            self._verify_governed_files(source_files, source_hashes)
+            points: list[tuple[date, float]] = []
+            for row in selected:
+                close = _to_float(dict(row.payload or {}).get("close"))
+                if close is None or close <= 0:
+                    raise ValueError(
+                        f"官方基准 {index_code} {row.effective_date} 点位无效"
+                    )
+                points.append((row.effective_date, close))
+            payload = dict(selected[-1].payload or {})
+            return BenchmarkSeries(
+                code=index_code,
+                name=str(payload.get("index_name") or index_code),
+                return_kind=str(payload.get("return_kind") or "unknown"),
+                points=tuple(points),
+                source=str(selected[-1].source),
+                source_files=source_files,
+                source_hashes=source_hashes,
+            )
+        except Exception:  # noqa: BLE001 - 正式调用方会按 required 硬失败
+            logger.warning("读取受治理官方基准失败", exc_info=True)
+            return None
 
     def index_bars(
         self,
