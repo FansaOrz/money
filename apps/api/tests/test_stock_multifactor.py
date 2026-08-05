@@ -1681,6 +1681,64 @@ def test_run_backtest_rejects_incomplete_historical_universe_data() -> None:
         )
 
 
+def test_historical_coverage_treats_suspension_as_known_not_missing() -> None:
+    """停牌造成的陈旧行情/估值不应伪报缺数，交易层仍负责排除不可交易股票。"""
+    day = START + timedelta(days=30)
+    active = StockBar(
+        code="600001",
+        trade_date=day,
+        open=10.0,
+        high=10.0,
+        low=10.0,
+        close=10.0,
+    )
+    suspended = StockBar(
+        code="600002",
+        trade_date=START,
+        open=20.0,
+        high=20.0,
+        low=20.0,
+        close=20.0,
+    )
+    panel = backtest.MarketPanel(
+        calendar=TradeCalendar((day,)),
+        bars_by_code={"600001": [active], "600002": [suspended]},
+        bar_lookup={"600001": {day: active}, "600002": {START: suspended}},
+        index_series=[],
+        industry_by_date={day: {"600001": "银行", "600002": "银行"}},
+    )
+    fundamentals = {
+        "600001": [
+            replace(_fundamentals("600001"), available_at=day, valuation_date=day)
+        ],
+        "600002": [
+            replace(
+                _fundamentals("600002"),
+                available_at=day,
+                valuation_date=START,
+            )
+        ],
+    }
+
+    summaries, minimum = backtest.validate_historical_universe_coverage(
+        {
+            day: UniverseMembership(
+                as_of=day,
+                members=frozenset({"600001", "600002"}),
+                snapshot_dates={"000300": day},
+            )
+        },
+        [_info("600001"), _info("600002")],
+        panel,
+        fundamentals,
+        1.0,
+    )
+
+    assert minimum == 1.0
+    assert "近10日成交1" in summaries[0]
+    assert "近10日估值1" in summaries[0]
+
+
 def test_run_backtest_no_repository() -> None:
     """仓储全部不可用（db=None、未注入）：BacktestError 明确提示。"""
     with pytest.raises(backtest.BacktestError, match="仓储不可用"):

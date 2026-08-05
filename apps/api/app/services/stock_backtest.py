@@ -3008,9 +3008,14 @@ def validate_historical_universe_coverage(
         if not members:
             raise BacktestError(f"{day.isoformat()} 历史指数股票池为空")
         recent_cutoff = day - timedelta(days=10)
-        daily = {
+        observed_daily = {
             code
             for code in members
+            if any(bar.trade_date <= day for bar in panel.bars_by_code.get(code, []))
+        }
+        recently_traded = {
+            code
+            for code in observed_daily
             if any(
                 recent_cutoff <= bar.trade_date <= day
                 for bar in panel.bars_by_code.get(code, [])
@@ -3029,6 +3034,7 @@ def validate_historical_universe_coverage(
         }
         financial: set[str] = set()
         valuation: set[str] = set()
+        fresh_valuation: set[str] = set()
         for code in members:
             for snapshot in fundamentals_by_code.get(code, []):
                 if snapshot.available_at > day:
@@ -3043,18 +3049,24 @@ def validate_historical_universe_coverage(
                     )
                 ):
                     financial.add(code)
-                if (snapshot.ep is not None or snapshot.bp is not None) and (
-                    snapshot.valuation_date is None
-                    or snapshot.valuation_date >= recent_cutoff
-                ):
+                if snapshot.ep is not None or snapshot.bp is not None:
                     valuation.add(code)
-        complete = daily & industry & financial & valuation
+                    if (
+                        snapshot.valuation_date is None
+                        or snapshot.valuation_date >= recent_cutoff
+                    ):
+                        fresh_valuation.add(code)
+        # 停牌股在信号日前可能超过十天没有成交，也不会产生新的日估值。
+        # 这属于“已知但不可交易”，不是数据缺失：完整性门禁检查是否存在
+        # 历史行情/估值，实际选股与成交层仍按 recently_traded 排除停牌标的。
+        complete = observed_daily & industry & financial & valuation
         ratio = len(complete) / len(members)
         minimum_observed = min(minimum_observed, ratio)
         summaries.append(
             f"{day.isoformat()} 完整 {len(complete)}/{len(members)}"
-            f"（日线{len(daily)}、行业{len(industry)}、财务{len(financial)}、"
-            f"估值{len(valuation)}）"
+            f"（历史日线{len(observed_daily)}、近10日成交{len(recently_traded)}、"
+            f"行业{len(industry)}、财务{len(financial)}、估值{len(valuation)}、"
+            f"近10日估值{len(fresh_valuation)}）"
         )
         if ratio + 1e-12 < minimum:
             raise BacktestError(
