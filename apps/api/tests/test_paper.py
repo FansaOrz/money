@@ -28,6 +28,7 @@ from app.models import (
     StrategyVersion,
 )
 from app.services import paper as paper_service
+from app.services import strategy_mandate
 from app.services.paper import PaperError
 
 BASE = date(2025, 1, 6)
@@ -131,6 +132,12 @@ def test_ensure_default_account_creates_with_defaults(db_session: Session) -> No
 
 
 def test_superseded_strategy_cannot_run(db_session: Session) -> None:
+    mandate = strategy_mandate.operational_validation_mandate(
+        strategy_name=paper_service.DEFAULT_STRATEGY_NAME,
+        initial_capital=1_000_000,
+        rebalance_days=20,
+        top_n=10,
+    )
     version = StrategyVersion(
         name=paper_service.DEFAULT_STRATEGY_NAME,
         initial_capital=Decimal("1000000"),
@@ -139,6 +146,8 @@ def test_superseded_strategy_cannot_run(db_session: Session) -> None:
         top_n=10,
         status="superseded_invalid_methodology",
         params={"superseded_reason": "旧方法失效"},
+        mandate=mandate,
+        mandate_sha256=strategy_mandate.mandate_sha256(mandate),
     )
     db_session.add(version)
     db_session.commit()
@@ -147,6 +156,12 @@ def test_superseded_strategy_cannot_run(db_session: Session) -> None:
 
 
 def test_v2_account_does_not_reuse_legacy_v1(db_session: Session) -> None:
+    mandate = strategy_mandate.operational_validation_mandate(
+        strategy_name=paper_service.LEGACY_STRATEGY_NAME,
+        initial_capital=1_000_000,
+        rebalance_days=20,
+        top_n=10,
+    )
     legacy = StrategyVersion(
         name=paper_service.LEGACY_STRATEGY_NAME,
         initial_capital=Decimal("1000000"),
@@ -155,6 +170,8 @@ def test_v2_account_does_not_reuse_legacy_v1(db_session: Session) -> None:
         top_n=10,
         status="superseded_invalid_methodology",
         params={"superseded_reason": "旧方法失效"},
+        mandate=mandate,
+        mandate_sha256=strategy_mandate.mandate_sha256(mandate),
     )
     db_session.add(legacy)
     db_session.flush()

@@ -19,13 +19,22 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from app.models import DataReadinessReport
 
 from app.services import stock_backtest as backtest
+from app.services import cash_ledger
+from app.services import corporate_actions
+from app.services import execution_calibration
 from app.services import stock_factors as factors
+from app.services import price_limit_rules
+from app.services import position_lots
 from app.services import stock_strategy as strategy
 from app.services.stock_repository import (
     CorporateAction,
@@ -107,6 +116,46 @@ def _fundamentals(
 
 def _info(code: str, industry: str = "银行", name: str | None = None) -> StockInfo:
     return StockInfo(code=code, name=name or f"股票{code}", industry=industry)
+
+
+def test_historical_readiness_is_persisted_per_signal_and_version(
+    db_session,
+) -> None:
+    code = "600001"
+    signal_day = START + timedelta(days=300)
+    bars = _make_bars(code, 301)
+    panel = backtest.MarketPanel(
+        calendar=TradeCalendar(tuple(bar.trade_date for bar in bars)),
+        bars_by_code={code: bars},
+        bar_lookup={code: {bar.trade_date: bar for bar in bars}},
+        index_series=[],
+    )
+    config = backtest.BacktestConfig(
+        start=signal_day,
+        end=signal_day,
+        candidate_codes=(code,),
+        strategy_name="readiness-test",
+        strategy_version_id=None,
+        data_snapshot_sha256="a" * 64,
+    )
+    result = backtest.persist_historical_readiness(
+        db_session,
+        config=config,
+        signal_days=[signal_day],
+        memberships={},
+        infos=[_info(code)],
+        panel=panel,
+        fundamentals_by_code={code: [_fundamentals(code)]},
+    )
+    assert result["reports"] == 1
+    report = db_session.scalar(select(DataReadinessReport))
+    assert report is not None and report.ready is True
+    assert report.data_snapshot_sha256 == "a" * 64
+    assert len(report.report_sha256) == 64
+    assert (
+        report.field_status["source_status"]["daily_data_date"]
+        == signal_day.isoformat()
+    )
 
 
 def _closes(days: int, growth: float = 0.001) -> list[float]:
@@ -223,7 +272,14 @@ def test_industry_neutral_zscore() -> None:
     """
     contexts = []
     for i, (code, roe) in enumerate(
-        [("b1", 0.20), ("b2", 0.15), ("b3", 0.10), ("u1", 0.06), ("u2", 0.05), ("u3", 0.04)]
+        [
+            ("b1", 0.20),
+            ("b2", 0.15),
+            ("b3", 0.10),
+            ("u1", 0.06),
+            ("u2", 0.05),
+            ("u3", 0.04),
+        ]
     ):
         industry = "银行" if code.startswith("b") else "公用"
         info = StockInfo(code=code, name=code, industry=industry)
@@ -233,7 +289,10 @@ def test_industry_neutral_zscore() -> None:
             fundamentals=(_fundamentals(code, roe=roe),),
         )
         contexts.append(ctx)
-    results = {r.code: r for r in factors.compute_cross_section(contexts, START + timedelta(days=300))}
+    results = {
+        r.code: r
+        for r in factors.compute_cross_section(contexts, START + timedelta(days=300))
+    }
     # 银行业最低 ROE（b3=0.10，仍高于公用全部）在行业内 z 为负
     assert results["b3"].zscores["roe"] is not None and results["b3"].zscores["roe"] < 0
     # 公用事业最高 ROE（u1=0.06）在行业内 z 为正
@@ -292,8 +351,15 @@ def test_universe_st_and_suspension_and_new_listing() -> None:
     suspended_bars = list(bars)
     last = suspended_bars[-1]
     suspended_bars[-1] = StockBar(
-        code=last.code, trade_date=last.trade_date, open=None, high=None,
-        low=None, close=last.close, volume=0.0, amount=0.0, suspended=True,
+        code=last.code,
+        trade_date=last.trade_date,
+        open=None,
+        high=None,
+        low=None,
+        close=last.close,
+        volume=0.0,
+        amount=0.0,
+        suspended=True,
     )
     suspended = strategy.filter_universe_stock(_info("600001"), suspended_bars, as_of)
     assert not suspended.passed and any("停牌" in r for r in suspended.reasons)
@@ -329,7 +395,11 @@ INDUSTRY_POOL = {
 
 def _scored_pool() -> tuple[list[factors.FactorResult], list[StockInfo]]:
     """构造两行业六只股票的复合分结果（银行略强）。"""
-    infos = [_info(code, industry) for industry, codes in INDUSTRY_POOL.items() for code in codes]
+    infos = [
+        _info(code, industry)
+        for industry, codes in INDUSTRY_POOL.items()
+        for code in codes
+    ]
     as_of = START + timedelta(days=300)
     contexts = []
     for i, info in enumerate(infos):
@@ -347,9 +417,7 @@ def _scored_pool() -> tuple[list[factors.FactorResult], list[StockInfo]]:
 def test_portfolio_industry_neutral_and_caps() -> None:
     """行业中性：两行业各 50% 份额（只数口径）；单股 ≤5% 截断；合计 ≤ 100%。"""
     scored, infos = _scored_pool()
-    plan = strategy.build_portfolio(
-        scored, infos, START + timedelta(days=300), top_n=6
-    )
+    plan = strategy.build_portfolio(scored, infos, START + timedelta(days=300), top_n=6)
     assert plan.target_weights
     assert all(w <= 0.05 + 1e-9 for w in plan.target_weights.values())
     assert plan.invested_weight <= 1.0 + 1e-9
@@ -369,9 +437,7 @@ def test_portfolio_top_n_and_ranking() -> None:
     """
     scored, infos = _scored_pool()
     ranked = sorted(scored, key=lambda item: item.composite, reverse=True)
-    plan = strategy.build_portfolio(
-        scored, infos, START + timedelta(days=300), top_n=2
-    )
+    plan = strategy.build_portfolio(scored, infos, START + timedelta(days=300), top_n=2)
     assert len(plan.target_weights) == 2
     assert set(plan.target_weights) == {ranked[0].code, ranked[1].code}
     # 两行业各占一席（行业内 z 使行业间可比，头部股得分接近）
@@ -384,10 +450,7 @@ def test_portfolio_top_n_and_ranking() -> None:
 
 def test_portfolio_redistributes_unused_industry_quota() -> None:
     """30 只分散标的有足够风险容量时，应接近满仓而非因未覆盖行业大量留现。"""
-    infos = [
-        _info(f"{600100 + index:06d}", f"行业{index // 3}")
-        for index in range(30)
-    ]
+    infos = [_info(f"{600100 + index:06d}", f"行业{index // 3}") for index in range(30)]
     scored = [
         factors.FactorResult(
             code=info.code,
@@ -425,12 +488,8 @@ def test_portfolio_swaps_same_industry_candidates_to_meet_style_limits() -> None
                 name=info.name,
                 industry=info.industry,
                 composite=float(40 - index),
-                market_cap=(
-                    100_000_000_000.0 if alternate else 1_000_000_000.0
-                ),
-                float_market_cap=(
-                    100_000_000_000.0 if alternate else 1_000_000_000.0
-                ),
+                market_cap=(100_000_000_000.0 if alternate else 1_000_000_000.0),
+                float_market_cap=(100_000_000_000.0 if alternate else 1_000_000_000.0),
                 size_exposure=1.0 if alternate else -1.0,
                 beta_exposure=0.0,
                 liquidity_exposure=0.0,
@@ -471,9 +530,16 @@ def test_price_limit_blocks_and_defers() -> None:
     bars = _make_bars(code, 320, 0.0005)
     t1 = bars[301]
     bars[301] = StockBar(
-        code=code, trade_date=t1.trade_date, open=t1.open, high=t1.high,
-        low=t1.low, close=t1.close, volume=1e6, amount=1e8,
-        suspended=False, raw_return=0.099,
+        code=code,
+        trade_date=t1.trade_date,
+        open=t1.open,
+        high=t1.high,
+        low=t1.low,
+        close=t1.close,
+        volume=1e6,
+        amount=1e8,
+        suspended=False,
+        raw_return=0.099,
     )
     calendar_days = [bar.trade_date for bar in bars[300:308]]
     panel = backtest.MarketPanel(
@@ -499,14 +565,84 @@ def test_price_limit_blocks_and_defers() -> None:
     first_buy = next(fill for fill in detail.fills if fill.action == "buy")
     assert first_buy.fill_date > bars[301].trade_date
     assert first_buy.shares % 100 == 0
+    assert first_buy.arrival_price is not None
+    assert first_buy.decision_price is not None
+    assert first_buy.market_vwap is not None
+    assert first_buy.participation_rate is not None
+    assert first_buy.implementation_shortfall is not None
+    assert first_buy.liquidity_adv == pytest.approx(1_000_000.0)
+    assert first_buy.execution_session == "open"
+    assert first_buy.slippage_model_version == "OPEN_ADV_SQRT_V1"
     assert code in detail.blocked_codes
+
+
+def test_long_suspension_expires_order_at_fixed_ttl_with_audit() -> None:
+    code = "600001"
+    bars = _make_bars(code, 292, 0.0005)
+    for index in range(281, 289):
+        bars[index] = replace(bars[index], suspended=True)
+    calendar_days = [bar.trade_date for bar in bars[280:290]]
+    panel = backtest.MarketPanel(
+        calendar=TradeCalendar(tuple(calendar_days)),
+        bars_by_code={code: bars},
+        bar_lookup={code: {bar.trade_date: bar for bar in bars}},
+        index_series=[],
+    )
+    policy = backtest.order_lifecycle.OrderLifecyclePolicy(
+        ttl_trading_days=5,
+        max_attempts=5,
+        signal_decay_per_attempt=0.10,
+        max_price_deviation=0.15,
+    )
+    decayed_target, strength = backtest.order_lifecycle.decayed_target_weight(
+        current_weight=0.10,
+        original_target_weight=0.20,
+        attempts_before_execution=2,
+        policy=policy,
+    )
+    assert strength == pytest.approx(0.80)
+    assert decayed_target == pytest.approx(0.18)
+    cancel, deviation = backtest.order_lifecycle.should_cancel_for_price_deviation(
+        10.0, 12.0, policy
+    )
+    assert cancel is True
+    assert deviation == pytest.approx(0.20)
+    assert backtest.order_lifecycle.opportunity_cost(
+        side="buy",
+        unfilled_shares=100,
+        decision_price=10.0,
+        current_price=12.0,
+    )["adverse_opportunity_cost"] == pytest.approx(200.0)
+    outcome = backtest.run_backtest_panel(
+        panel,
+        [_info(code)],
+        {code: [_fundamentals(code)]},
+        backtest.BacktestConfig(
+            start=calendar_days[0],
+            end=calendar_days[-1],
+            initial_capital=1_000_000.0,
+            top_n=1,
+            max_stock_weight=0.05,
+            initial_signal=True,
+            order_policy=policy,
+        ),
+    )
+    detail = outcome.rebalances[0]
+    assert not detail.fills
+    expired = [event for event in detail.order_events if event["status"] == "expired"]
+    assert len(expired) == 1
+    assert expired[0]["attempts"] == 5
+    assert expired[0]["order_lifecycle_version"] == policy.version
+    assert "最大重试" in expired[0]["reason"]
 
 
 def test_fee_model_min_commission_and_stamp_tax() -> None:
     """费用口径：佣金双边最低 5 元，印花税仅卖出，滑点双边。"""
     cost = backtest.CostModel(
-        commission_rate=0.00025, min_commission=5.0,
-        stamp_tax_rate=0.0005, slippage_rate=0.001,
+        commission_rate=0.00025,
+        min_commission=5.0,
+        stamp_tax_rate=0.0005,
+        slippage_rate=0.001,
     )
     # 小额买入：0.00025×10000=2.5 < 5 → 最低 5 元，无印花税
     assert backtest.trade_fee("buy", 10_000.0, cost) == pytest.approx(5.0)
@@ -514,18 +650,456 @@ def test_fee_model_min_commission_and_stamp_tax() -> None:
     assert backtest.trade_fee("sell", 100_000.0, cost) == pytest.approx(75.0)
 
     bar = StockBar(
-        code="600001", trade_date=START, open=10.0, high=10.1,
-        low=9.9, close=10.0, volume=1e6, amount=1e7,
+        code="600001",
+        trade_date=START,
+        open=10.0,
+        high=10.1,
+        low=9.9,
+        close=10.0,
+        volume=1e6,
+        amount=1e7,
     )
     assert backtest.trade_price(bar, "buy", 0.001) == pytest.approx(10.01)
     assert backtest.trade_price(bar, "sell", 0.001) == pytest.approx(9.99)
     low_impact = backtest.trade_price(
-        bar, "buy", 0.001, shares=1_000, market_impact_coefficient=0.01
+        bar,
+        "buy",
+        0.001,
+        shares=1_000,
+        market_impact_coefficient=0.01,
+        available_volume=1_000_000,
     )
     high_impact = backtest.trade_price(
-        bar, "buy", 0.001, shares=100_000, market_impact_coefficient=0.01
+        bar,
+        "buy",
+        0.001,
+        shares=100_000,
+        market_impact_coefficient=0.01,
+        available_volume=1_000_000,
     )
     assert high_impact > low_impact > 10.01
+
+
+def test_execution_cost_scenarios_and_calibration_are_auditable() -> None:
+    scenarios = backtest.cost_scenarios(backtest.CostModel())
+    assert set(scenarios) == {
+        "optimistic",
+        "baseline",
+        "conservative",
+        "extreme",
+    }
+    assert (
+        scenarios["optimistic"].market_impact_coefficient
+        < scenarios["baseline"].market_impact_coefficient
+        < scenarios["conservative"].market_impact_coefficient
+        < scenarios["extreme"].market_impact_coefficient
+    )
+
+    observations = []
+    for index, (participation, volatility) in enumerate(
+        ((0.0025, 0.01), (0.01, 0.03), (0.04, 0.015), (0.09, 0.04))
+    ):
+        shortfall = 0.001 + 0.02 * participation**0.5 + 0.10 * volatility
+        observations.append(
+            execution_calibration.ExecutionObservation(
+                code="600001" if index % 2 == 0 else "300001",
+                trade_date=START + timedelta(days=index),
+                side="buy" if index < 2 else "sell",
+                implementation_shortfall=shortfall,
+                participation_rate=participation,
+                recent_volatility=volatility,
+                liquidity_adv=500_000.0 * (10**index),
+                execution_session="open",
+            )
+        )
+    result = execution_calibration.calibrate_observations(observations)
+    assert result["status"] == "calibrated"
+    assert result["sample_size"] == 4
+    assert result["market_impact_coefficient"] == pytest.approx(0.02)
+    assert result["volatility_slippage_coefficient"] == pytest.approx(0.10)
+    assert result["calibration_mae"] == pytest.approx(0.0, abs=1e-12)
+    assert sum(group["sample_size"] for group in result["groups"].values()) == 4
+
+
+def test_cash_ledger_interest_freeze_receivable_and_settlement_conserve() -> None:
+    ledger = cash_ledger.CashLedger(
+        available=100_000.0,
+        settled=100_000.0,
+    )
+    interest = ledger.accrue_interest(
+        START,
+        calendar_days=3,
+    )
+    assert interest == pytest.approx(16.44)
+    ledger.recognize_receivable(START, 100.0, "dividend:test")
+    ledger.settle_receivable(START, 100.0, "dividend:test")
+    ledger.reserve(START, 10_005.0, "buy:test")
+    assert ledger.frozen == pytest.approx(10_005.0)
+    ledger.consume_reservation(START, 10_005.0, "buy:test", fee=5.0)
+    ledger.receive_cash(
+        START,
+        9_990.0,
+        "sell:test",
+        settled=False,
+        event_type="stock_sale_proceeds",
+        fee=10.0,
+    )
+    assert ledger.available > ledger.settled
+    ledger.settle_sale_proceeds(
+        START + timedelta(days=1),
+        9_990.0,
+        "sell:test",
+    )
+    ledger.assert_conserved()
+    audit = ledger.conservation()
+    assert audit["conservation_error"] == pytest.approx(0.0)
+    assert audit["closing"]["frozen"] == pytest.approx(0.0)
+    assert {item["event_type"] for item in audit["events"]} >= {
+        "cash_interest",
+        "receivable_recognized",
+        "receivable_settled",
+        "buy_order_frozen",
+        "buy_order_settled",
+        "stock_sale_proceeds",
+        "sale_proceeds_settled",
+    }
+
+
+def test_open_execution_uses_only_prior_adv_and_never_close_fallback() -> None:
+    days = [START + timedelta(days=index) for index in range(6)]
+    history = [
+        StockBar(
+            code="600001",
+            trade_date=day,
+            open=10.0,
+            high=10.1,
+            low=9.9,
+            close=10.0,
+            volume=1_000_000.0,
+        )
+        for day in days[:5]
+    ]
+    low_close_volume = StockBar(
+        code="600001",
+        trade_date=days[-1],
+        open=10.0,
+        high=10.1,
+        low=9.9,
+        close=10.0,
+        volume=1.0,
+    )
+    high_close_volume = replace(low_close_volume, volume=1_000_000_000.0)
+    assert backtest.prior_adv_volume(
+        history + [low_close_volume], days[-1]
+    ) == backtest.prior_adv_volume(history + [high_close_volume], days[-1])
+    adv = backtest.prior_adv_volume(history, days[-1])
+    assert backtest.trade_price(
+        low_close_volume,
+        "buy",
+        0.001,
+        shares=10_000,
+        available_volume=adv,
+        market_impact_coefficient=0.01,
+    ) == backtest.trade_price(
+        high_close_volume,
+        "buy",
+        0.001,
+        shares=10_000,
+        available_volume=adv,
+        market_impact_coefficient=0.01,
+    )
+
+    missing_open = replace(low_close_volume, open=None, close=99.0)
+    assert not backtest.can_trade(missing_open, 10.0, "buy", 0.98, code="600001")[0]
+    with pytest.raises(backtest.BacktestError, match="禁止回退"):
+        backtest.trade_price(missing_open, "buy", 0.001)
+
+
+def test_historical_fee_schedule_changes_on_policy_effective_dates() -> None:
+    cost = backtest.CostModel(
+        commission_rate=0.00025,
+        min_commission=5.0,
+        stamp_tax_rate=0.0005,
+    )
+    before_stamp_cut = backtest.trade_fee_breakdown(
+        "sell",
+        100_000.0,
+        cost,
+        code="600001",
+        trade_date=date(2023, 8, 25),
+        shares=10_000,
+    )
+    after_stamp_cut = backtest.trade_fee_breakdown(
+        "sell",
+        100_000.0,
+        cost,
+        code="600001",
+        trade_date=date(2023, 8, 28),
+        shares=10_000,
+    )
+    assert before_stamp_cut.commission == pytest.approx(25.0)
+    assert before_stamp_cut.stamp_tax == pytest.approx(100.0)
+    assert before_stamp_cut.transfer_fee == pytest.approx(1.0)
+    assert after_stamp_cut.stamp_tax == pytest.approx(50.0)
+    assert before_stamp_cut.total - after_stamp_cut.total == pytest.approx(50.0)
+    before_transfer_cut = backtest.trade_fee_breakdown(
+        "buy",
+        100_000.0,
+        cost,
+        code="000001",
+        trade_date=date(2022, 4, 28),
+        shares=10_000,
+    )
+    after_transfer_cut = backtest.trade_fee_breakdown(
+        "buy",
+        100_000.0,
+        cost,
+        code="000001",
+        trade_date=date(2022, 4, 29),
+        shares=10_000,
+    )
+    assert before_transfer_cut.transfer_fee == pytest.approx(2.0)
+    assert after_transfer_cut.transfer_fee == pytest.approx(1.0)
+    assert before_transfer_cut.rule_version != after_transfer_cut.rule_version
+
+
+def test_price_limit_rule_golden_boundaries() -> None:
+    legacy_chinext = price_limit_rules.price_limit_rule(
+        "300001", date(2020, 8, 21), st=False, listing_session=100
+    )
+    registered_chinext = price_limit_rules.price_limit_rule(
+        "300001", date(2020, 8, 24), st=False, listing_session=100
+    )
+    assert legacy_chinext.upper_limit == 0.10
+    assert registered_chinext.upper_limit == 0.20
+    assert (
+        price_limit_rules.price_limit_rule(
+            "688001", date(2024, 1, 2), st=False, listing_session=5
+        ).upper_limit
+        is None
+    )
+    assert (
+        price_limit_rules.price_limit_rule(
+            "688001", date(2024, 1, 3), st=False, listing_session=6
+        ).upper_limit
+        == 0.20
+    )
+    assert (
+        price_limit_rules.price_limit_rule(
+            "830001", date(2024, 1, 2), st=False, listing_session=1
+        ).upper_limit
+        is None
+    )
+    assert (
+        price_limit_rules.price_limit_rule(
+            "830001", date(2024, 1, 3), st=False, listing_session=2
+        ).upper_limit
+        == 0.30
+    )
+    main_ipo = price_limit_rules.price_limit_rule(
+        "600001", date(2018, 1, 2), st=False, listing_session=1
+    )
+    assert (main_ipo.upper_limit, main_ipo.lower_limit) == (0.44, 0.36)
+    assert (
+        price_limit_rules.price_limit_rule(
+            "600001", date(2024, 1, 2), st=True, listing_session=100
+        ).upper_limit
+        == 0.05
+    )
+
+    before = StockBar(
+        code="300001",
+        trade_date=date(2020, 8, 21),
+        open=11.5,
+        high=11.6,
+        low=11.4,
+        close=11.5,
+        raw_return=0.15,
+    )
+    after = replace(before, trade_date=date(2020, 8, 24))
+    assert not backtest.can_trade(
+        before,
+        10.0,
+        "buy",
+        0.98,
+        code="300001",
+        listing_session=100,
+    )[0]
+    assert backtest.can_trade(
+        after,
+        10.0,
+        "buy",
+        0.98,
+        code="300001",
+        listing_session=100,
+    )[0]
+
+
+def test_unknown_delisting_is_restricted_not_last_close_liquidated() -> None:
+    unknown = corporate_actions.resolve_terminal(
+        terminal_type="unknown",
+        terminal_price=10.0,  # 即便碰巧有最后收盘价也不得使用
+        consideration_status="unknown",
+    )
+    assert unknown.action == "restrict_asset"
+    assert unknown.cash_per_share == 0.0
+    assert unknown.restricted_value_per_share == 0.0
+    assert unknown.requires_manual_review is True
+
+    official = corporate_actions.resolve_terminal(
+        terminal_type="cash_liquidation",
+        terminal_price=8.0,
+        consideration_status="official",
+    )
+    assert official.action == "cash_settlement"
+    assert official.cash_per_share == 8.0
+    assert official.requires_manual_review is False
+
+    code = "600001"
+    days = [START + timedelta(days=index) for index in range(306)]
+    bars = _make_bars(code, len(days), growth=0.0, start_close=10.0)
+    action_day = days[303]
+    panel = backtest.MarketPanel(
+        calendar=TradeCalendar(tuple(days)),
+        bars_by_code={code: bars},
+        bar_lookup={code: {bar.trade_date: bar for bar in bars}},
+        index_series=[],
+        corporate_actions_by_date={
+            action_day: (
+                CorporateAction(
+                    code=code,
+                    action_date=action_day,
+                    kind="terminal",
+                    terminal_price=10.0,
+                    terminal_type="unknown",
+                    consideration_status="unknown",
+                    event_key="unknown-delist",
+                    source="unverified-last-close",
+                ),
+            )
+        },
+    )
+    outcome = backtest.run_backtest_panel(
+        panel,
+        [_info(code)],
+        {code: [_fundamentals(code)]},
+        backtest.BacktestConfig(
+            start=days[300],
+            end=days[-1],
+            initial_signal=True,
+            top_n=1,
+            max_stock_weight=1.0,
+            max_industry_weight=1.0,
+            max_volume_participation=1.0,
+        ),
+    )
+    assert outcome.final_value < 10_000
+    assert any("退市持仓转为受限资产" in item for item in outcome.warnings)
+
+
+def test_dividend_tax_fifo_holding_period_and_policy_boundaries() -> None:
+    sale_day = date(2025, 2, 10)
+    entitlement = sale_day - timedelta(days=5)
+    lots = [
+        position_lots.PositionLot(
+            lot_id="short",
+            acquired_date=sale_day - timedelta(days=10),
+            sellable_date=sale_day - timedelta(days=9),
+            shares=100,
+            total_cost=1_000,
+            source="test",
+        ),
+        position_lots.PositionLot(
+            lot_id="medium",
+            acquired_date=sale_day - timedelta(days=100),
+            sellable_date=sale_day - timedelta(days=99),
+            shares=100,
+            total_cost=1_000,
+            source="test",
+        ),
+        position_lots.PositionLot(
+            lot_id="long",
+            acquired_date=sale_day - timedelta(days=400),
+            sellable_date=sale_day - timedelta(days=399),
+            shares=100,
+            total_cost=1_000,
+            source="test",
+        ),
+    ]
+    claims = corporate_actions.create_dividend_tax_claims(
+        code="600001",
+        event_key="dividend-tax",
+        entitlement_date=entitlement,
+        gross_cash_per_share=1.0,
+        lots=lots,
+    )
+    due, details = corporate_actions.realize_dividend_tax(
+        claims=claims,
+        consumed_lots=[
+            {
+                "lot_id": lot.lot_id,
+                "shares": lot.shares,
+            }
+            for lot in lots
+        ],
+        sale_date=sale_day,
+    )
+    assert due == pytest.approx(30.0)
+    assert [item["tax_rate"] for item in details] == [0.20, 0.10, 0.0]
+    assert all(
+        item["rule_version"] == "CN_LISTED_DIVIDEND_TAX_2015" for item in details
+    )
+    assert corporate_actions.dividend_tax_rate(
+        acquired_date=date(2013, 1, 1),
+        sale_date=date(2014, 2, 1),
+        entitlement_date=date(2014, 1, 1),
+    )[0] == pytest.approx(0.05)
+
+
+def test_rights_policy_and_fractional_conversion_are_reproducible() -> None:
+    maintain = corporate_actions.decide_rights_issue(
+        held_shares=1_000,
+        subscription_ratio=0.5,
+        subscription_price=8.0,
+        available_cash=2_000,
+        portfolio_value=20_000,
+        rights_tradable=True,
+        right_market_price=0.5,
+    )
+    assert maintain.requested_shares == 500
+    assert maintain.subscribed_shares == 50
+    assert maintain.sold_rights == 450
+    assert maintain.rights_sale_cash == pytest.approx(225.0)
+    decline = corporate_actions.decide_rights_issue(
+        held_shares=1_000,
+        subscription_ratio=0.5,
+        subscription_price=8.0,
+        available_cash=2_000,
+        portfolio_value=20_000,
+        rights_tradable=False,
+        right_market_price=None,
+        policy=corporate_actions.RightsDecisionPolicy(mode="decline"),
+    )
+    assert decline.subscribed_shares == 0
+    assert decline.lapsed_rights == 500
+
+    conversion = corporate_actions.convert_registered_shares(
+        raw_shares=100.75,
+        cash_compensation_per_fraction=10.0,
+    )
+    assert conversion.registered_shares == 100
+    assert conversion.fractional_shares == pytest.approx(0.75)
+    assert conversion.cash_compensation == pytest.approx(7.5)
+    assert (
+        conversion.registered_shares * 10 + conversion.cash_compensation
+        == pytest.approx(100.75 * 10)
+    )
+    restricted = corporate_actions.convert_registered_shares(
+        raw_shares=100.75,
+        cash_compensation_per_fraction=None,
+    )
+    assert restricted.cash_compensation == 0
+    assert restricted.restricted_fractional_value == pytest.approx(0.75)
 
 
 def test_corporate_action_preserves_raw_price_portfolio_value() -> None:
@@ -654,9 +1228,7 @@ def test_share_merger_converts_position_to_successor() -> None:
     ratio = 0.5
     days = [START + timedelta(days=index) for index in range(306)]
     old_bars = _make_bars(old_code, len(days), growth=0.0, start_close=10.0)
-    successor_bars = _make_bars(
-        successor, len(days), growth=0.0, start_close=20.0
-    )
+    successor_bars = _make_bars(successor, len(days), growth=0.0, start_close=20.0)
     action_day = days[303]
     panel = backtest.MarketPanel(
         calendar=TradeCalendar(tuple(days)),
@@ -701,8 +1273,15 @@ def test_share_merger_converts_position_to_successor() -> None:
 def test_suspension_blocks_trade() -> None:
     """停牌不可成交（买卖双向）。"""
     suspended_bar = StockBar(
-        code="600001", trade_date=START, open=None, high=None, low=None,
-        close=10.0, volume=0.0, amount=0.0, suspended=True,
+        code="600001",
+        trade_date=START,
+        open=None,
+        high=None,
+        low=None,
+        close=10.0,
+        volume=0.0,
+        amount=0.0,
+        suspended=True,
     )
     ok, reason = backtest.can_trade(suspended_bar, 10.0, "buy", 0.098)
     assert not ok and "停牌" in reason
@@ -725,9 +1304,7 @@ def test_real_limit_prices_override_close_return_inference() -> None:
         up_limit=11.0,
         down_limit=9.0,
     )
-    ok, _reason = backtest.can_trade(
-        opened_normally, 10.0, "buy", 0.98
-    )
+    ok, _reason = backtest.can_trade(opened_normally, 10.0, "buy", 0.98)
     assert ok
 
     opened_at_limit = StockBar(
@@ -755,9 +1332,14 @@ def test_backtest_flat_market_deterministic() -> None:
     bars_by_code = {
         code: [
             StockBar(
-                code=code, trade_date=calendar_days[i], open=panels[code][i],
-                high=panels[code][i], low=panels[code][i], close=panels[code][i],
-                volume=1e6, amount=1e8,
+                code=code,
+                trade_date=calendar_days[i],
+                open=panels[code][i],
+                high=panels[code][i],
+                low=panels[code][i],
+                close=panels[code][i],
+                volume=1e6,
+                amount=1e8,
             )
             for i in range(days)
         ]
@@ -772,8 +1354,10 @@ def test_backtest_flat_market_deterministic() -> None:
         index_series=[],
     )
     config = backtest.BacktestConfig(
-        start=calendar_days[200], end=calendar_days[-1],
-        initial_capital=1_000_000.0, top_n=2,
+        start=calendar_days[200],
+        end=calendar_days[-1],
+        initial_capital=1_000_000.0,
+        top_n=2,
     )
     infos = [_info(code) for code in codes]
     fundamentals_by_code = {code: [_fundamentals(code)] for code in codes}
@@ -801,12 +1385,13 @@ def test_backtest_no_lookahead() -> None:
 
     infos = [_info(code) for code in codes]
     fundamentals_by_code = {
-        code: [_fundamentals(code, roe=0.15 - 0.01 * i)]
-        for i, code in enumerate(codes)
+        code: [_fundamentals(code, roe=0.15 - 0.01 * i)] for i, code in enumerate(codes)
     }
     config = backtest.BacktestConfig(
-        start=calendar_days[0], end=calendar_days[-1],
-        initial_capital=1_000_000.0, top_n=2,
+        start=calendar_days[0],
+        end=calendar_days[-1],
+        initial_capital=1_000_000.0,
+        top_n=2,
     )
     last_signal = max(
         detail_day
@@ -838,10 +1423,15 @@ def test_backtest_no_lookahead() -> None:
     for code in codes:
         tampered[code] = [
             StockBar(
-                code=bar.code, trade_date=bar.trade_date, open=bar.open,
-                high=bar.high, low=bar.low,
+                code=bar.code,
+                trade_date=bar.trade_date,
+                open=bar.open,
+                high=bar.high,
+                low=bar.low,
                 close=bar.close * 3.0 if bar.trade_date > last_signal else bar.close,
-                volume=bar.volume, amount=bar.amount, suspended=bar.suspended,
+                volume=bar.volume,
+                amount=bar.amount,
+                suspended=bar.suspended,
             )
             for bar in tampered[code]
         ]
@@ -859,7 +1449,9 @@ def test_validation_stats_rank_ic() -> None:
         (d1, {"a": 3.0, "b": 2.0, "c": 1.0, "d": 0.5, "e": 0.1, "f": -1.0}),
         (d2, {"a": 3.0, "b": 2.0, "c": 1.0, "d": 0.5, "e": 0.1, "f": -1.0}),
     ]
-    forwards = [(d1, {"a": 0.30, "b": 0.20, "c": 0.10, "d": 0.05, "e": 0.01, "f": -0.10})]
+    forwards = [
+        (d1, {"a": 0.30, "b": 0.20, "c": 0.10, "d": 0.05, "e": 0.01, "f": -0.10})
+    ]
     result = backtest.validation_stats(scores, forwards)
     assert result["rank_ic_mean"] == pytest.approx(1.0)
     assert result["rank_ic_count"] == 1
@@ -869,7 +1461,9 @@ def test_validation_stats_rank_ic() -> None:
 
     # 不能把两个各6只的横截面池化成12只后分档；每期不足10只仍不产出。
     d3 = date(2025, 3, 31)
-    scores3 = scores + [(d3, {"a": 3.0, "b": 2.0, "c": 1.0, "d": 0.5, "e": 0.1, "f": -1.0})]
+    scores3 = scores + [
+        (d3, {"a": 3.0, "b": 2.0, "c": 1.0, "d": 0.5, "e": 0.1, "f": -1.0})
+    ]
     forwards2 = [
         (d1, {"a": 0.30, "b": 0.20, "c": 0.10, "d": 0.05, "e": 0.01, "f": -0.10}),
         (d2, {"a": 0.28, "b": 0.18, "c": 0.09, "d": 0.04, "e": 0.02, "f": -0.08}),
@@ -880,15 +1474,9 @@ def test_validation_stats_rank_ic() -> None:
 
     # 每期分别有10只：逐期分档后再汇总，spread 为正。
     codes = [f"s{index}" for index in range(10)]
-    period_scores = {
-        code: float(index) for index, code in enumerate(codes)
-    }
-    period_returns_1 = {
-        code: index / 100.0 for index, code in enumerate(codes)
-    }
-    period_returns_2 = {
-        code: index / 120.0 for index, code in enumerate(codes)
-    }
+    period_scores = {code: float(index) for index, code in enumerate(codes)}
+    period_returns_1 = {code: index / 100.0 for index, code in enumerate(codes)}
+    period_returns_2 = {code: index / 120.0 for index, code in enumerate(codes)}
     result3 = backtest.validation_stats(
         [(d1, period_scores), (d2, period_scores), (d3, period_scores)],
         [(d1, period_returns_1), (d2, period_returns_2)],
@@ -925,9 +1513,7 @@ class MockRepository:
         return [info for info in self._infos if info.code in wanted]
 
     def trade_calendar(self, start: date | None, end: date | None) -> TradeCalendar:
-        days = sorted(
-            {bar.trade_date for bars in self._bars.values() for bar in bars}
-        )
+        days = sorted({bar.trade_date for bars in self._bars.values() for bar in bars})
         if start is not None:
             days = [d for d in days if d >= start]
         if end is not None:
@@ -1005,8 +1591,11 @@ def test_run_backtest_with_mock_repository() -> None:
         index=[(START + timedelta(days=i), 4000.0 * (1.0003**i)) for i in range(days)],
     )
     config = backtest.BacktestConfig(
-        start=START, end=START + timedelta(days=days - 1),
-        initial_capital=1_000_000.0, top_n=2, benchmark_index="CSI300",
+        start=START,
+        end=START + timedelta(days=days - 1),
+        initial_capital=1_000_000.0,
+        top_n=2,
+        benchmark_index="CSI300",
     )
     outcome = backtest.run_backtest(config=config, repository=repo)
     assert outcome.benchmark_kind == "index:CSI300"
@@ -1131,21 +1720,39 @@ def test_board_and_price_limit_rules() -> None:
 def test_one_word_limit_detection() -> None:
     """一字板：振幅≈0 且触板（法定板幅 ±ε 带内）；有振幅或非触板不算。"""
     flat = StockBar(
-        code="600001", trade_date=START, open=11.0, high=11.0, low=11.0,
-        close=11.0, volume=1e6, amount=1e7,
+        code="600001",
+        trade_date=START,
+        open=11.0,
+        high=11.0,
+        low=11.0,
+        close=11.0,
+        volume=1e6,
+        amount=1e7,
     )
     # limit 参数为法定板幅（主板 10%）：+10.0% 触板 + 零振幅 → 一字
     assert one_word_limit(flat, 0.10, 0.10)
     assert one_word_limit(flat, 0.0999, 0.10)  # 容忍带（±2‰×板幅）内仍视为一字
     ranged = StockBar(
-        code="600001", trade_date=START, open=10.5, high=11.0, low=10.2,
-        close=11.0, volume=1e6, amount=1e7,
+        code="600001",
+        trade_date=START,
+        open=10.5,
+        high=11.0,
+        low=10.2,
+        close=11.0,
+        volume=1e6,
+        amount=1e7,
     )
     assert not one_word_limit(ranged, 0.10, 0.10)  # 有振幅：非一字
     assert not one_word_limit(flat, 0.05, 0.10)  # 零振幅但未触板
     nohl = StockBar(
-        code="600001", trade_date=START, open=None, high=None, low=None,
-        close=11.0, volume=1e6, amount=1e7,
+        code="600001",
+        trade_date=START,
+        open=None,
+        high=None,
+        low=None,
+        close=11.0,
+        volume=1e6,
+        amount=1e7,
     )
     assert not one_word_limit(nohl, 0.10, 0.10)  # high/low 缺失保守放行
 
@@ -1172,12 +1779,25 @@ def test_limit_up_blocked_with_suspension_gap() -> None:
     code = "600001"
     bars = _make_bars(code, 3, growth=0.0, start_close=10.0)
     suspended = StockBar(
-        code=code, trade_date=bars[1].trade_date, open=None, high=None,
-        low=None, close=bars[0].close, volume=0.0, amount=0.0, suspended=True,
+        code=code,
+        trade_date=bars[1].trade_date,
+        open=None,
+        high=None,
+        low=None,
+        close=bars[0].close,
+        volume=0.0,
+        amount=0.0,
+        suspended=True,
     )
     limit_up = StockBar(
-        code=code, trade_date=bars[2].trade_date, open=11.0, high=11.0,
-        low=10.9, close=bars[0].close * 1.10, volume=1e6, amount=1e8,
+        code=code,
+        trade_date=bars[2].trade_date,
+        open=11.0,
+        high=11.0,
+        low=10.9,
+        close=bars[0].close * 1.10,
+        volume=1e6,
+        amount=1e8,
     )
     series = [bars[0], suspended, limit_up]
     prev = backtest.prev_bar_before(series, limit_up.trade_date)
@@ -1192,13 +1812,21 @@ def test_limit_up_blocked_with_suspension_gap() -> None:
 def test_can_trade_per_board_limits() -> None:
     """分板块触发线：同一 +15% 涨幅，主板/ST 阻塞买入，创业/科创/北交所放行。"""
     bar = StockBar(
-        code="000002", trade_date=START, open=11.5, high=11.6, low=11.2,
-        close=11.5, volume=1e6, amount=1e8,
+        code="000002",
+        trade_date=START,
+        open=11.5,
+        high=11.6,
+        low=11.2,
+        close=11.5,
+        volume=1e6,
+        amount=1e8,
     )
     prev_close = 10.0  # move = +15%
     ok_main, _ = backtest.can_trade(bar, prev_close, "buy", 0.98, code="600001")
     assert not ok_main  # 主板触发线 10%×0.98=9.8% < 15%
-    ok_st, reason = backtest.can_trade(bar, prev_close, "buy", 0.98, code="600001", st=True)
+    ok_st, reason = backtest.can_trade(
+        bar, prev_close, "buy", 0.98, code="600001", st=True
+    )
     assert not ok_st and "涨停" in reason  # ST 触发线 5%×0.98=4.9%
     ok_gem, _ = backtest.can_trade(bar, prev_close, "buy", 0.98, code="300750")
     assert ok_gem  # 创业板触发线 20%×0.98=19.6% > 15%
@@ -1211,8 +1839,14 @@ def test_can_trade_per_board_limits() -> None:
 def test_one_word_limit_blocks_both_sides() -> None:
     """一字涨停：买卖双向均不可成交；一字跌停同样双向阻塞。"""
     one_word_up = StockBar(
-        code="600001", trade_date=START, open=11.0, high=11.0, low=11.0,
-        close=11.0, volume=1e6, amount=1e7,
+        code="600001",
+        trade_date=START,
+        open=11.0,
+        high=11.0,
+        low=11.0,
+        close=11.0,
+        volume=1e6,
+        amount=1e7,
     )
     prev_close = 10.0  # move = +10%，主板法定板幅 10% 触板
     ok_buy, reason_buy = backtest.can_trade(one_word_up, prev_close, "buy", 0.98)
@@ -1221,8 +1855,14 @@ def test_one_word_limit_blocks_both_sides() -> None:
     assert not ok_sell and "一字" in reason_sell
 
     one_word_down = StockBar(
-        code="600001", trade_date=START, open=9.0, high=9.0, low=9.0,
-        close=9.0, volume=1e6, amount=1e7,
+        code="600001",
+        trade_date=START,
+        open=9.0,
+        high=9.0,
+        low=9.0,
+        close=9.0,
+        volume=1e6,
+        amount=1e7,
     )
     ok_sell_down, reason_down = backtest.can_trade(one_word_down, 10.0, "sell", 0.98)
     assert not ok_sell_down and "一字" in reason_down
@@ -1233,10 +1873,20 @@ def test_one_word_limit_blocks_both_sides() -> None:
 def test_st_status_as_of_name_history() -> None:
     """历史 ST 判定：名称区间命中按区间 is_st；无覆盖回退当前名称。"""
     periods = [
-        NamePeriod(code="600001", name="普通股份", start_date=date(2020, 1, 1),
-                   end_date=date(2021, 6, 30), is_st=False),
-        NamePeriod(code="600001", name="ST股份", start_date=date(2021, 7, 1),
-                   end_date=date(2022, 5, 31), is_st=True),
+        NamePeriod(
+            code="600001",
+            name="普通股份",
+            start_date=date(2020, 1, 1),
+            end_date=date(2021, 6, 30),
+            is_st=False,
+        ),
+        NamePeriod(
+            code="600001",
+            name="ST股份",
+            start_date=date(2021, 7, 1),
+            end_date=date(2022, 5, 31),
+            is_st=True,
+        ),
     ]
     # 命中 ST 区间 → True（即使当前名称非 ST）
     assert st_status_as_of("普通股份", periods, date(2021, 12, 1))
@@ -1255,8 +1905,13 @@ def test_universe_uses_name_history_for_st() -> None:
     bars = _make_bars("600001", 320, 0.0005)
     # 当前名称已摘帽，但 as_of 落在 ST 区间内
     periods = [
-        NamePeriod(code="600001", name="ST股份", start_date=date(2021, 7, 1),
-                   end_date=date(2022, 5, 31), is_st=True),
+        NamePeriod(
+            code="600001",
+            name="ST股份",
+            start_date=date(2021, 7, 1),
+            end_date=date(2022, 5, 31),
+            is_st=True,
+        ),
     ]
     result = strategy.filter_universe_stock(
         _info("600001", name="普通股份"), bars, as_of, name_periods=periods
@@ -1290,21 +1945,37 @@ def test_pending_orders_overridden_warns() -> None:
         close *= 1.0005
         bars.append(
             StockBar(
-                code=code, trade_date=day, open=close, high=close * 1.01,
-                low=close * 0.99, close=close, volume=1e6, amount=1e8,
+                code=code,
+                trade_date=day,
+                open=close,
+                high=close * 1.01,
+                low=close * 0.99,
+                close=close,
+                volume=1e6,
+                amount=1e8,
             )
         )
     signal1 = date(2025, 1, 31)
     signal2 = date(2025, 2, 28)
-    assert strategy.month_ends([d for d in all_days if d >= signal1]) == [signal1, signal2]
+    assert strategy.month_ends([d for d in all_days if d >= signal1]) == [
+        signal1,
+        signal2,
+    ]
     # 首期 T+1（2-25 前的 2-3..2-24 正常成交）——为构造顺延，把 2-3 设为涨停
     for day in (date(2025, 2, 3), date(2025, 2, 4)):
         idx = all_days.index(day)
         bar = bars[idx]
         bars[idx] = StockBar(
-            code=code, trade_date=day, open=bar.open, high=bar.high,
-            low=bar.low, close=bar.close, volume=1e6, amount=1e8,
-            suspended=False, raw_return=0.099,
+            code=code,
+            trade_date=day,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=1e6,
+            amount=1e8,
+            suspended=False,
+            raw_return=0.099,
         )
 
     calendar_days = [d for d in all_days if signal1 <= d <= signal2]
@@ -1315,8 +1986,11 @@ def test_pending_orders_overridden_warns() -> None:
         index_series=[],
     )
     config = backtest.BacktestConfig(
-        start=signal1, end=signal2,
-        initial_capital=1_000_000.0, top_n=1, max_stock_weight=0.05,
+        start=signal1,
+        end=signal2,
+        initial_capital=1_000_000.0,
+        top_n=1,
+        max_stock_weight=0.05,
     )
     outcome = backtest.run_backtest_panel(
         panel, [_info(code)], {code: [_fundamentals(code)]}, config
@@ -1345,7 +2019,10 @@ def test_pending_orders_dropped_by_new_signal_warns() -> None:
     jan = [date(2025, 10, 25) + timedelta(days=i) for i in range(7)]  # 10-25~10-31
     feb = [date(2025, 11, 24) + timedelta(days=i) for i in range(7)]  # 11-24~11-30
     calendar_days = jan + feb
-    assert strategy.month_ends(calendar_days) == [date(2025, 10, 31), date(2025, 11, 30)]
+    assert strategy.month_ends(calendar_days) == [
+        date(2025, 10, 31),
+        date(2025, 11, 30),
+    ]
     # 首期（10-25 起点信号）与次期（10-31 月末信号）之间的全部执行日
     # （10-26~10-30）从 bar_lookup 剔除（模拟无行情顺延），首期订单在
     # 10-31 信号日被覆盖。
@@ -1359,8 +2036,11 @@ def test_pending_orders_dropped_by_new_signal_warns() -> None:
         index_series=[],
     )
     config = backtest.BacktestConfig(
-        start=calendar_days[0], end=calendar_days[-1],
-        initial_capital=1_000_000.0, top_n=1, max_stock_weight=0.05,
+        start=calendar_days[0],
+        end=calendar_days[-1],
+        initial_capital=1_000_000.0,
+        top_n=1,
+        max_stock_weight=0.05,
         initial_signal=True,
     )
     outcome = backtest.run_backtest_panel(
@@ -1379,9 +2059,16 @@ def test_first_period_blocked_buy_eventually_fills() -> None:
     bars = _make_bars(code, 320, 0.0005)
     t1 = bars[301]
     bars[301] = StockBar(
-        code=code, trade_date=t1.trade_date, open=t1.open, high=t1.high,
-        low=t1.low, close=t1.close, volume=1e6, amount=1e8,
-        suspended=False, raw_return=0.099,
+        code=code,
+        trade_date=t1.trade_date,
+        open=t1.open,
+        high=t1.high,
+        low=t1.low,
+        close=t1.close,
+        volume=1e6,
+        amount=1e8,
+        suspended=False,
+        raw_return=0.099,
     )
     calendar_days = [bar.trade_date for bar in bars[300:308]]
     panel = backtest.MarketPanel(
@@ -1391,8 +2078,11 @@ def test_first_period_blocked_buy_eventually_fills() -> None:
         index_series=[],
     )
     config = backtest.BacktestConfig(
-        start=calendar_days[0], end=calendar_days[-1],
-        initial_capital=1_000_000.0, top_n=1, max_stock_weight=0.05,
+        start=calendar_days[0],
+        end=calendar_days[-1],
+        initial_capital=1_000_000.0,
+        top_n=1,
+        max_stock_weight=0.05,
         initial_signal=True,
     )
     outcome = backtest.run_backtest_panel(
@@ -1416,8 +2106,11 @@ def test_turnover_detail_real_values() -> None:
         index_series=[],
     )
     config = backtest.BacktestConfig(
-        start=calendar_days[0], end=calendar_days[-1],
-        initial_capital=1_000_000.0, top_n=1, max_stock_weight=0.05,
+        start=calendar_days[0],
+        end=calendar_days[-1],
+        initial_capital=1_000_000.0,
+        top_n=1,
+        max_stock_weight=0.05,
     )
     outcome = backtest.run_backtest_panel(
         panel, [_info(code)], {code: [_fundamentals(code)]}, config
@@ -1425,7 +2118,8 @@ def test_turnover_detail_real_values() -> None:
     detail = outcome.rebalances[0]
     traded = sum(fill.amount for fill in detail.fills)
     assert detail.turnover == pytest.approx(
-        0.5 * traded / config.initial_capital, abs=1e-6
+        0.5 * traded / config.initial_capital,
+        abs=1e-5,  # 现金在成交日前按 ACT/365 计息，分母会有微小增长
     )
     assert outcome.avg_turnover > 0
 
@@ -1437,8 +2131,15 @@ def test_full_suspension_excluded_from_forward_returns() -> None:
     bars_ok = _make_bars("600001", 320, 0.0005)
     suspended_bars = [
         StockBar(
-            code="600002", trade_date=bar.trade_date, open=None, high=None,
-            low=None, close=10.0, volume=0.0, amount=0.0, suspended=True,
+            code="600002",
+            trade_date=bar.trade_date,
+            open=None,
+            high=None,
+            low=None,
+            close=10.0,
+            volume=0.0,
+            amount=0.0,
+            suspended=True,
         )
         for bar in _make_bars("600002", 320, 0.0005)
     ]
@@ -1454,8 +2155,10 @@ def test_full_suspension_excluded_from_forward_returns() -> None:
     infos = [_info("600001"), _info("600002")]
     fundamentals_by_code = {code: [_fundamentals(code)] for code in codes}
     config = backtest.BacktestConfig(
-        start=calendar_days[0], end=calendar_days[-1],
-        initial_capital=1_000_000.0, top_n=2,
+        start=calendar_days[0],
+        end=calendar_days[-1],
+        initial_capital=1_000_000.0,
+        top_n=2,
     )
     outcome = backtest.run_backtest_panel(panel, infos, fundamentals_by_code, config)
     # 停牌股从未通过 universe，不会出现在任何打分/前瞻收益中
@@ -1478,7 +2181,10 @@ def test_industry_coverage_gate() -> None:
         )
     # 降级模式（研究性因子查询）：不抛，但 warning 明确
     plan = strategy.build_portfolio(
-        scored, unknown_infos, START + timedelta(days=300), top_n=6,
+        scored,
+        unknown_infos,
+        START + timedelta(days=300),
+        top_n=6,
         enforce_industry_coverage=False,
     )
     assert plan.industry_known_ratio == pytest.approx(0.0)
@@ -1490,9 +2196,15 @@ def test_dual_layer_panel_research_qfq_exec_raw() -> None:
     exec_bars = _make_bars("600001", 10, 0.001, start_close=10.0)
     qfq_bars = [
         StockBar(
-            code=bar.code, trade_date=bar.trade_date, open=bar.open * 0.5,
-            high=bar.high * 0.5, low=bar.low * 0.5, close=bar.close * 0.5,
-            volume=bar.volume, amount=bar.amount, suspended=bar.suspended,
+            code=bar.code,
+            trade_date=bar.trade_date,
+            open=bar.open * 0.5,
+            high=bar.high * 0.5,
+            low=bar.low * 0.5,
+            close=bar.close * 0.5,
+            volume=bar.volume,
+            amount=bar.amount,
+            suspended=bar.suspended,
         )
         for bar in exec_bars
     ]
@@ -1525,19 +2237,31 @@ def test_statutory_disclosure_deadline() -> None:
 @pytest.fixture()
 def mock_repo() -> MockRepository:
     return MockRepository(
-        infos=[_info(code, industry) for industry, codes in INDUSTRY_POOL.items() for code in codes],
+        infos=[
+            _info(code, industry)
+            for industry, codes in INDUSTRY_POOL.items()
+            for code in codes
+        ],
         bars_by_code={
             code: _make_bars(code, 320, growth, amount=1e8)
             for code, growth in (
-                ("600001", 0.0008), ("600002", 0.0005), ("600003", 0.0006),
-                ("000001", -0.0003), ("000002", 0.0004), ("000003", 0.0001),
+                ("600001", 0.0008),
+                ("600002", 0.0005),
+                ("600003", 0.0006),
+                ("000001", -0.0003),
+                ("000002", 0.0004),
+                ("000003", 0.0001),
             )
         },
         fundamentals_by_code={
             code: [_fundamentals(code, roe=roe)]
             for code, roe in (
-                ("600001", 0.16), ("600002", 0.12), ("600003", 0.13),
-                ("000001", 0.08), ("000002", 0.09), ("000003", 0.07),
+                ("600001", 0.16),
+                ("600002", 0.12),
+                ("600003", 0.13),
+                ("000001", 0.08),
+                ("000002", 0.09),
+                ("000003", 0.07),
             )
         },
     )
@@ -1562,7 +2286,12 @@ def test_api_factors_with_mock_repository(client: TestClient, mock_repo) -> None
     assert len(data["rows"]) == 6
     assert data["rows"][0]["rank"] == 1
     assert {row["code"] for row in data["rows"]} == {
-        "600001", "600002", "600003", "000001", "000002", "000003",
+        "600001",
+        "600002",
+        "600003",
+        "000001",
+        "000002",
+        "000003",
     }
     # 复合分降序且行业内 z 已计算
     composites = [row["composite"] for row in data["rows"]]

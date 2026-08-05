@@ -55,6 +55,7 @@ from app.schemas.paper import (
 )
 from app.schemas.quant import ScreenerItem, ScreenerRequest
 from app.services import quant_screener as screener_service
+from app.services import strategy_mandate
 from app.services.quant import (
     QuantError,
     _annual_return,
@@ -118,6 +119,12 @@ def ensure_default_account(db: Session) -> PaperAccount:
         select(StrategyVersion).where(StrategyVersion.name == DEFAULT_STRATEGY_NAME)
     ).scalars().first()
     if version is None:
+        mandate = strategy_mandate.operational_validation_mandate(
+            strategy_name=DEFAULT_STRATEGY_NAME,
+            initial_capital=DEFAULT_INITIAL_CAPITAL,
+            rebalance_days=DEFAULT_REBALANCE_INTERVAL,
+            top_n=DEFAULT_TOP_N,
+        )
         version = StrategyVersion(
             name=DEFAULT_STRATEGY_NAME,
             initial_capital=DEFAULT_INITIAL_CAPITAL,
@@ -125,6 +132,8 @@ def ensure_default_account(db: Session) -> PaperAccount:
             fee_rate=DEFAULT_FEE_RATE,
             top_n=DEFAULT_TOP_N,
             params=dict(DEFAULT_STRATEGY_PARAMS),
+            mandate=mandate,
+            mandate_sha256=strategy_mandate.mandate_sha256(mandate),
             status="paper_testing",
         )
         db.add(version)

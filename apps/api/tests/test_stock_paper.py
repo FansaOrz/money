@@ -1,12 +1,13 @@
 """A股规则策略前向模拟：就绪门槛、T+1、幂等和账本闭环。"""
 
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import (
     IndexConstituent,
+    DataSourceSLAState,
     StockDailyBar,
     StockFinancialIndicator,
     StockIndustry,
@@ -18,7 +19,12 @@ from app.models import (
     StockValuation,
 )
 from app.services import stock_paper
-from app.services.stock_repository import Fundamentals, StockBar, StockInfo, TradeCalendar
+from app.services.stock_repository import (
+    Fundamentals,
+    StockBar,
+    StockInfo,
+    TradeCalendar,
+)
 from app.timezone import CN_TZ
 
 
@@ -80,9 +86,7 @@ class ForwardRepository:
             for code in wanted
         ]
 
-    def trade_calendar(
-        self, start: date | None, end: date | None
-    ) -> TradeCalendar:
+    def trade_calendar(self, start: date | None, end: date | None) -> TradeCalendar:
         days = sorted(
             {
                 bar.trade_date
@@ -106,6 +110,34 @@ def _seed_trial(db: Session) -> tuple[ForwardRepository, date]:
     signal_day = first_day + timedelta(days=299)
     infos: list[StockInfo] = []
     bars: dict[str, list[StockBar]] = {}
+    synced_at = datetime.now(UTC)
+    for dataset in (
+        "suspend_d",
+        "stk_limit",
+        "dividend",
+        "namechange",
+        "index_membership_weight",
+        "industry_classification",
+    ):
+        db.add(
+            DataSourceSLAState(
+                dataset=dataset,
+                required=True,
+                primary_source="test",
+                fallback_source="test-fallback",
+                license_class="test",
+                frequency_minutes=1440,
+                max_latency_minutes=2160 if dataset != "stk_limit" else 240,
+                owner="test",
+                failure_mode="halt_new_orders",
+                status="success",
+                active_source="test",
+                last_attempted_at=synced_at,
+                last_success_at=synced_at,
+                data_date=signal_day,
+                row_count=50,
+            )
+        )
     for index in range(50):
         code = f"{600000 + index:06d}"
         industry = "制造" if index < 25 else "消费"
@@ -210,9 +242,7 @@ def test_forward_cycle_generates_then_executes_t_plus_one(
     assert db_session.query(StockPaperRun).count() == 1
     assert db_session.query(StockPaperNavDaily).count() == 1
     first_nav = db_session.scalar(
-        select(StockPaperNavDaily).where(
-            StockPaperNavDaily.nav_date == signal_day
-        )
+        select(StockPaperNavDaily).where(StockPaperNavDaily.nav_date == signal_day)
     )
     assert first_nav is not None
     # 基准不能在策略首个可执行日之前提前产生收益。
@@ -248,19 +278,28 @@ def test_forward_cycle_generates_then_executes_t_plus_one(
     assert signal.executed_at == next_day
     assert signal.order_state
     assert all(
-        state["status"] in {"filled", "partial", "blocked"}
-        and state["events"]
+        state["status"] in {"filled", "partial", "blocked"} and state["events"]
         for state in signal.order_state.values()
     )
     assert db_session.query(StockPaperTrade).count() == second.trade_count
     assert db_session.query(StockPaperNavDaily).count() == 2
     second_nav = db_session.scalar(
-        select(StockPaperNavDaily).where(
-            StockPaperNavDaily.nav_date == next_day
-        )
+        select(StockPaperNavDaily).where(StockPaperNavDaily.nav_date == next_day)
     )
     assert second_nav is not None
     assert float(second_nav.benchmark_nav) == 1.0
+    assert float(second_nav.cash_interest) > 0
+    assert float(second_nav.frozen_cash) == 0.0
+    assert float(second_nav.settled_cash) <= float(second_nav.cash)
+    assert float(second_nav.cash_conservation_error) == 0.0
+    assert second_nav.cash_ledger["policy_version"] == (
+        stock_paper.cash_ledger.CASH_POLICY_VERSION
+    )
+    assert {event["event_type"] for event in second_nav.cash_ledger["events"]} >= {
+        "cash_interest",
+        "buy_order_frozen",
+        "buy_order_settled",
+    }
 
     summary = stock_paper.get_summary(db_session)
     assert summary.started is True
@@ -268,6 +307,39 @@ def test_forward_cycle_generates_then_executes_t_plus_one(
     assert summary.strategy.candidate_count == 50
     assert summary.metrics.trading_days == 2
     assert summary.positions
+
+
+def test_pending_signal_can_be_manually_cancelled_with_opportunity_cost(
+    db_session: Session, monkeypatch
+) -> None:
+    repository, signal_day = _seed_trial(db_session)
+    monkeypatch.setattr(stock_paper, "EXPECTED_UNIVERSE_COUNT", 50)
+    monkeypatch.setattr(stock_paper, "REQUIRE_PREVALIDATION", False)
+    monkeypatch.setattr(stock_paper, "load_repository", lambda _db: repository)
+    monkeypatch.setattr(
+        stock_paper,
+        "now_cn",
+        lambda: datetime.combine(signal_day, time(16), tzinfo=CN_TZ),
+    )
+    stock_paper.run_cycle(db_session)
+    signal = db_session.scalar(select(StockPaperSignal))
+    assert signal is not None
+
+    result = stock_paper.cancel_pending_signal(
+        db_session,
+        signal.id,
+        reason="人工风控复核取消",
+    )
+    assert result.status == "cancelled"
+    db_session.refresh(signal)
+    assert signal.status == "cancelled"
+    assert all(
+        item["status"] == "cancelled"
+        and item["adverse_opportunity_cost"] == 0.0
+        and item["events"][-1]["reason"] == "人工风控复核取消"
+        and item["order_lifecycle_version"] == stock_paper.ORDER_POLICY.version
+        for item in signal.order_state.values()
+    )
 
 
 def test_late_initialization_never_backfills_missed_open(

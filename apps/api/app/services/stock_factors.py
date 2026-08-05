@@ -61,7 +61,7 @@ QUALITY_DIRECTIONS: dict[str, int] = {
     "roa": 1,
     "gross_margin": 1,
     "net_margin": 1,
-    "ocf_to_profit": 1,
+    "cash_conversion_assets": 1,
     "accruals": -1,
     "earnings_stability": 1,
     "margin_change": 1,
@@ -79,6 +79,16 @@ VALUE_DIRECTIONS: dict[str, int] = {
     "loss_profitability": 1,
     "valuation_percentile": 1,
 }
+from app.services.financial_sector_model import (  # noqa: E402
+    factor_directions as _financial_directions,
+    factor_families as _financial_families,
+)
+
+for _financial_name, _financial_direction in _financial_directions().items():
+    if _financial_families()[_financial_name] == "quality":
+        QUALITY_DIRECTIONS[_financial_name] = _financial_direction
+    else:
+        VALUE_DIRECTIONS[_financial_name] = _financial_direction
 
 MOMENTUM_WINDOW = 252  # 12 个月
 MOMENTUM_SKIP = 21  # 跳过最近 1 个月（12-1）
@@ -134,6 +144,9 @@ class FactorResult:
     liquidity_exposure: float | None = None
     average_daily_amount: float | None = None
     data_warnings: list[str] = field(default_factory=list)
+    factor_metadata: dict[str, dict[str, object]] = field(default_factory=dict)
+    model_structure: dict[str, object] = field(default_factory=dict)
+    model_eligible: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -191,10 +204,18 @@ def zscore(values: dict[str, float | None]) -> dict[str, float | None]:
     return {key: ((v - mean) / std if v is not None else None) for key, v in values.items()}
 
 
-def historical_percentile(series: list[float], value: float) -> float | None:
+MIN_VALUATION_HISTORY_OBSERVATIONS = 24
+
+
+def historical_percentile(
+    series: list[float],
+    value: float,
+    *,
+    minimum_observations: int = MIN_VALUATION_HISTORY_OBSERVATIONS,
+) -> float | None:
     """value 在自身历史序列中的分位数 ∈ [0,1]（小于该值的占比，并列计半）。"""
     valid = [v for v in series if v is not None]
-    if not valid:
+    if len(valid) < minimum_observations:
         return None
     below = sum(1 for v in valid if v < value)
     equal = sum(1 for v in valid if v == value)
@@ -219,6 +240,8 @@ def _latest_with_values(
     result: Fundamentals | None = None
     for snapshot in fundamentals:
         if snapshot.available_at <= as_of:
+            if not snapshot.formal_factor_usable:
+                continue
             if any(getattr(snapshot, field) is not None for field in fields):
                 result = snapshot
         else:
@@ -233,14 +256,16 @@ def _fundamental_value_series(
 
     用于估值历史分位：当前估值在其自身历史（同一可用性约束）中的分位。
     """
-    series: list[float] = []
+    observations: dict[date, float] = {}
     for snapshot in fundamentals:
         if snapshot.available_at > as_of:
             break
         values = [v for v in (snapshot.ep, snapshot.bp) if v is not None]
         if values:
-            series.append(fmean(values))
-    return series
+            observations[
+                snapshot.valuation_date or snapshot.available_at
+            ] = fmean(values)
+    return [observations[day] for day in sorted(observations)]
 
 
 def momentum_12_1(closes: list[float]) -> float | None:
@@ -322,6 +347,7 @@ def _stability(
     values = [
         float(value)
         for snapshot in snapshots[-8:]
+        if snapshot.formal_factor_usable
         if (value := getattr(snapshot, field_name)) is not None
     ]
     if len(values) < 3:
@@ -329,6 +355,53 @@ def _stability(
     mean = fmean(values)
     variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
     return -math.sqrt(variance)
+
+
+def _financial_policy_assessments(
+    context: StockContext,
+    as_of: date,
+):
+    from app.services.financial_ratio_policy import (
+        assess_cash_conversion,
+        assess_fcf_yield,
+    )
+
+    latest_quality = _latest_with_values(
+        context.fundamentals,
+        as_of,
+        ("net_income", "operating_cash_flow", "total_assets"),
+    )
+    latest_value = _latest_with_values(
+        context.fundamentals, as_of, ("market_cap",)
+    )
+    latest_fcf = _latest_with_values(
+        context.fundamentals, as_of, ("free_cash_flow",)
+    )
+    finance = any(
+        marker in context.info.industry
+        for marker in ("银行", "证券", "保险", "多元金融")
+    )
+    cash = assess_cash_conversion(
+        net_income=latest_quality.net_income if latest_quality else None,
+        operating_cash_flow=(
+            latest_quality.operating_cash_flow if latest_quality else None
+        ),
+        total_assets=latest_quality.total_assets if latest_quality else None,
+    )
+    fcf = assess_fcf_yield(
+        free_cash_flow=(
+            latest_fcf.free_cash_flow if latest_fcf is not None else None
+        ),
+        flow_basis=latest_fcf.flow_basis if latest_fcf is not None else None,
+        market_cap=latest_value.market_cap if latest_value is not None else None,
+        market_cap_date=(
+            latest_value.valuation_date if latest_value is not None else None
+        ),
+        signal_date=as_of,
+        is_financial_company=finance,
+        unit_policy=latest_fcf.unit_policy if latest_fcf is not None else None,
+    )
+    return cash, fcf
 
 
 def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
@@ -358,6 +431,27 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
         as_of,
         ("ep", "bp", "market_cap", "sales_yield", "dividend_yield"),
     )
+    sector_fields = tuple(
+        name
+        for name in _financial_directions()
+        if not name.endswith(("_ep", "_bp"))
+    )
+    latest_sector = _latest_with_values(
+        context.fundamentals,
+        as_of,
+        sector_fields + ("company_type",),
+    )
+    from app.services.financial_sector_model import assess_financial_sector
+
+    sector_assessment = (
+        assess_financial_sector(
+            latest_sector,
+            industry=context.info.industry,
+            valuation=latest_value,
+        )
+        if latest_sector is not None
+        else None
+    )
     finance = any(
         marker in context.info.industry
         for marker in ("银行", "证券", "保险", "多元金融")
@@ -381,21 +475,22 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
         "max_drawdown_120": maximum_drawdown_factor(closes, 120),
         "residual_volatility": None,
     }
+    result.update({field: None for field in sector_fields})
+    if sector_assessment is not None:
+        result.update(sector_assessment.values)
 
-    for name in ("roe", "roa", "gross_margin", "net_margin", "ocf_to_profit", "debt_ratio"):
+    for name in ("roe", "roa", "gross_margin", "net_margin", "debt_ratio"):
         result[name] = getattr(latest_quality, name) if latest_quality else None
-    accruals = None
-    if (
-        latest_quality is not None
-        and latest_quality.net_income is not None
-        and latest_quality.operating_cash_flow is not None
-        and latest_quality.total_assets is not None
-        and latest_quality.total_assets > 0
-    ):
-        accruals = (
-            latest_quality.net_income - latest_quality.operating_cash_flow
-        ) / latest_quality.total_assets
-    result["accruals"] = accruals
+    cash_assessment, fcf_assessment = _financial_policy_assessments(
+        context, as_of
+    )
+    result["ocf_to_profit"] = cash_assessment.ocf_to_profit
+    result["cash_conversion_assets"] = cash_assessment.cash_conversion_assets
+    result["accruals"] = (
+        -cash_assessment.cash_conversion_assets
+        if cash_assessment.cash_conversion_assets is not None
+        else None
+    )
     result["earnings_stability"] = _stability(context.fundamentals, "roe")
     margins = [
         snapshot.net_margin
@@ -416,13 +511,26 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
             "gross_margin",
             "net_margin",
             "ocf_to_profit",
+            "cash_conversion_assets",
             "accruals",
             "margin_change",
             "debt_ratio",
         ):
             result[name] = None
+    if sector_assessment is not None:
+        # 正式金融类型只进入自己的质量/风险/价值字段，通用金融三因子与
+        # 工业 EP/BP 不得并行补位。
+        for name in (
+            "financial_roe",
+            "financial_roa",
+            "financial_earnings_stability",
+        ):
+            result[name] = None
     result["ep"] = latest_value.ep if latest_value is not None else None
     result["bp"] = latest_value.bp if latest_value is not None else None
+    if sector_assessment is not None:
+        result["ep"] = None
+        result["bp"] = None
     result["sales_yield"] = (
         latest_value.sales_yield if latest_value is not None else None
     )
@@ -435,18 +543,7 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
     result["float_market_cap"] = (
         latest_value.float_market_cap if latest_value is not None else None
     )
-    latest_fcf = _latest_with_values(
-        context.fundamentals, as_of, ("free_cash_flow",)
-    )
-    result["fcf_yield"] = (
-        latest_fcf.free_cash_flow / latest_value.market_cap
-        if latest_fcf is not None
-        and latest_fcf.free_cash_flow is not None
-        and latest_value is not None
-        and latest_value.market_cap is not None
-        and latest_value.market_cap > 0
-        else None
-    )
+    result["fcf_yield"] = fcf_assessment.value
     latest_profit = _latest_with_values(
         context.fundamentals, as_of, ("net_income",)
     )
@@ -505,19 +602,137 @@ _FACTOR_DIRECTION: dict[str, int] = {
 }
 
 
-def _combine_family(zvalues: dict[str, float | None], family: str) -> float | None:
-    """族内子因子 z 值等权复合；缺失剔除后重新归一，全部缺失返回 None。"""
-    names = [name for name, fam in _FACTOR_FAMILY.items() if fam == family]
-    valid = [zvalues[name] for name in names if zvalues.get(name) is not None]
-    if not valid:
-        return None
-    return fmean(valid)  # type: ignore[arg-type]
+MISSING_OPTIONAL_PENALTY = -0.25
+
+
+def _family_policy(result: FactorResult, family: str) -> tuple[list[str], set[str]]:
+    """返回固定字段集合与必需项；集合不随单只股票的实际缺失而变化。"""
+    sector = str(result.model_structure.get("sector") or "")
+    if sector in {"bank", "broker", "insurance"}:
+        from app.services.financial_sector_model import FEATURE_DICTIONARIES
+
+        features = [
+            feature
+            for feature in FEATURE_DICTIONARIES[sector]
+            if ("quality" if feature.family == "risk" else feature.family) == family
+        ]
+        return (
+            [feature.field for feature in features],
+            {feature.field for feature in features if feature.required},
+        )
+    if family == "quality":
+        if any(
+            marker in result.industry
+            for marker in ("银行", "证券", "保险", "多元金融")
+        ):
+            return (
+                [
+                    "financial_roe",
+                    "financial_roa",
+                    "financial_earnings_stability",
+                ],
+                {"financial_roe"},
+            )
+        return (
+            [
+                "roe",
+                "roa",
+                "gross_margin",
+                "net_margin",
+                "cash_conversion_assets",
+                "accruals",
+                "earnings_stability",
+                "margin_change",
+                "debt_ratio",
+            ],
+            {"roe"},
+        )
+    policies = {
+        "value": (
+            [
+                "ep",
+                "bp",
+                "sales_yield",
+                "dividend_yield",
+                "fcf_yield",
+                "loss_profitability",
+                "valuation_percentile",
+            ],
+            {"bp"},
+        ),
+        "momentum": (
+            [
+                "momentum_12_1",
+                "momentum_6_1",
+                "short_reversal",
+                "residual_momentum",
+            ],
+            {"momentum_12_1"},
+        ),
+        "trend": (["trend"], {"trend"}),
+        "lowvol": (
+            [
+                "volatility_60",
+                "volatility_120",
+                "max_drawdown_120",
+                "residual_volatility",
+            ],
+            {"volatility_60"},
+        ),
+    }
+    names, required = policies[family]
+    return list(names), set(required)
+
+
+def _combine_family(
+    result: FactorResult,
+    family: str,
+) -> tuple[float | None, dict[str, object]]:
+    """固定权重复合；必需项缺失阻断，可选项按预注册惩罚填充。"""
+    names, required = _family_policy(result, family)
+    missing_required = sorted(
+        name for name in required if result.zscores.get(name) is None
+    )
+    available = sorted(
+        name for name in names if result.zscores.get(name) is not None
+    )
+    missing_optional = sorted(
+        name
+        for name in names
+        if name not in required and result.zscores.get(name) is None
+    )
+    weight = 1.0 / len(names) if names else 0.0
+    structure: dict[str, object] = {
+        "fields": names,
+        "required": sorted(required),
+        "available": available,
+        "missing_required": missing_required,
+        "missing_optional": missing_optional,
+        "missing_policy": (
+            f"required_block;optional_fixed_penalty={MISSING_OPTIONAL_PENALTY}"
+        ),
+        "effective_weights": {name: weight for name in names},
+    }
+    if not names or missing_required:
+        structure["status"] = "blocked_required_missing"
+        return None, structure
+    values = [
+        (
+            float(result.zscores[name])
+            if result.zscores.get(name) is not None
+            else MISSING_OPTIONAL_PENALTY
+        )
+        for name in names
+    ]
+    structure["status"] = "valid"
+    return sum(weight * value for value in values), structure
 
 
 def compute_cross_section(
     contexts: list[StockContext],
     as_of: date,
     weights: dict[str, float] | None = None,
+    official_market_returns: dict[date, float] | None = None,
 ) -> list[FactorResult]:
     """横截面打分：原始因子 → 行业内 winsorize+z → 族分 → 加权复合分。
 
@@ -544,63 +759,90 @@ def compute_cross_section(
                 returns[usable[index].trade_date] = value
                 market_by_date.setdefault(usable[index].trade_date, []).append(value)
         returns_by_code[context.info.code] = returns
-    market_returns = {
-        day: fmean(values) for day, values in market_by_date.items() if values
-    }
+    from app.services.factor_residual_model import (
+        estimate_residual_model,
+        leave_one_out_proxy,
+    )
 
     results: list[FactorResult] = []
     for context in contexts:
         raw = raw_factors(context, as_of)
-        aligned = [
-            (value, market_returns[day])
-            for day, value in sorted(returns_by_code[context.info.code].items())
-            if day in market_returns
+        cash_assessment, fcf_assessment = _financial_policy_assessments(
+            context, as_of
+        )
+        from app.services.financial_sector_model import assess_financial_sector
+
+        latest_sector = _latest_with_values(
+            context.fundamentals,
+            as_of,
+            tuple(
+                name
+                for name in _financial_directions()
+                if not name.endswith(("_ep", "_bp"))
+            )
+            + ("company_type",),
+        )
+        latest_valuation = _latest_with_values(
+            context.fundamentals, as_of, ("ep", "bp")
+        )
+        sector_assessment = (
+            assess_financial_sector(
+                latest_sector,
+                industry=context.info.industry,
+                valuation=latest_valuation,
+            )
+            if latest_sector is not None
+            else None
+        )
+        own_returns = returns_by_code[context.info.code]
+        if official_market_returns and len(
+            set(own_returns) & set(official_market_returns)
+        ) >= 60:
+            market_proxy = official_market_returns
+            market_source = "official_total_return_index"
+        else:
+            market_proxy = leave_one_out_proxy(
+                returns_by_code, context.info.code
+            )
+            market_source = "leave_one_out_investable_universe"
+        same_industry_codes = {
+            item.info.code
+            for item in contexts
+            if item.info.industry == context.info.industry
+        }
+        industry_proxy = leave_one_out_proxy(
+            returns_by_code,
+            context.info.code,
+            eligible_codes=same_industry_codes,
+        )
+        residual_model = estimate_residual_model(
+            own_returns,
+            market_proxy,
+            market_source=market_source,
+            industry_returns=industry_proxy or None,
+        )
+        beta = residual_model.beta
+        residual_values = [
+            value for _day, value in sorted(residual_model.residuals.items())
         ]
-        pairs = aligned[-120:]
-        beta = None
-        alpha = 0.0
-        if len(pairs) >= 20:
-            market_mean = fmean(pair[1] for pair in pairs)
-            stock_mean = fmean(pair[0] for pair in pairs)
-            variance = sum((pair[1] - market_mean) ** 2 for pair in pairs)
-            if variance > 0:
-                beta = sum(
-                    (stock - stock_mean) * (market - market_mean)
-                    for stock, market in pairs
-                ) / variance
-                alpha = stock_mean - beta * market_mean
         residual_volatility = None
-        if beta is not None and len(pairs) >= 20:
-            residuals = [
-                stock - alpha - beta * market for stock, market in pairs
-            ]
-            residual_mean = fmean(residuals)
+        recent_residuals = residual_values[-120:]
+        if len(recent_residuals) >= 20:
+            residual_mean = fmean(recent_residuals)
             residual_volatility = -math.sqrt(
-                sum((value - residual_mean) ** 2 for value in residuals)
-                / (len(residuals) - 1)
+                sum((value - residual_mean) ** 2 for value in recent_residuals)
+                / (len(recent_residuals) - 1)
             )
-        # 12-1 残差动量：在 252 日对齐窗口内跳过最近 21 日，用市场模型
-        # alpha/beta 的日残差复合，避免把单纯高 Beta 上涨误当个股动量。
-        momentum_pairs = aligned[-252:-21] if len(aligned) >= 253 else []
+        # 12-1 残差动量直接复合已保存的模型残差，跳过最近21个交易日。
+        momentum_residuals = (
+            residual_values[-252:-21] if len(residual_values) >= 253 else []
+        )
         residual_momentum = None
-        if len(momentum_pairs) >= 126:
-            market_mean = fmean(pair[1] for pair in momentum_pairs)
-            stock_mean = fmean(pair[0] for pair in momentum_pairs)
-            market_variance = sum(
-                (pair[1] - market_mean) ** 2 for pair in momentum_pairs
-            )
-            if market_variance > 0:
-                momentum_beta = sum(
-                    (stock - stock_mean) * (market - market_mean)
-                    for stock, market in momentum_pairs
-                ) / market_variance
-                momentum_alpha = stock_mean - momentum_beta * market_mean
-                compounded = 1.0
-                for stock, market in momentum_pairs:
-                    compounded *= 1.0 + (
-                        stock - momentum_alpha - momentum_beta * market
-                    )
-                residual_momentum = compounded - 1.0
+        if len(momentum_residuals) >= 126:
+            compounded = 1.0
+            for value in momentum_residuals:
+                compounded *= 1.0 + value
+            residual_momentum = compounded - 1.0
         recent_amounts = [
             bar.amount
             for bar in context.bars[-20:]
@@ -630,25 +872,148 @@ def compute_cross_section(
                 beta_exposure=beta,
                 liquidity_exposure=liquidity,
                 average_daily_amount=average_daily_amount,
+                factor_metadata={
+                    "cash_conversion": {
+                        "profit_classification": (
+                            cash_assessment.profit_classification
+                        ),
+                        "denominator_floor": cash_assessment.denominator_floor,
+                        "issues": list(cash_assessment.issues),
+                    },
+                    "fcf_yield": {
+                        "status": fcf_assessment.status,
+                        "reason": fcf_assessment.reason,
+                        **fcf_assessment.lineage,
+                    },
+                    "market_model": {
+                        "model": residual_model.model,
+                        "market_source": residual_model.market_source,
+                        "window": residual_model.window,
+                        "observations": residual_model.observations,
+                        "missing_dates": residual_model.missing_dates,
+                        "alpha": residual_model.alpha,
+                        "beta": residual_model.beta,
+                        "industry_beta": residual_model.industry_beta,
+                        "r_squared": residual_model.r_squared,
+                        "capm_r_squared": residual_model.capm_r_squared,
+                    },
+                },
+                model_eligible=(
+                    sector_assessment.eligible
+                    if sector_assessment is not None
+                    else True
+                ),
+                model_structure=(
+                    {
+                        "sector": sector_assessment.sector,
+                        "eligible": sector_assessment.eligible,
+                        "used_features": list(sector_assessment.used_features),
+                        "missing_required": list(
+                            sector_assessment.missing_required
+                        ),
+                        "reason": sector_assessment.reason,
+                    }
+                    if sector_assessment is not None
+                    else {"sector": "industrial_or_legacy", "eligible": True}
+                ),
             )
         )
+        if sector_assessment is not None and not sector_assessment.eligible:
+            results[-1].data_warnings.append(sector_assessment.reason)
 
-    # 按行业分组做 winsorize + z-score（行业中性化：每只股票只与同行业比较）
+    # 全市场当期无区分度的字段先阻断，再进入行业横截面处理。尤其是
+    # valuation_percentile：单点或重复快照不能以全体 0.5 伪装成有效因子。
+    from app.services.factor_health import inspect_factor
+
+    blocked_factors: dict[str, tuple[str, ...]] = {}
+    # 此处只在评分内部阻断已知会由单点历史机械产生 0.5 的估值分位；
+    # 全因子分布健康门禁由正式运行的 factor_health 报告统一判定，避免
+    # 小型诊断股票池把“股票池本身同质”误判成源字段损坏。
+    for factor_name in ("valuation_percentile",):
+        health = inspect_factor(
+            factor_name,
+            [item.raw.get(factor_name) for item in results],
+        )
+        if health.blocked:
+            blocked_factors[factor_name] = health.reasons
+    for result in results:
+        for factor_name, reasons in blocked_factors.items():
+            if result.raw.get(factor_name) is not None:
+                result.data_warnings.append(
+                    f"{factor_name} 当期分布阻断：{'；'.join(reasons)}"
+                )
+
+    # 正式横截面使用行业哑变量 + log市值 + Beta + 流动性 WLS 残差化。
+    # 小诊断股票池样本不足时才保留原行业内标准化回退。
     by_industry: dict[str, list[FactorResult]] = {}
     for result in results:
         by_industry.setdefault(result.industry, []).append(result)
 
+    from app.services.cross_sectional_neutralization import (
+        NeutralizationObservation,
+        neutralize_wls,
+    )
+
+    for factor_name, direction in _FACTOR_DIRECTION.items():
+        if factor_name in blocked_factors:
+            for item in results:
+                item.zscores[factor_name] = None
+                item.factor_metadata.setdefault(factor_name, {})[
+                    "health_block"
+                ] = list(blocked_factors[factor_name])
+            continue
+        oriented = {
+            item.code: (
+                item.raw.get(factor_name) * direction
+                if item.raw.get(factor_name) is not None
+                else None
+            )
+            for item in results
+        }
+        neutralization = neutralize_wls(
+            [
+                NeutralizationObservation(
+                    code=item.code,
+                    industry=item.industry,
+                    value=oriented[item.code],
+                    log_market_cap=item.size_exposure,
+                    beta=item.beta_exposure,
+                    liquidity=item.liquidity_exposure,
+                    float_market_cap=item.float_market_cap,
+                )
+                for item in results
+            ]
+        )
+        diagnostics = {
+            "method": neutralization.method,
+            "sample_size": neutralization.sample_size,
+            "coefficients": neutralization.coefficients,
+            "r_squared": neutralization.r_squared,
+            "weighted_control_correlations": (
+                neutralization.weighted_control_correlations
+            ),
+            "small_industries": list(neutralization.small_industries),
+        }
+        if neutralization.method == "wls_sqrt_float_market_cap":
+            standardized = zscore(winsorize(neutralization.residuals))
+            for item in results:
+                item.zscores[factor_name] = standardized[item.code]
+                item.factor_metadata.setdefault(factor_name, {})[
+                    "neutralization"
+                ] = diagnostics
+        else:
+            for members in by_industry.values():
+                column = {
+                    member.code: oriented[member.code] for member in members
+                }
+                zscores = zscore(winsorize(column))
+                for member in members:
+                    member.zscores[factor_name] = zscores[member.code]
+                    member.factor_metadata.setdefault(factor_name, {})[
+                        "neutralization"
+                    ] = diagnostics
+
     for members in by_industry.values():
-        for factor_name, direction in _FACTOR_DIRECTION.items():
-            column = {member.code: member.raw.get(factor_name) for member in members}
-            # 方向调整：负债率等「越小越好」的因子取负后参与 winsorize/z
-            oriented = {
-                code: (value * direction if value is not None else None)
-                for code, value in column.items()
-            }
-            zscores = zscore(winsorize(oriented))
-            for member in members:
-                member.zscores[factor_name] = zscores[member.code]
         # 趋势对 12-1 动量做行业内横截面正交化，族权重不再重复押注同一
         # 排名方向；样本不足或动量无方差时保留原趋势分。
         momentum_trend = [
@@ -680,13 +1045,44 @@ def compute_cross_section(
                         - trend_mean
                         - slope * (float(momentum) - momentum_mean)
                     )
+        # 60/120日低波高度重叠：保留60日水平，120日仅贡献控制60日后的
+        # 中长期增量，避免同一种波动风险在族内被重复计权。
+        volatility_pair = [
+            (
+                member,
+                member.zscores.get("volatility_60"),
+                member.zscores.get("volatility_120"),
+            )
+            for member in members
+            if member.zscores.get("volatility_60") is not None
+            and member.zscores.get("volatility_120") is not None
+        ]
+        if len(volatility_pair) >= 3:
+            short_mean = fmean(float(item[1]) for item in volatility_pair)
+            long_mean = fmean(float(item[2]) for item in volatility_pair)
+            variance = sum(
+                (float(short) - short_mean) ** 2
+                for _member, short, _long in volatility_pair
+            )
+            if variance > 0:
+                slope = sum(
+                    (float(short) - short_mean) * (float(long) - long_mean)
+                    for _member, short, long in volatility_pair
+                ) / variance
+                for member, short, long in volatility_pair:
+                    member.zscores["volatility_120"] = (
+                        float(long)
+                        - long_mean
+                        - slope * (float(short) - short_mean)
+                    )
 
     for result in results:
-        result.quality = _combine_family(result.zscores, "quality")
-        result.value = _combine_family(result.zscores, "value")
-        result.momentum = _combine_family(result.zscores, "momentum")
-        result.trend = _combine_family(result.zscores, "trend")
-        result.lowvol = _combine_family(result.zscores, "lowvol")
+        family_structures: dict[str, object] = {}
+        for family in DEFAULT_FAMILY_WEIGHTS:
+            score, structure = _combine_family(result, family)
+            setattr(result, family, score)
+            family_structures[family] = structure
+        result.model_structure["families"] = family_structures
 
         weighted = 0.0
         weight_sum = 0.0
@@ -708,7 +1104,8 @@ def compute_cross_section(
                 weight_sum / total_weight if total_weight > 0 else 0.0
             )
             result.eligible = (
-                result.data_coverage + 1e-12 >= MIN_FAMILY_WEIGHT_COVERAGE
+                result.model_eligible
+                and result.data_coverage + 1e-12 >= MIN_FAMILY_WEIGHT_COVERAGE
             )
             if weight_sum < total_weight - 1e-9:
                 missing = [

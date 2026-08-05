@@ -474,31 +474,32 @@ def test_import_stocktoday_index_weights(db_session: Session, tmp_path: Path) ->
                 "index_code": "000300.SH",
                 "con_code": "000001.SZ",
                 "trade_date": "20240131",
-                "weight": 1.2,
+                    "weight": 40.0,
             },
             {
                 "index_code": "000300.SH",
                 "con_code": "600519.SH",
                 "trade_date": "20240131",
-                "weight": 3.5,
+                    "weight": 60.0,
             },
             {
                 "index_code": "000300.SH",
                 "con_code": "600519.SH",
                 "trade_date": "20240229",
-                "weight": 3.4,
+                    "weight": 55.0,
             },
             {
                 "index_code": "000300.SH",
                 "con_code": "300750.SZ",
                 "trade_date": "20240229",
-                "weight": 2.1,
+                    "weight": 45.0,
             },
         ]
     ).to_parquet(partition / "2024.parquet", index=False)
 
     result = stock_universe.import_stocktoday_index_weights(db_session, snapshot_root)
     assert result["status"] == "success"
+    assert result["weights_imported"] == 4
     assert result["snapshots_imported"] == 4
     assert result["events_imported"] == 4
 

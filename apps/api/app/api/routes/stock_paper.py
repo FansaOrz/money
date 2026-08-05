@@ -5,9 +5,11 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.schemas.stock_paper import (
+    StockPaperCancelRequest,
     StockPaperPrepareRequest,
     StockPaperPrepareResponse,
     StockPaperRunResponse,
+    StockPaperSignalOut,
     StockPaperSummary,
     StockPaperTradeOut,
 )
@@ -65,3 +67,27 @@ def trades(
 ) -> list[StockPaperTradeOut]:
     """股票模拟成交明细。"""
     return [StockPaperTradeOut(**item) for item in stock_paper.list_trades(db, limit)]
+
+
+@router.post(
+    "/signals/{signal_id}/cancel",
+    response_model=StockPaperSignalOut,
+)
+def cancel_signal(
+    signal_id: int,
+    payload: StockPaperCancelRequest,
+    db: Session = Depends(get_db),
+) -> StockPaperSignalOut:
+    """人工撤销尚未完成的模拟调仓信号，并保存机会成本审计。"""
+    try:
+        return stock_paper.cancel_pending_signal(
+            db,
+            signal_id,
+            reason=payload.reason,
+        )
+    except stock_paper.StockPaperError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc

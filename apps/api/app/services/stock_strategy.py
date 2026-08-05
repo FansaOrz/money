@@ -28,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 
+import numpy as np
+
 from app.services import stock_factors as factors
 from app.services.stock_repository import (
     NamePeriod,
@@ -251,6 +253,7 @@ def build_portfolio(
     minimum_holdings: int = 20,
     max_annual_volatility: float = 0.25,
     max_tracking_error: float = 0.15,
+    use_convex_optimizer: bool = False,
 ) -> PortfolioPlan:
     """由复合分排名构建目标组合（行业中性、单股/行业上限）。
 
@@ -749,18 +752,235 @@ def build_portfolio(
         else 0.02
     )
 
-    def annual_volatility(weights: dict[str, float]) -> float:
-        return (
-            sum(
-                (
-                    weight
-                    * daily_risk_by_code.get(code, fallback_risk)
-                )
-                ** 2
-                for code, weight in weights.items()
+    risk_codes = sorted(set(target) | set(benchmark_weights))
+    risk_lookup = {item.code: item for item in scored}
+    industries_for_risk = sorted(
+        {
+            risk_lookup[code].industry
+            for code in risk_codes
+            if code in risk_lookup
+        }
+    )
+    market_variance = max(fallback_risk**2 * 0.35, 1e-8)
+    industry_variance = max(fallback_risk**2 * 0.15, 1e-8)
+    covariance = np.zeros((len(risk_codes), len(risk_codes)), dtype=float)
+    for left_index, left in enumerate(risk_codes):
+        left_item = risk_lookup.get(left)
+        left_beta = (
+            float(left_item.beta_exposure)
+            if left_item is not None and left_item.beta_exposure is not None
+            else 1.0
+        )
+        left_industry = left_item.industry if left_item is not None else "未知"
+        for right_index, right in enumerate(risk_codes):
+            right_item = risk_lookup.get(right)
+            right_beta = (
+                float(right_item.beta_exposure)
+                if right_item is not None and right_item.beta_exposure is not None
+                else 1.0
             )
-            ** 0.5
-            * (252.0**0.5)
+            right_industry = (
+                right_item.industry if right_item is not None else "未知"
+            )
+            covariance[left_index, right_index] = (
+                left_beta * right_beta * market_variance
+                + (
+                    industry_variance
+                    if left_industry == right_industry
+                    and left_industry != "未知"
+                    else 0.0
+                )
+            )
+        total_variance = daily_risk_by_code.get(left, fallback_risk) ** 2
+        covariance[left_index, left_index] += max(
+            total_variance - covariance[left_index, left_index],
+            total_variance * 0.20,
+        )
+    if len(risk_codes):
+        eigenvalues, eigenvectors = np.linalg.eigh(
+            (covariance + covariance.T) / 2.0
+        )
+        covariance = (
+            eigenvectors
+            @ np.diag(np.maximum(eigenvalues, 1e-12))
+            @ eigenvectors.T
+        )
+
+    optimizer_report: dict[str, object] | None = None
+    if target and risk_codes and use_convex_optimizer:
+        from app.services.convex_portfolio_optimizer import (
+            estimate_trade_cost_rates,
+            optimize_portfolio,
+        )
+
+        alpha_values = [
+            0.002 * risk_lookup[code].composite
+            if code in risk_lookup and code in target
+            else 0.0
+            for code in risk_codes
+        ]
+        alpha_errors = [
+            0.001
+            + 0.003
+            * (
+                1.0
+                - min(
+                    max(risk_lookup[code].data_coverage, 0.0),
+                    1.0,
+                )
+            )
+            if code in risk_lookup
+            else 0.01
+            for code in risk_codes
+        ]
+        effective_portfolio_value = float(portfolio_value or 1_000_000.0)
+        average_amounts = [
+            (
+                risk_lookup[code].average_daily_amount
+                if code in risk_lookup
+                and risk_lookup[code].average_daily_amount is not None
+                else effective_portfolio_value
+            )
+            for code in risk_codes
+        ]
+        expected_trade_values = [
+            abs(
+                target.get(code, 0.0)
+                - (current_weights or {}).get(code, 0.0)
+            )
+            * effective_portfolio_value
+            for code in risk_codes
+        ]
+        cost_rates = estimate_trade_cost_rates(
+            [1.0] * len(risk_codes),
+            average_amounts,
+            expected_trade_values,
+        )
+        industry_matrix = np.asarray(
+            [
+                [
+                    1.0
+                    if code in risk_lookup
+                    and risk_lookup[code].industry == industry
+                    else 0.0
+                    for industry in industries_for_risk
+                ]
+                for code in risk_codes
+            ],
+            dtype=float,
+        )
+        benchmark_industry = [
+            sum(
+                benchmark_weights.get(code, 0.0)
+                for code in risk_codes
+                if code in risk_lookup
+                and risk_lookup[code].industry == industry
+            )
+            for industry in industries_for_risk
+        ]
+        style_matrix = np.asarray(
+            [
+                [
+                    normalized_exposures[label].get(code, 0.0)
+                    for label in ("size", "beta", "liquidity")
+                ]
+                for code in risk_codes
+            ],
+            dtype=float,
+        )
+        benchmark_style = [
+            sum(
+                benchmark_weights.get(code, 0.0)
+                * normalized_exposures[label].get(code, 0.0)
+                for code in risk_codes
+            )
+            for label in ("size", "beta", "liquidity")
+        ]
+        optimizer_report = optimize_portfolio(
+            codes=risk_codes,
+            alpha=alpha_values,
+            alpha_standard_errors=alpha_errors,
+            covariance=covariance,
+            current_weights=[
+                (current_weights or {}).get(code, 0.0)
+                for code in risk_codes
+            ],
+            benchmark_weights=[
+                benchmark_weights.get(code, 0.0) for code in risk_codes
+            ],
+            linear_cost_rates=cost_rates["linear_cost_rates"],
+            impact_cost_rates=cost_rates["impact_cost_rates"],
+            industry_exposures=(
+                industry_matrix
+                if len(eligible) >= minimum_holdings
+                else None
+            ),
+            benchmark_industry_exposures=(
+                benchmark_industry
+                if len(eligible) >= minimum_holdings
+                else None
+            ),
+            style_exposures=(
+                style_matrix if len(eligible) >= minimum_holdings else None
+            ),
+            benchmark_style_exposures=(
+                benchmark_style
+                if len(eligible) >= minimum_holdings
+                else None
+            ),
+            adv_weight_limits=[
+                (
+                    stock_weight_limit.get(code, max_stock_weight)
+                    if code in target
+                    or (current_weights or {}).get(code, 0.0) > 0
+                    else 0.0
+                )
+                for code in risk_codes
+            ],
+            max_stock_weight=max_stock_weight,
+            max_industry_active_weight=0.03,
+            max_style_active_exposure=0.20,
+            max_tracking_error=max_tracking_error,
+            max_annual_volatility=max_annual_volatility,
+            max_turnover=2.0,
+            minimum_cash=max(1.0 - sum(target.values()), 0.0),
+            maximum_cash=max(1.0 - sum(target.values()), 0.0),
+        )
+        if optimizer_report["passed"] is True:
+            original_target_codes = set(target)
+            target = {
+                code: min(float(weight), max_stock_weight)
+                for code, weight in dict(
+                    optimizer_report["weights"]
+                ).items()
+                if code in original_target_codes and float(weight) >= 1e-7
+            }
+            industry_weight = {}
+            for code, weight in target.items():
+                industry = (
+                    risk_lookup[code].industry
+                    if code in risk_lookup
+                    else "未知"
+                )
+                industry_weight[industry] = (
+                    industry_weight.get(industry, 0.0) + weight
+                )
+        else:
+            plan.warnings.append(
+                "正式凸优化不可行，本期持有现金；诊断="
+                + str(optimizer_report.get("infeasibility"))
+            )
+            target = {}
+            industry_weight = {}
+
+    def annual_volatility(weights: dict[str, float]) -> float:
+        if not risk_codes:
+            return 0.0
+        vector = np.asarray(
+            [weights.get(code, 0.0) for code in risk_codes], dtype=float
+        )
+        return float(
+            np.sqrt(max(vector @ covariance @ vector, 0.0) * 252.0)
         )
 
     expected_annual_vol = annual_volatility(target)
@@ -834,6 +1054,68 @@ def build_portfolio(
         if lowvol_risk
         else None
     )
+    from app.services.portfolio_risk_controls import (
+        capacity_curve,
+        stress_test,
+        tail_risk,
+    )
+
+    target_codes = list(target)
+    stress_report = stress_test(
+        codes=target_codes,
+        weights=[target[code] for code in target_codes],
+        position_values=[
+            target[code] * float(portfolio_value or 1_000_000.0)
+            for code in target_codes
+        ],
+        adv_amounts=[
+            (
+                risk_lookup[code].average_daily_amount
+                if code in risk_lookup
+                and risk_lookup[code].average_daily_amount is not None
+                else float(portfolio_value or 1_000_000.0)
+            )
+            for code in target_codes
+        ],
+        industry_by_code={
+            code: (
+                risk_lookup[code].industry
+                if code in risk_lookup
+                else "未知"
+            )
+            for code in target_codes
+        },
+    )
+    simulated_returns: list[float] = []
+    if target_codes and risk_codes:
+        target_vector = np.asarray(
+            [target.get(code, 0.0) for code in risk_codes]
+        )
+        simulated = np.random.default_rng(20260805).multivariate_normal(
+            np.zeros(len(risk_codes)),
+            covariance,
+            size=2000,
+        )
+        simulated_returns = (simulated @ target_vector).tolist()
+    tail_report = tail_risk(simulated_returns)
+    capacity_report = capacity_curve(
+        codes=target_codes,
+        target_weights=[target[code] for code in target_codes],
+        adv_amounts=[
+            (
+                risk_lookup[code].average_daily_amount
+                if code in risk_lookup
+                and risk_lookup[code].average_daily_amount is not None
+                else float(portfolio_value or 1_000_000.0)
+            )
+            for code in target_codes
+        ],
+        capital_levels=[
+            float(portfolio_value or 1_000_000.0) * multiplier
+            for multiplier in (0.5, 1.0, 2.0, 5.0, 10.0)
+        ],
+        gross_expected_return=max(expected_score * 0.01, 0.0),
+    )
     plan.diagnostics = {
         "objective": "factor_score-risk-turnover-cost",
         "expected_factor_score": round(expected_score, 8),
@@ -843,11 +1125,17 @@ def build_portfolio(
         "expected_daily_volatility": expected_daily_vol,
         "expected_annual_volatility": expected_annual_vol,
         "expected_tracking_error": expected_tracking_error,
+        "risk_model": "MARKET_INDUSTRY_SPECIFIC_PSD_V1",
+        "risk_model_assets": risk_codes,
+        "risk_model_industries": industries_for_risk,
+        "risk_covariance": covariance.tolist(),
+        "convex_optimizer": optimizer_report,
         "max_annual_volatility": max_annual_volatility,
         "max_tracking_error": max_tracking_error,
-        "stress_loss_5sigma": (
-            -5.0 * expected_daily_vol if expected_daily_vol is not None else None
-        ),
+        "stress_test": stress_report,
+        "stress_loss": stress_report.get("worst_portfolio_pnl_rate"),
+        "tail_risk": tail_report,
+        "capacity_curve": capacity_report,
         "benchmark_exposures": benchmark_exposures,
         "portfolio_exposures": portfolio_exposures,
         "exposure_deviations": deviations,
@@ -856,7 +1144,7 @@ def build_portfolio(
         "minimum_trade_weight": minimum_trade_weight,
         "max_adv_participation": max_adv_participation,
         "capacity_constrained_count": sum(
-            stock_weight_limit[code] < max_stock_weight - 1e-12
+            stock_weight_limit.get(code, 0.0) < max_stock_weight - 1e-12
             for code in target
         ),
     }

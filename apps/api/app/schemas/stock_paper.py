@@ -17,6 +17,12 @@ class StockPaperStrategyInfo(ConfiguredBaseModel):
     calendar_days_remaining: int
     observation_progress: float
     candidate_count: int
+    validation_scope: str
+    investment_approval_eligible: bool
+    mandate_version: str
+    mandate_sha256: str
+    result_interpretation: str
+    approval_blocker: str | None = None
     params: dict = Field(default_factory=dict)
 
 
@@ -60,11 +66,21 @@ class StockPaperSignalOut(ConfiguredBaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class StockPaperCancelRequest(ConfiguredBaseModel):
+    reason: str = Field(min_length=1, max_length=300)
+
+
 class StockPaperHistoryPoint(ConfiguredBaseModel):
     date: str
     nav: float
     benchmark_nav: float
     total_value: float
+    available_cash: float = 0.0
+    frozen_cash: float = 0.0
+    receivable_cash: float = 0.0
+    settled_cash: float = 0.0
+    cash_interest: float = 0.0
+    cash_conservation_error: float = 0.0
     daily_return: float | None = None
     benchmark_daily_return: float | None = None
     rebalanced: bool = False
@@ -107,6 +123,11 @@ class StockPaperSummary(ConfiguredBaseModel):
     as_of: str | None = None
     initial_capital: float = 1_000_000.0
     cash: float = 1_000_000.0
+    frozen_cash: float = 0.0
+    receivable_cash: float = 0.0
+    settled_cash: float = 1_000_000.0
+    cash_interest: float = 0.0
+    cash_ledger: dict = Field(default_factory=dict)
     market_value: float = 0.0
     total_value: float = 1_000_000.0
     nav: float = 1.0

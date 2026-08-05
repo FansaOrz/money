@@ -316,6 +316,17 @@ class DeflatedSharpeResult:
     dsr: float
 
 
+@dataclass(frozen=True)
+class ProbabilisticSharpeResult:
+    sample_count: int
+    sharpe: float
+    benchmark_sharpe: float
+    skew: float
+    kurtosis: float
+    probability: float
+    minimum_track_record_length: int | None
+
+
 def _norm_ppf(p: float) -> float:
     """标准正态逆累积分布（Acklam 有理逼近，|误差| < 1.15e-9）。"""
     if p <= 0.0:
@@ -402,6 +413,48 @@ def deflated_sharpe(
         sr_std=sr_std,
         expected_max_sr=e_max,
         dsr=dsr,
+    )
+
+
+def probabilistic_sharpe(
+    returns: Sequence[float],
+    *,
+    benchmark_sharpe: float = 0.0,
+    confidence: float = 0.95,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+) -> ProbabilisticSharpeResult | None:
+    """非正态修正 PSR 与达到给定置信度的最短记录长度。"""
+    sr = sharpe_ratio(returns, risk_free_rate)
+    if sr is None or len(returns) < 2:
+        return None
+    skew = skewness(returns) or 0.0
+    kurt = kurtosis(returns) or 0.0
+    variance_term = (
+        1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr
+    )
+    variance_term = max(variance_term, 1e-12)
+    statistic = (
+        (sr - benchmark_sharpe)
+        * math.sqrt(len(returns) - 1)
+        / math.sqrt(variance_term)
+    )
+    probability = _norm_cdf(statistic)
+    minimum_length = None
+    if sr > benchmark_sharpe:
+        z = _norm_ppf(confidence)
+        minimum_length = math.ceil(
+            1.0
+            + variance_term
+            * (z / (sr - benchmark_sharpe)) ** 2
+        )
+    return ProbabilisticSharpeResult(
+        sample_count=len(returns),
+        sharpe=sr,
+        benchmark_sharpe=benchmark_sharpe,
+        skew=skew,
+        kurtosis=kurt,
+        probability=probability,
+        minimum_track_record_length=minimum_length,
     )
 
 
