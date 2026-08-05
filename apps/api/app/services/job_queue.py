@@ -73,7 +73,7 @@ def claim(
     now = now or datetime.now(UTC)
     worker_id = worker_id or f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
     recover_expired(db, now)
-    candidates = db.scalars(
+    statement = (
         select(PersistentJob)
         .where(
             PersistentJob.status == "queued",
@@ -84,7 +84,10 @@ def claim(
             ),
         )
         .order_by(PersistentJob.scheduled_for, PersistentJob.id)
-    ).all()
+    )
+    if db.get_bind().dialect.name == "postgresql":
+        statement = statement.with_for_update(skip_locked=True)
+    candidates = db.scalars(statement).all()
     for job in candidates:
         dependencies = set(job.depends_on or [])
         if dependencies:

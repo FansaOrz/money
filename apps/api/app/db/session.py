@@ -22,7 +22,26 @@ def create_db_engine(database_url: str | None = None) -> Engine:
         connect_args["check_same_thread"] = False
         # 后台同步任务会短暂写库；等待当前写事务释放，避免立刻报 database is locked。
         connect_args["timeout"] = 30
-    return create_engine(url, connect_args=connect_args, pool_pre_ping=True)
+    settings = get_settings()
+    options: dict[str, object] = {"pool_pre_ping": True}
+    if url.startswith(("postgresql", "postgres")):
+        options.update(
+            {
+                "pool_size": settings.database_pool_size,
+                "max_overflow": settings.database_max_overflow,
+                "pool_timeout": settings.database_pool_timeout_seconds,
+                "isolation_level": "READ COMMITTED",
+                "connect_args": {
+                    "options": (
+                        f"-c statement_timeout={settings.database_statement_timeout_ms} "
+                        f"-c lock_timeout={settings.database_lock_timeout_ms}"
+                    )
+                },
+            }
+        )
+    else:
+        options["connect_args"] = connect_args
+    return create_engine(url, **options)
 
 
 engine = create_db_engine()

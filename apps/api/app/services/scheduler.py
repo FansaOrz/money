@@ -51,15 +51,19 @@ _handler.setFormatter(_BeijingFormatter("%(asctime)s %(levelname)s %(message)s")
 logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger(__name__)
 _stock_daily_thread: threading.Thread | None = None
+_HEARTBEAT_PATH = Path("/tmp/money-scheduler-heartbeat")
 _SCHEDULED_JOB_NAMES = {
     "backup_verify",
     "candidate_pool_nav",
+    "corporate_actions",
+    "execution_references",
     "fund_catalog",
     "fund_nav",
     "fund_nav_early",
     "fund_nav_late",
     "fund_nav_startup",
     "holdings",
+    "index_reference",
     "indices",
     "news",
     "paper",
@@ -69,6 +73,16 @@ _SCHEDULED_JOB_NAMES = {
     "stock_reference",
     "us_indices",
 }
+
+
+def scheduler_heartbeat_ok(max_age_seconds: int = 90) -> bool:
+    try:
+        return (
+            time.time() - _HEARTBEAT_PATH.stat().st_mtime
+            <= max_age_seconds
+        )
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +115,12 @@ def _extract_stats(result: Any) -> dict[str, Any]:
                 data_date = datetime.strptime(str(latest_nav_date), "%Y-%m-%d").date()
             except ValueError:
                 data_date = None
-        return {"total": total, "updated": updated, "failed": failed, "data_date": data_date}
+        return {
+            "total": total,
+            "updated": updated,
+            "failed": failed,
+            "data_date": data_date,
+        }
     # paper 任务返回 PaperRunResponse（pydantic 模型）
     trade_count = int(getattr(result, "trade_count", 0) or 0)
     skipped = bool(getattr(result, "skipped", False))
@@ -112,7 +131,12 @@ def _extract_stats(result: Any) -> dict[str, Any]:
             data_date = datetime.strptime(str(run_date), "%Y-%m-%d").date()
         except ValueError:
             data_date = None
-    return {"total": 1, "updated": 0 if skipped else trade_count, "failed": 0, "data_date": data_date}
+    return {
+        "total": 1,
+        "updated": 0 if skipped else trade_count,
+        "failed": 0,
+        "data_date": data_date,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +274,99 @@ def _sync_stock_reference() -> None:
         db.close()
 
 
+def _sync_corporate_actions() -> None:
+    """每日导入已刷新结构化分红/送转文件，并执行冲突检测。"""
+    from app.services.corporate_action_master import import_dividend_snapshot
+
+    root = (
+        Path(get_settings().research_data_dir)
+        / "tushare_snapshot"
+        / "stocks"
+        / "dividend"
+    )
+    db = SessionLocal()
+    try:
+        with track_sync_run(db, "corporate_actions") as record:
+            result = import_dividend_snapshot(db, root)
+            record(
+                total=int(result["inserted"]) + int(result["skipped"]),
+                updated=int(result["inserted"]),
+                failed=int(result["invalid"]),
+            )
+        logger.info("公司行为主数据增量导入完成：%s", result)
+    except Exception:
+        logger.exception("公司行为主数据增量导入失败")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _sync_execution_references() -> None:
+    """刷新交易执行与公司行为必需参考集并更新逐数据集 SLA。"""
+    from app.services.execution_reference_sync import (
+        refresh_execution_references,
+    )
+
+    db = SessionLocal()
+    try:
+        with track_sync_run(db, "execution_references") as record:
+            result = refresh_execution_references(db)
+            datasets = result["datasets"]
+            failed = [
+                name
+                for name, item in datasets.items()
+                if item["status"] == "failed"
+            ]
+            record(
+                total=len(datasets),
+                updated=len(datasets) - len(failed),
+                failed=len(failed),
+                data_date=date.fromisoformat(str(result["as_of"])),
+            )
+            if failed:
+                raise RuntimeError(
+                    "必需参考数据同步失败：" + ",".join(sorted(failed))
+                )
+        logger.info("A股执行参考数据刷新完成：%s", result)
+    except Exception:
+        logger.exception("A股执行参考数据刷新失败")
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _sync_index_reference() -> None:
+    """同步官方指数当前成员/权重并冻结当前行业 PIT 观测。"""
+    from app.services.index_reference_sync import (
+        capture_industry_pit,
+        sync_official_index_weights,
+    )
+
+    db = SessionLocal()
+    try:
+        with track_sync_run(db, "index_reference") as record:
+            weights = sync_official_index_weights(db)
+            industries = capture_industry_pit(db)
+            record(
+                total=2,
+                updated=2,
+                failed=0,
+                data_date=date.today(),
+            )
+        logger.info(
+            "指数权重与行业 PIT 同步完成：weights=%s industries=%s",
+            weights,
+            industries,
+        )
+    except Exception:
+        logger.exception("指数权重与行业 PIT 同步失败")
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def _sync_fund_catalog() -> None:
     try:
         from app.services.fund_catalog import sync_fund_catalog
@@ -274,7 +391,9 @@ def _sync_candidate_pool_nav(batch_size: int = 25) -> None:
 
     db = SessionLocal()
     try:
-        pool = db.scalar(select(CandidatePool).order_by(CandidatePool.created_at.desc()).limit(1))
+        pool = db.scalar(
+            select(CandidatePool).order_by(CandidatePool.created_at.desc()).limit(1)
+        )
         if pool is None:
             return
         rows = db.execute(
@@ -290,12 +409,18 @@ def _sync_candidate_pool_nav(batch_size: int = 25) -> None:
         ).all()
         with track_sync_run(db, "candidate_pool_nav") as record:
             results = [
-                backfill_fund_nav_history(db, instrument, years=5, resume=True, use_fallback=True)
+                backfill_fund_nav_history(
+                    db, instrument, years=5, resume=True, use_fallback=True
+                )
                 for instrument, _member in rows
             ]
             candidate_pool_service.refresh_member_nav_status(db, pool.id)
             failed = sum(1 for item in results if item["status"] == "failed")
-            updated = sum(1 for item in results if item["status"] in {"complete", "partial", "skipped"})
+            updated = sum(
+                1
+                for item in results
+                if item["status"] in {"complete", "partial", "skipped"}
+            )
             record(total=len(rows), updated=updated, failed=failed)
         logger.info("候选池 #%s 历史净值批量回填完成：%s", pool.id, results)
     except Exception:
@@ -348,7 +473,10 @@ def _sync_stock_market_close() -> bool:
             )
             logger.info("A股全市场收盘估值完成：%s", valuation_result)
         logger.info("A股全市场收盘快照完成：%s", result)
-        return result.get("status") in {"success", "partial"} and result.get("updated", 0) > 0
+        return (
+            result.get("status") in {"success", "partial"}
+            and result.get("updated", 0) > 0
+        )
     except Exception:
         logger.exception("A股全市场收盘快照失败")
         db.rollback()
@@ -376,7 +504,9 @@ def _mark_stock_daily_timeout(timeout_minutes: int) -> None:
             state.status = "partial"
             state.finished_at = datetime.now(UTC)
             timeout_note = f"超过 {timeout_minutes} 分钟，已终止；下次从 {state.last_code or '断点'} 继续"
-            state.detail = f"{state.detail}; {timeout_note}" if state.detail else timeout_note
+            state.detail = (
+                f"{state.detail}; {timeout_note}" if state.detail else timeout_note
+            )
         db.commit()
     except Exception:
         logger.exception("收口 A 股日线超时状态失败")
@@ -453,7 +583,9 @@ def _run_stock_daily_subprocess() -> None:
         if completed.returncode != 0:
             logger.error("A股日线子进程异常退出，返回码：%s", completed.returncode)
     except subprocess.TimeoutExpired:
-        logger.error("A股日线同步超过 %s 分钟，已终止，不再阻塞基金任务", timeout_minutes)
+        logger.error(
+            "A股日线同步超过 %s 分钟，已终止，不再阻塞基金任务", timeout_minutes
+        )
         _mark_stock_daily_timeout(timeout_minutes)
     except Exception:
         logger.exception("启动 A 股日线子进程失败")
@@ -564,6 +696,12 @@ def next_run_times(now: datetime | None = None) -> dict[str, datetime]:
         "stock_daily": _next_daily(now, 17, 5),
         # 收盘前维护当前指数成分的行业和财务覆盖，新成分会自动补齐。
         "stock_reference": _next_daily(now, 16, 10),
+        # 当前成分/权重使用中证官方收盘权重，行业变更进入 PIT。
+        "index_reference": _next_daily(now, 16, 50),
+        # 收盘行情落库后刷新停牌、涨跌停、分红和名称变更。
+        "execution_references": _next_daily(now, 17, 50),
+        # 日线任务后导入分红/送转主数据并做冲突检测，模拟盘前完成。
+        "corporate_actions": _next_daily(now, 18, 10),
         # 等待 A 股同步子进程（最长 60 分钟）结束后再推进前向模拟。
         "stock_paper": _next_daily(now, 18, 30),
         # 全市场基金目录每周日凌晨同步
@@ -590,6 +728,16 @@ def _backup_and_verify() -> None:
             database_url=settings.database_url,
             research_data_dir=Path(settings.research_data_dir),
             destination=destination,
+            encryption_key=(
+                settings.backup_encryption_key.get_secret_value()
+                if settings.backup_encryption_key is not None
+                else None
+            ),
+            offsite_directory=(
+                Path(settings.backup_offsite_dir)
+                if settings.backup_offsite_dir
+                else None
+            ),
         )
         verify_backup(destination)
     finally:
@@ -638,9 +786,7 @@ def _run_persisted(
                 ).all()
             )
             if not set(depends_on).issubset(completed):
-                job.error = "等待依赖：" + ",".join(
-                    sorted(set(depends_on) - completed)
-                )
+                job.error = "等待依赖：" + ",".join(sorted(set(depends_on) - completed))
                 db.commit()
                 return
         now = now_cn()
@@ -693,6 +839,9 @@ def main() -> None:
     next_holdings = schedule["holdings"]
     next_stock_daily = schedule["stock_daily"]
     next_stock_reference = schedule["stock_reference"]
+    next_index_reference = schedule["index_reference"]
+    next_execution_references = schedule["execution_references"]
+    next_corporate_actions = schedule["corporate_actions"]
     next_stock_paper = schedule["stock_paper"]
     next_fund_catalog = schedule["fund_catalog"]
     next_candidate_pool_nav = schedule["candidate_pool_nav"]
@@ -705,6 +854,9 @@ def main() -> None:
         next_nav_late.isoformat(),
     )
     while True:
+        _HEARTBEAT_PATH.write_text(
+            datetime.now(UTC).isoformat(), encoding="utf-8"
+        )
         now = now_cn()
         if now >= next_news:
             _run_persisted("news", next_news, _sync_news)
@@ -735,9 +887,7 @@ def main() -> None:
             )
             next_nav_late += timedelta(days=1)
         if now >= next_us_indices:
-            _run_persisted(
-                "us_indices", next_us_indices, lambda: _sync_us_indices()
-            )
+            _run_persisted("us_indices", next_us_indices, lambda: _sync_us_indices())
             next_us_indices += timedelta(days=1)
         if now >= next_holdings:
             _run_persisted("holdings", next_holdings, _sync_holdings)
@@ -758,18 +908,44 @@ def main() -> None:
                 "stock_reference", next_stock_reference, _sync_stock_reference
             )
             next_stock_reference += timedelta(days=1)
+        if now >= next_index_reference:
+            _run_persisted(
+                "index_reference",
+                next_index_reference,
+                _sync_index_reference,
+                depends_on=["stock_reference"],
+            )
+            next_index_reference += timedelta(days=1)
+        if now >= next_execution_references:
+            _run_persisted(
+                "execution_references",
+                next_execution_references,
+                _sync_execution_references,
+                depends_on=["stock_daily"],
+            )
+            next_execution_references += timedelta(days=1)
+        if now >= next_corporate_actions:
+            _run_persisted(
+                "corporate_actions",
+                next_corporate_actions,
+                _sync_corporate_actions,
+                depends_on=["stock_daily", "execution_references"],
+            )
+            next_corporate_actions += timedelta(days=1)
         if now >= next_stock_paper:
             _run_persisted(
                 "stock_paper",
                 next_stock_paper,
                 _run_stock_paper,
-                depends_on=["stock_daily"],
+                depends_on=[
+                    "stock_daily",
+                    "execution_references",
+                    "corporate_actions",
+                ],
             )
             next_stock_paper += timedelta(days=1)
         if now >= next_fund_catalog:
-            _run_persisted(
-                "fund_catalog", next_fund_catalog, _sync_fund_catalog
-            )
+            _run_persisted("fund_catalog", next_fund_catalog, _sync_fund_catalog)
             next_fund_catalog += timedelta(days=7)
         if now >= next_candidate_pool_nav:
             _run_persisted(

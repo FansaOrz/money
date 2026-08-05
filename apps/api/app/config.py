@@ -6,7 +6,7 @@
 
 from functools import lru_cache
 
-from pydantic import SecretStr, field_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,11 +27,28 @@ class Settings(BaseSettings):
     admin_api_key: SecretStr | None = None
     broker_adapter: str = "simulated"
     broker_api_key: SecretStr | None = None
+    alert_webhook_url: SecretStr | None = None
+    alert_ack_sla_minutes: int = 15
+    backup_encryption_key: SecretStr | None = None
+    backup_offsite_dir: str | None = None
+    require_tls: bool = True
+    trusted_hosts: list[str] = ["localhost", "127.0.0.1", "testserver"]
+    identity_signing_key: SecretStr | None = None
+    high_risk_api_key: SecretStr | None = None
+    enforce_high_risk_preflight: bool = False
+    live_bind_host: str = "127.0.0.1"
+    trusted_proxy_ips: list[str] = ["127.0.0.1"]
+    maximum_clock_offset_seconds: float = 1.0
 
     # 数据库连接串。
     # SQLite（默认开发）: sqlite:///./money.db
     # PostgreSQL（生产）: postgresql+psycopg://user:password@host:5432/money
     database_url: str = "sqlite:///./money.db"
+    database_pool_size: int = 10
+    database_max_overflow: int = 20
+    database_pool_timeout_seconds: int = 10
+    database_statement_timeout_ms: int = 30_000
+    database_lock_timeout_ms: int = 5_000
 
     # 允许跨域的前端来源
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -68,6 +85,14 @@ class Settings(BaseSettings):
     news_llm_model: str = ""
     news_llm_timeout_seconds: int = 30
 
+    @model_validator(mode="after")
+    def production_database_must_be_postgresql(self) -> "Settings":
+        if self.environment == "production" and self.database_url.startswith(
+            "sqlite"
+        ):
+            raise ValueError("production 必须使用 PostgreSQL，禁止 SQLite")
+        return self
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def split_cors_origins(cls, value: object) -> object:
@@ -76,6 +101,13 @@ class Settings(BaseSettings):
         """
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
+
+    @field_validator("trusted_hosts", "trusted_proxy_ips", mode="before")
+    @classmethod
+    def split_string_lists(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
 

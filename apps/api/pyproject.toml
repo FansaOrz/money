@@ -14,12 +14,15 @@ dependencies = [
     "python-multipart>=0.0.9",
     "requests>=2.31",
     "pandas>=2.0",
+    "numpy>=1.26",
+    "cvxpy>=1.6,<2",
     "lxml>=5.0",
     "akshare>=1.17,<2",
     # 研究数据仓库（DuckDB + Parquet 分区目录）
     "duckdb>=1.0",
     "pyarrow>=14.0",
     "alembic>=1.13",
+    "cryptography>=43,<47",
 ]
 
 [project.optional-dependencies]
@@ -27,10 +30,14 @@ dev = [
     "pytest>=8.0",
     "httpx>=0.27",
     "ruff>=0.12",
+    "hypothesis>=6.100,<7",
 ]
 # PostgreSQL 部署时安装: pip install "money-api[postgres]"
 postgres = [
     "psycopg[binary]>=3.1",
+]
+ml = [
+    "xgboost>=2.1,<4",
 ]
 
 [build-system]

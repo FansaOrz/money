@@ -1,0 +1,12 @@
+{
+	auto_https off
+	admin off
+}
+
+:8443 {
+	tls internal
+	respond /gateway-health 200
+	reverse_proxy api:8000 {
+		header_up Host localhost
+	}
+}

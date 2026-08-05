@@ -2,41 +2,158 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-money}
       POSTGRES_USER: ${POSTGRES_USER:-money}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    command:
+      - postgres
+      - -c
+      - max_connections=150
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - wal_level=replica
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-money} -d ${POSTGRES_DB:-money}"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: "no"
+    environment: &api_environment
+      MONEY_ENVIRONMENT: production
+      MONEY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-money}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-money}
+      MONEY_AUTO_CREATE_TABLES: "false"
+      MONEY_READONLY_API_KEY: ${MONEY_READONLY_API_KEY:?MONEY_READONLY_API_KEY is required}
+      MONEY_ADMIN_API_KEY: ${MONEY_ADMIN_API_KEY:?MONEY_ADMIN_API_KEY is required}
+      MONEY_HIGH_RISK_API_KEY: ${MONEY_HIGH_RISK_API_KEY:?MONEY_HIGH_RISK_API_KEY is required}
+      MONEY_IDENTITY_SIGNING_KEY: ${MONEY_IDENTITY_SIGNING_KEY:?MONEY_IDENTITY_SIGNING_KEY is required}
+      MONEY_BACKUP_ENCRYPTION_KEY: ${MONEY_BACKUP_ENCRYPTION_KEY:?MONEY_BACKUP_ENCRYPTION_KEY is required}
+      MONEY_REQUIRE_TLS: "true"
+      MONEY_ENFORCE_HIGH_RISK_PREFLIGHT: "true"
+      MONEY_CORS_ORIGINS: ${MONEY_CORS_ORIGINS:-http://127.0.0.1:3000}
+      MONEY_RESEARCH_DATA_DIR: /data/research
+      MONEY_RESEARCH_DB: /data/research/research.duckdb
+      MONEY_DATABASE_POOL_SIZE: ${MONEY_DATABASE_POOL_SIZE:-10}
+      MONEY_DATABASE_MAX_OVERFLOW: ${MONEY_DATABASE_MAX_OVERFLOW:-20}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
 
   api:
     build:
       context: ..
       dockerfile: apps/api/Dockerfile
     restart: unless-stopped
-    environment:
-      MONEY_DATABASE_URL: ${MONEY_DATABASE_URL:-postgresql+psycopg://money:change-me@db:5432/money}
-      MONEY_CORS_ORIGINS: ${MONEY_CORS_ORIGINS:-http://localhost:3000}
-      MONEY_IMPORT_SESSION_TTL_MINUTES: ${MONEY_IMPORT_SESSION_TTL_MINUTES:-30}
-      MONEY_RESEARCH_DATA_DIR: /data/research
-      MONEY_RESEARCH_DB: /data/research/research.duckdb
-    ports:
-      - "8000:8000"
+    stop_grace_period: 30s
+    environment: *api_environment
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - ${MONEY_TRUSTED_PROXY_IPS:-127.0.0.1}
     volumes:
       - research_data:/data/research
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; r=urllib.request.Request('http://localhost:8000/api/health',headers={'X-API-Key':os.environ['MONEY_READONLY_API_KEY']}); urllib.request.urlopen(r,timeout=3)"
+        ]
       interval: 15s
       timeout: 5s
+      retries: 8
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+
+  gateway:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    stop_grace_period: 20s
+    ports:
+      - "127.0.0.1:${MONEY_API_TLS_PORT:-8443}:8443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "--spider",
+          "--no-check-certificate",
+          "https://localhost:8443/gateway-health"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment: *api_environment
+    command: ["python", "-m", "app.services.scheduler"]
+    volumes:
+      - research_data:/data/research
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from app.services.scheduler import scheduler_heartbeat_ok; raise SystemExit(0 if scheduler_heartbeat_ok() else 1)"
+        ]
+      interval: 30s
+      timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: "3.0"
 
   web:
     build:
@@ -45,14 +162,31 @@ services:
       args:
         API_PROXY_URL: http://api:8000
     restart: unless-stopped
+    stop_grace_period: 20s
     environment:
-      API_PROXY_URL: http://api:8000
+      API_PROXY_URL: https://gateway:8443
+      API_PROXY_KEY: ${MONEY_READONLY_API_KEY}
+      NODE_EXTRA_CA_CERTS: /caddy-pki/caddy/pki/authorities/local/root.crt
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${MONEY_WEB_PORT:-3000}:3000"
     depends_on:
-      api:
+      gateway:
         condition: service_healthy
+    volumes:
+      - caddy_data:/caddy-pki:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
 
 volumes:
   postgres_data:
   research_data:
+  caddy_data:
+  caddy_config:
