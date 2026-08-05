@@ -996,6 +996,14 @@ def prepare_forward_account(
         "holdout_evaluations": validation.get("holdout_evaluations"),
         "walkforward_folds": len(validation.get("folds", [])),
         "holdout_sharpe": holdout.get("sharpe"),
+        "holdout_trade_count": holdout.get("trade_count"),
+        "holdout_turnover": holdout.get("turnover"),
+        "holdout_non_empty_target_count": holdout.get(
+            "non_empty_target_count"
+        ),
+        "holdout_average_target_invested_weight": holdout.get(
+            "average_target_invested_weight"
+        ),
         "benchmark_kind": holdout.get("benchmark_kind"),
         "benchmark_code": holdout.get("benchmark_code"),
         "benchmark_name": holdout.get("benchmark_name"),

@@ -586,6 +586,8 @@ def test_strategy_lifecycle_blocks_skips_and_requires_gates(db_session) -> None:
             "holdout_evaluations": 1,
             "walkforward_folds": 3,
             "holdout_sharpe": 0.5,
+            "holdout_trade_count": 12,
+            "holdout_turnover": 0.4,
             "validation_scope": "operational_only",
         },
         actor="tester",
@@ -617,6 +619,27 @@ def test_strategy_lifecycle_blocks_skips_and_requires_gates(db_session) -> None:
         )
 
 
+def test_operational_validation_rejects_cash_only_holdout(db_session) -> None:
+    version = _version(db_session, operational_only=True)
+    with pytest.raises(ValueError, match="没有任何真实模拟成交"):
+        strategy_lifecycle.transition(
+            db_session,
+            version.id,
+            "operational_validated",
+            evidence={
+                "data_coverage": 0.99,
+                "holdout_evaluations": 1,
+                "walkforward_folds": 3,
+                "holdout_sharpe": 0.5,
+                "holdout_trade_count": 0,
+                "holdout_turnover": 0.0,
+                "validation_scope": "operational_only",
+            },
+            actor="tester",
+            reason="现金策略不能验证交易链路",
+        )
+
+
 def test_stock_strategy_validation_evidence_cannot_be_faked(db_session) -> None:
     version = _version(db_session, operational_only=True)
     common = {
@@ -624,6 +647,8 @@ def test_stock_strategy_validation_evidence_cannot_be_faked(db_session) -> None:
         "holdout_evaluations": 1,
         "walkforward_folds": 3,
         "holdout_sharpe": 0.5,
+        "holdout_trade_count": 12,
+        "holdout_turnover": 0.4,
         "validation_scope": "operational_only",
         "validation_sha256": "frozen-hash",
         "generated_by": "stock_validation.run_stock_walk_forward",
@@ -687,6 +712,8 @@ def test_stock_strategy_frozen_benchmark_evidence_rejects_tampering(
         "holdout_evaluations": 1,
         "walkforward_folds": 3,
         "holdout_sharpe": 0.5,
+        "holdout_trade_count": 12,
+        "holdout_turnover": 0.4,
         "validation_scope": "operational_only",
         "validation_sha256": "frozen-hash",
         "generated_by": "stock_validation.run_stock_walk_forward",

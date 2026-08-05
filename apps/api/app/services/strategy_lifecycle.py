@@ -70,6 +70,8 @@ def evaluate_gates(
         evaluations = evidence.get("holdout_evaluations")
         folds = evidence.get("walkforward_folds")
         sharpe = _number(evidence, "holdout_sharpe")
+        trade_count = evidence.get("holdout_trade_count")
+        turnover = _number(evidence, "holdout_turnover")
         _check(
             results,
             failures,
@@ -105,6 +107,28 @@ def evaluate_gates(
             expected="finite number（仅证明已计算，不证明Alpha）",
             passed=sharpe is not None,
             message="缺少留出集 Sharpe",
+        )
+        _check(
+            results,
+            failures,
+            key="holdout_trade_count",
+            actual=trade_count,
+            expected=">=1",
+            passed=(
+                isinstance(trade_count, int)
+                and not isinstance(trade_count, bool)
+                and trade_count >= 1
+            ),
+            message="留出集没有任何真实模拟成交，不能验证交易链路",
+        )
+        _check(
+            results,
+            failures,
+            key="holdout_turnover",
+            actual=turnover,
+            expected=">0",
+            passed=turnover is not None and turnover > 0,
+            message="留出集换手率为零，策略实际只持有现金",
         )
         _check(
             results,

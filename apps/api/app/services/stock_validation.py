@@ -195,6 +195,18 @@ def _metrics(outcome: BacktestOutcome) -> dict[str, object]:
         "comparator_metrics": comparator_metrics,
         "max_drawdown": quant_stats.max_drawdown(outcome.equity),
         "turnover": outcome.avg_turnover,
+        "trade_count": sum(
+            len(rebalance.fills) for rebalance in outcome.rebalances
+        ),
+        "non_empty_target_count": sum(
+            bool(rebalance.target) for rebalance in outcome.rebalances
+        ),
+        "average_target_invested_weight": (
+            sum(1.0 - rebalance.cash_weight for rebalance in outcome.rebalances)
+            / len(outcome.rebalances)
+            if outcome.rebalances
+            else 0.0
+        ),
         "fees": outcome.total_fees,
         "trading_days": len(outcome.calendar),
         "rebalance_count": len(outcome.rebalances),
