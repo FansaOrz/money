@@ -834,6 +834,10 @@ def prepare_forward_account(
             "git_sha": git_sha,
             "git_worktree_clean": True,
             "git_status_sha256": hashlib.sha256(git_status.encode()).hexdigest(),
+            "validation_period": {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            },
         }
     )
     version.params = params
