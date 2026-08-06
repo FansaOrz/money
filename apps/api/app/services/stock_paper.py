@@ -90,7 +90,7 @@ from app.services.stock_repository import (
 from app.timezone import now_cn
 
 STRATEGY_NAME = "A股多因子规则V7-版本11零中心证据门控版"
-OPERATIONAL_SHADOW_NAME = "A股多因子规则V7-版本14运行影子镜像"
+OPERATIONAL_SHADOW_NAME = "A股多因子规则V7-版本15运行影子镜像"
 MODEL_VERSION = "stock_rules_v7"
 ACCOUNT_NAME = "A股规则策略模拟账户"
 INITIAL_CAPITAL = Decimal("1000000.00")
