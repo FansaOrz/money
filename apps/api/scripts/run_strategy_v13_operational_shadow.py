@@ -1,4 +1,4 @@
-"""创建版本12运行影子；只用开发数据验证链路，不读取正式留出集。"""
+"""创建版本13运行影子；只用开发数据验证链路，不读取正式留出集。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ REPLAY_FOLDS = (
 )
 VALIDATION_START = date(2022, 1, 4)
 VALIDATION_END = date(2022, 12, 29)
-GENERATOR = "scripts.run_strategy_v12_operational_shadow.run_development_replay"
+GENERATOR = "scripts.run_strategy_v13_operational_shadow.run_development_replay"
 
 
 def _config(
@@ -170,7 +170,7 @@ def run() -> dict[str, object]:
             if result is not None:
                 return result
             raise RuntimeError(
-                f"版本12已有未完成记录 id={existing.id} status={existing.status}"
+                f"版本13已有未完成记录 id={existing.id} status={existing.status}"
             )
 
         source = db.get(StrategyVersion, SOURCE_VERSION_ID)
@@ -272,7 +272,7 @@ def run() -> dict[str, object]:
                 repository=repository,
             )
             stock_validation._assert_strategy_activity(
-                outcome, stage=f"版本12运行回放折{index}"
+                outcome, stage=f"版本13运行回放折{index}"
             )
             folds.append(stock_validation._metrics(outcome))
         validation_outcome = stock_backtest.run_backtest(
@@ -285,10 +285,10 @@ def run() -> dict[str, object]:
             repository=repository,
         )
         stock_validation._assert_strategy_activity(
-            validation_outcome, stage="版本12运行回放验证段"
+            validation_outcome, stage="版本13运行回放验证段"
         )
         validation = {
-            "kind": "strategy_v12_operational_development_replay",
+            "kind": "strategy_v13_operational_development_replay",
             "folds": folds,
             "validation": stock_validation._metrics(validation_outcome),
             "holdout_evaluations": 0,
@@ -309,7 +309,7 @@ def run() -> dict[str, object]:
             version.id,
             "operational_validated",
             evidence=evidence,
-            actor="system:strategy-v12-operational-shadow",
+            actor="system:strategy-v13-operational-shadow",
             reason=("三个开发折与一个开发验证段的运行链路回放通过；未访问正式留出集"),
         )
         version = strategy_lifecycle.transition(
@@ -320,13 +320,13 @@ def run() -> dict[str, object]:
                 "experiment_snapshot_complete": True,
                 "validation_sha256": validation_sha256,
             },
-            actor="system:strategy-v12-operational-shadow",
+            actor="system:strategy-v13-operational-shadow",
             reason=("代码、候选池、冻结权重与运行回放证据已冻结，启动两个月运行影子"),
         )
         account, _ = stock_paper._ensure_account(db, data_date)
         db.add(
             AuditLog(
-                actor="system:strategy-v12-operational-shadow",
+                actor="system:strategy-v13-operational-shadow",
                 action="operational_shadow_started",
                 resource_type="strategy_version",
                 resource_id=str(version.id),

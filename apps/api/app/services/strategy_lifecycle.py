@@ -470,7 +470,7 @@ def transition(
         trusted_generators = {"stock_validation.run_stock_walk_forward"}
         if to_status == "operational_validated":
             trusted_generators.add(
-                "scripts.run_strategy_v12_operational_shadow.run_development_replay"
+                "scripts.run_strategy_v13_operational_shadow.run_development_replay"
             )
         if evidence.get("generated_by") not in trusted_generators:
             failures.append("股票验证证据不是由系统走步验证生成")
