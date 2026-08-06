@@ -4,6 +4,9 @@ from datetime import date
 
 from scripts.backfill_validated_price_limits import (
     complete_leading_name_period,
+    dated_name_periods,
+    fetch_required_public_names,
+    read_public_name_cache,
 )
 
 
@@ -39,3 +42,74 @@ def test_leading_period_is_not_inferred_without_ordered_predecessor() -> None:
 
     assert completed == periods
     assert predecessor is None
+
+
+def test_no_public_name_request_when_no_dated_name_needs_crosscheck(
+    tmp_path,
+) -> None:
+    cache = tmp_path / "public-names.json"
+
+    result = fetch_required_public_names(
+        [],
+        cache_path=cache,
+        workers=2,
+        timeout_seconds=1,
+    )
+
+    assert result == {}
+    assert not cache.exists()
+
+
+def test_public_name_cache_is_reused_without_network(tmp_path) -> None:
+    cache = tmp_path / "public-names.json"
+    cache.write_text(
+        '{"entries":{"600291":{"names":["西水股份","*ST西水"]}}}',
+        encoding="utf-8",
+    )
+
+    result = fetch_required_public_names(
+        ["600291"],
+        cache_path=cache,
+        workers=1,
+        timeout_seconds=1,
+    )
+
+    assert result == {"600291": ["西水股份", "*ST西水"]}
+    assert read_public_name_cache(cache) == result
+
+
+def test_single_name_from_listing_is_closed_by_stock_basic(tmp_path) -> None:
+    import pandas as pd
+
+    snapshot = tmp_path / "snapshot"
+    name_dir = snapshot / "stocks" / "namechange"
+    basic_dir = snapshot / "global" / "stock_basic"
+    name_dir.mkdir(parents=True)
+    basic_dir.mkdir(parents=True)
+    name_path = name_dir / "603290.SH.parquet"
+    basic_path = basic_dir / "L.parquet"
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "603290.SH",
+                "name": "斯达半导",
+                "start_date": "20200204",
+                "end_date": None,
+            }
+        ]
+    ).to_parquet(name_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "603290.SH",
+                "name": "斯达半导",
+                "list_date": "20200204",
+            }
+        ]
+    ).to_parquet(basic_path, index=False)
+
+    periods, sources, mode = dated_name_periods(snapshot, "603290.SH")
+
+    assert periods == [(date(2020, 2, 4), None, "斯达半导")]
+    assert sources == (name_path, basic_path)
+    assert mode == ("tushare.namechange.dated_single_from_listing+stock_basic.current")

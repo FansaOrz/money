@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--evidence-output", type=Path, required=True)
+    parser.add_argument(
+        "--public-name-cache",
+        type=Path,
+        help="AkShare 历史名称缓存；默认写在证据报告旁，成功单股会立即落盘",
+    )
     parser.add_argument("--name-workers", type=int, default=4)
     parser.add_argument("--name-timeout-seconds", type=int, default=90)
     return parser.parse_args()
@@ -59,6 +64,76 @@ def historical_names(code: str, *, timeout_seconds: int) -> list[str]:
     ]
 
 
+def read_public_name_cache(path: Path) -> dict[str, list[str]]:
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    entries = dict(payload.get("entries") or {})
+    return {
+        str(code): [
+            str(name).strip()
+            for name in dict(item).get("names", [])
+            if str(name).strip()
+        ]
+        for code, item in entries.items()
+    }
+
+
+def write_public_name_cache(path: Path, names_by_code: dict[str, list[str]]) -> None:
+    payload = {
+        "source": "akshare.stock_info_change_name",
+        "updated_at": datetime.now(UTC).isoformat(),
+        "entries": {
+            code: {"names": names} for code, names in sorted(names_by_code.items())
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def fetch_required_public_names(
+    codes: list[str],
+    *,
+    cache_path: Path,
+    workers: int,
+    timeout_seconds: int,
+) -> dict[str, list[str]]:
+    cached = read_public_name_cache(cache_path)
+    missing = [code for code in codes if not cached.get(code)]
+    if not missing:
+        return {code: cached[code] for code in codes}
+    failures: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(missing)))) as executor:
+        future_codes = {
+            executor.submit(
+                historical_names,
+                code,
+                timeout_seconds=timeout_seconds,
+            ): code
+            for code in missing
+        }
+        for future in as_completed(future_codes):
+            code = future_codes[future]
+            try:
+                names = future.result()
+                if not names:
+                    raise RuntimeError("公开历史名称响应为空")
+                cached[code] = names
+                # 单股成功即持久化，后续某只超时不会抹掉已经取得的证据。
+                write_public_name_cache(cache_path, cached)
+            except Exception as exc:  # noqa: BLE001 - 汇总所有外部接口失败
+                failures[code] = str(exc)
+    if failures:
+        detail = "；".join(f"{code}: {message}" for code, message in failures.items())
+        raise RuntimeError(f"AkShare 历史名称交叉验证失败：{detail}")
+    return {code: cached[code] for code in codes}
+
+
 def complete_leading_name_period(
     periods: list[tuple[date, date | None, str]],
     public_names: list[str],
@@ -71,9 +146,7 @@ def complete_leading_name_period(
     if required_start >= earliest[0]:
         return periods, None
     matching_indices = [
-        index
-        for index, name in enumerate(public_names)
-        if name == earliest[2]
+        index for index, name in enumerate(public_names) if name == earliest[2]
     ]
     if not matching_indices or matching_indices[0] == 0:
         return periods, None
@@ -114,6 +187,27 @@ def dated_name_periods(
             periods.append((start, end, name))
         if not periods:
             raise RuntimeError(f"{ts_code} 带日期名称证据为空")
+        basic_path = snapshot / "global" / "stock_basic" / "L.parquet"
+        if len(periods) == 1 and periods[0][1] is None and basic_path.is_file():
+            basic = pd.read_parquet(basic_path)
+            matched = basic[basic["ts_code"].astype(str) == ts_code]
+            if len(matched) == 1:
+                current_name = str(matched.iloc[0]["name"] or "").strip()
+                list_text = str(matched.iloc[0]["list_date"] or "")
+                list_date = (
+                    date.fromisoformat(
+                        f"{list_text[:4]}-{list_text[4:6]}-{list_text[6:8]}"
+                    )
+                    if len(list_text) >= 8
+                    else None
+                )
+                if periods[0][0] == list_date and periods[0][2] == current_name:
+                    return (
+                        periods,
+                        (path, basic_path),
+                        "tushare.namechange.dated_single_from_listing"
+                        "+stock_basic.current",
+                    )
         return periods, (path,), "tushare.namechange.dated"
 
     # “没有改名记录”与“接口失败”不可混为一谈。只有保存的成功空响应、
@@ -156,8 +250,10 @@ def main() -> None:
         "generated_at": generated_at.isoformat(),
         "period": {"start": start.isoformat(), "end": end.isoformat()},
         "reference_source": "tushare.daily.pre_close",
-        "name_evidence_source": (
-            "tushare.namechange.dated+akshare.stock_info_change_name.crosscheck"
+        "name_evidence_policy": (
+            "有改名记录使用 tushare.namechange.dated 与 "
+            "akshare.stock_info_change_name 交叉确认；成功空响应使用 "
+            "tushare.namechange.empty 与 stock_basic.current 闭环"
         ),
         "partitions": [],
     }
@@ -167,34 +263,49 @@ def main() -> None:
         for raw_code in args.codes.split(",")
         if raw_code.strip()
     ]
-    with ThreadPoolExecutor(
-        max_workers=max(1, min(args.name_workers, len(codes)))
-    ) as executor:
-        fetched_names = dict(
-            zip(
-                codes,
-                executor.map(
-                    lambda code: historical_names(
-                        code,
-                        timeout_seconds=args.name_timeout_seconds,
-                    ),
-                    codes,
-                ),
-                strict=True,
-            )
-        )
+    name_materials: dict[
+        str,
+        tuple[list[tuple[date, date | None, str]], tuple[Path, ...], str],
+    ] = {}
     for code in codes:
         if not code.startswith(("00", "001", "002", "003", "6")):
             raise RuntimeError(f"{code} 不是本脚本允许的沪深主板证券")
-        names = fetched_names[code]
         ts_code = qualified_code(code)
-        periods, name_sources, dated_name_mode = dated_name_periods(snapshot, ts_code)
+        name_materials[code] = dated_name_periods(snapshot, ts_code)
+    dated_codes = [
+        code
+        for code, (_periods, _sources, mode) in name_materials.items()
+        if mode == "tushare.namechange.dated"
+    ]
+    cache_path = (
+        args.public_name_cache.resolve()
+        if args.public_name_cache
+        else args.evidence_output.resolve().with_suffix(".public-names.json")
+    )
+    fetched_names = fetch_required_public_names(
+        dated_codes,
+        cache_path=cache_path,
+        workers=args.name_workers,
+        timeout_seconds=args.name_timeout_seconds,
+    )
+    for code in codes:
+        periods, name_sources, dated_name_mode = name_materials[code]
+        names = (
+            fetched_names[code]
+            if dated_name_mode == "tushare.namechange.dated"
+            else [name for _period_start, _period_end, name in periods]
+        )
+        ts_code = qualified_code(code)
         periods, inferred_predecessor = complete_leading_name_period(
             periods,
             names,
             start,
         )
-        dated_names = {name for _start, _end, name in periods}
+        dated_names = {
+            name
+            for period_start, period_end, name in periods
+            if period_start <= end and (period_end is None or period_end >= start)
+        }
         public_names = {name for name in names if name}
         if dated_name_mode == "tushare.namechange.dated" and not dated_names.issubset(
             public_names
@@ -207,6 +318,11 @@ def main() -> None:
             # 声称区间内存在 ST 名称。
             if dated_name_mode != "tushare.namechange.dated":
                 raise RuntimeError(f"{code} AkShare 名称序列含 ST/退市标识")
+        name_evidence_source = (
+            "tushare.namechange.dated+akshare.stock_info_change_name.crosscheck"
+            if dated_name_mode == "tushare.namechange.dated"
+            else dated_name_mode
+        )
         daily_path = snapshot / "stocks" / "daily" / f"{ts_code}.parquet"
         target = snapshot / "stocks" / "stk_limit" / f"{ts_code}.parquet"
         if target.exists():
@@ -245,10 +361,7 @@ def main() -> None:
                     "rule_version": derived.rule_version,
                     "source": "validated_derived",
                     "reference_source": "tushare.daily.pre_close",
-                    "name_evidence_source": (
-                        "tushare.namechange.dated+"
-                        "akshare.stock_info_change_name.crosscheck"
-                    ),
+                    "name_evidence_source": name_evidence_source,
                     "name_as_of": active_name,
                     "algorithm_version": ALGORITHM_VERSION,
                     "generated_at": generated_at.isoformat(),
@@ -275,6 +388,7 @@ def main() -> None:
                     for period_start, period_end, name in periods
                 ],
                 "dated_name_mode": dated_name_mode,
+                "name_evidence_source": name_evidence_source,
                 "inferred_public_predecessor": inferred_predecessor,
                 "dated_name_sources": [
                     {
@@ -283,6 +397,14 @@ def main() -> None:
                     }
                     for source_path in name_sources
                 ],
+                "public_name_cache": (
+                    {
+                        "path": str(cache_path),
+                        "sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
+                    }
+                    if dated_name_mode == "tushare.namechange.dated"
+                    else None
+                ),
                 "output": str(target),
             }
         )
