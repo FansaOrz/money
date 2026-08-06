@@ -105,6 +105,48 @@ class ForwardRepository:
         return {}
 
 
+def test_formal_validation_completion_separates_operational_and_investment_status() -> (
+    None
+):
+    failed = stock_paper.formal_validation_completion_metadata(
+        {
+            "net_excess_return": -0.01,
+            "alpha_evidence_status": "alpha_evidence_insufficient",
+            "quintile_gate_status": "failed",
+            "active_alpha_gate_status": "failed",
+            "stability_gate_status": "failed",
+            "robustness_gate_status": "failed",
+        }
+    )
+    assert failed == {
+        "formal_validation_status": "completed",
+        "formal_validation_scope": ("operational_only_with_investment_diagnostics"),
+        "operational_validation_status": "passed",
+        "investment_validation_status": "evidence_failed",
+        "investment_validation_failed_gates": [
+            "net_excess_return",
+            "composite_ic",
+            "quintile",
+            "active_alpha",
+            "stability",
+            "robustness",
+        ],
+    }
+
+    passed = stock_paper.formal_validation_completion_metadata(
+        {
+            "net_excess_return": 0.01,
+            "alpha_evidence_status": "alpha_evidence_sufficient",
+            "quintile_gate_status": "passed",
+            "active_alpha_gate_status": "passed",
+            "stability_gate_status": "passed",
+            "robustness_gate_status": "passed",
+        }
+    )
+    assert passed["investment_validation_status"] == "evidence_passed"
+    assert passed["investment_validation_failed_gates"] == []
+
+
 def _seed_trial(db: Session) -> tuple[ForwardRepository, date]:
     first_day = date(2025, 1, 1)
     signal_day = first_day + timedelta(days=299)

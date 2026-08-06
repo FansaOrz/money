@@ -140,6 +140,38 @@ class StockPaperError(ValueError):
     """前向模拟数据不足或状态错误。"""
 
 
+def formal_validation_completion_metadata(
+    holdout: dict[str, object],
+) -> dict[str, object]:
+    """把一次性留出结果归纳为互不混淆的运行/投资状态。"""
+    net_excess_return = holdout.get("net_excess_return")
+    investment_checks = {
+        "net_excess_return": (
+            isinstance(net_excess_return, (int, float))
+            and not isinstance(net_excess_return, bool)
+            and math.isfinite(float(net_excess_return))
+            and float(net_excess_return) > 0.0
+        ),
+        "composite_ic": (
+            holdout.get("alpha_evidence_status") == "alpha_evidence_sufficient"
+        ),
+        "quintile": holdout.get("quintile_gate_status") == "passed",
+        "active_alpha": holdout.get("active_alpha_gate_status") == "passed",
+        "stability": holdout.get("stability_gate_status") == "passed",
+        "robustness": holdout.get("robustness_gate_status") == "passed",
+    }
+    failed = [name for name, passed in investment_checks.items() if not passed]
+    return {
+        "formal_validation_status": "completed",
+        "formal_validation_scope": ("operational_only_with_investment_diagnostics"),
+        "operational_validation_status": "passed",
+        "investment_validation_status": (
+            "evidence_passed" if not failed else "evidence_failed"
+        ),
+        "investment_validation_failed_gates": failed,
+    }
+
+
 def _money(value: float | Decimal) -> Decimal:
     return Decimal(str(value)).quantize(_CENT, rounding=ROUND_HALF_UP)
 
@@ -316,9 +348,7 @@ def get_readiness(db: Session) -> StockPaperReadiness:
                 f"安全动作={reconciliation['safe_action']}"
             )
         if reconciliation["degraded"]:
-            warnings.append(
-                f"跨源复核有 {reconciliation['degraded']} 个字段使用备用源"
-            )
+            warnings.append(f"跨源复核有 {reconciliation['degraded']} 个字段使用备用源")
     return StockPaperReadiness(
         ready=not blockers,
         status="ready" if not blockers else "blocked",
@@ -971,8 +1001,7 @@ def prepare_forward_account(
             factor_spec={"model": "rules_multifactor"},
             parameters={
                 "top_n": top_n_grid or [TOP_N],
-                "max_stock_weight": max_stock_weight_grid
-                or [MAX_STOCK_WEIGHT],
+                "max_stock_weight": max_stock_weight_grid or [MAX_STOCK_WEIGHT],
             },
             status="failed",
             error=str(exc),
@@ -1045,9 +1074,7 @@ def prepare_forward_account(
         "holdout_sharpe": holdout.get("sharpe"),
         "holdout_trade_count": holdout.get("trade_count"),
         "holdout_turnover": holdout.get("turnover"),
-        "holdout_non_empty_target_count": holdout.get(
-            "non_empty_target_count"
-        ),
+        "holdout_non_empty_target_count": holdout.get("non_empty_target_count"),
         "holdout_average_target_invested_weight": holdout.get(
             "average_target_invested_weight"
         ),
@@ -1081,50 +1108,30 @@ def prepare_forward_account(
         "cscv_pbo": validation.get("cscv_pbo"),
         "effective_trial_count": holdout.get("effective_trial_count"),
         "return_skewness": holdout.get("return_skewness"),
-        "return_excess_kurtosis": holdout.get(
-            "return_excess_kurtosis"
-        ),
+        "return_excess_kurtosis": holdout.get("return_excess_kurtosis"),
         "probabilistic_sharpe_probability": holdout.get(
             "probabilistic_sharpe_probability"
         ),
-        "deflated_sharpe_probability": holdout.get(
-            "deflated_sharpe_probability"
-        ),
-        "minimum_track_record_length": holdout.get(
-            "minimum_track_record_length"
-        ),
+        "deflated_sharpe_probability": holdout.get("deflated_sharpe_probability"),
+        "minimum_track_record_length": holdout.get("minimum_track_record_length"),
         "rank_ic_mean": holdout.get("rank_ic_mean"),
         "rank_icir": holdout.get("rank_icir"),
         "rank_ic_p_value": holdout.get("rank_ic_p_value"),
         "rank_ic_ci_lower": holdout.get("rank_ic_ci_lower"),
-        "rank_ic_effective_observations": holdout.get(
-            "rank_ic_effective_observations"
-        ),
+        "rank_ic_effective_observations": holdout.get("rank_ic_effective_observations"),
         "multiple_testing_fdr": holdout.get("multiple_testing_fdr"),
         "alpha_evidence_status": holdout.get("alpha_evidence_status"),
-        "quintile_monotonicity": holdout.get(
-            "quintile_monotonicity"
-        ),
+        "quintile_monotonicity": holdout.get("quintile_monotonicity"),
         "top_bottom_spread": holdout.get("top_bottom_spread"),
         "top_bottom_ci_lower": holdout.get("top_bottom_ci_lower"),
         "top_bottom_hit_rate": holdout.get("top_bottom_hit_rate"),
         "quintile_gate_status": holdout.get("quintile_gate_status"),
-        "active_return_newey_west_t": holdout.get(
-            "active_return_newey_west_t"
-        ),
+        "active_return_newey_west_t": holdout.get("active_return_newey_west_t"),
         "active_return_ci_lower": holdout.get("active_return_ci_lower"),
-        "regression_alpha_ci_lower": holdout.get(
-            "regression_alpha_ci_lower"
-        ),
-        "active_alpha_gate_status": holdout.get(
-            "active_alpha_gate_status"
-        ),
-        "worst_year_excess_return": holdout.get(
-            "worst_year_excess_return"
-        ),
-        "worst_regime_excess_return": holdout.get(
-            "worst_regime_excess_return"
-        ),
+        "regression_alpha_ci_lower": holdout.get("regression_alpha_ci_lower"),
+        "active_alpha_gate_status": holdout.get("active_alpha_gate_status"),
+        "worst_year_excess_return": holdout.get("worst_year_excess_return"),
+        "worst_regime_excess_return": holdout.get("worst_regime_excess_return"),
         "max_single_period_alpha_contribution": holdout.get(
             "max_single_period_alpha_contribution"
         ),
@@ -1133,15 +1140,9 @@ def prepare_forward_account(
         ),
         "stability_gate_status": holdout.get("stability_gate_status"),
         "robustness_passed": holdout.get("robustness_passed"),
-        "robustness_neighbor_pass_rate": holdout.get(
-            "robustness_neighbor_pass_rate"
-        ),
-        "cost_2x_excess_return": holdout.get(
-            "cost_2x_excess_return"
-        ),
-        "robustness_gate_status": holdout.get(
-            "robustness_gate_status"
-        ),
+        "robustness_neighbor_pass_rate": holdout.get("robustness_neighbor_pass_rate"),
+        "cost_2x_excess_return": holdout.get("cost_2x_excess_return"),
+        "robustness_gate_status": holdout.get("robustness_gate_status"),
         "validation_scope": "operational_only",
         "validation_sha256": params["validation_sha256"],
         "generated_by": "stock_validation.run_stock_walk_forward",
@@ -1161,6 +1162,10 @@ def prepare_forward_account(
                 "该结果不代表投资Alpha有效"
             ),
         )
+        params = dict(version.params or {})
+        params.update(formal_validation_completion_metadata(holdout))
+        version.params = params
+        db.commit()
         if not readiness.ready:
             return {
                 "version_id": version.id,
