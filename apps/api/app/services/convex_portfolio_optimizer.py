@@ -94,6 +94,7 @@ def optimize_portfolio(
     style_exposures: np.ndarray | None = None,
     benchmark_style_exposures: Sequence[float] | None = None,
     adv_weight_limits: Sequence[float] | None = None,
+    asset_weight_limits: Sequence[float] | None = None,
     scenario_returns: np.ndarray | None = None,
     max_cvar_loss: float | None = None,
     cvar_confidence: float = 0.95,
@@ -143,6 +144,14 @@ def optimize_portfolio(
     adv_limits = np.asarray(
         adv_weight_limits if adv_weight_limits is not None else np.ones(count)
     )
+    asset_limits = np.asarray(
+        asset_weight_limits
+        if asset_weight_limits is not None
+        else np.full(count, max_stock_weight),
+        dtype=float,
+    )
+    if asset_limits.shape != (count,):
+        raise ValueError("逐证券权重上限维度不一致")
 
     weights = cp.Variable(count, nonneg=True, name="weights")
     trades = weights - current
@@ -162,7 +171,7 @@ def optimize_portfolio(
         - l2_regularization * cp.sum_squares(active)
     )
     constraints: list[cp.Constraint] = [
-        weights <= max_stock_weight,
+        weights <= np.minimum(asset_limits, max_stock_weight),
         cp.sum(weights) >= 1.0 - maximum_cash,
         cp.sum(weights) <= 1.0 - minimum_cash,
         cp.abs(trades) <= adv_limits,
@@ -233,6 +242,7 @@ def optimize_portfolio(
         "covariance": covariance.tolist(),
         "current_weights": current.tolist(),
         "benchmark_weights": benchmark.tolist(),
+        "asset_weight_limits": asset_limits.tolist(),
         "limits": {
             "max_stock_weight": max_stock_weight,
             "max_tracking_error": max_tracking_error,

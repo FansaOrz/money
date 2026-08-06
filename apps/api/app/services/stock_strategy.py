@@ -938,8 +938,19 @@ def build_portfolio(
             ),
             adv_weight_limits=[
                 (
-                    stock_weight_limit.get(code, max_stock_weight)
+                    max(
+                        stock_weight_limit.get(code, max_stock_weight),
+                        (current_weights or {}).get(code, 0.0),
+                    )
                     if code in target or (current_weights or {}).get(code, 0.0) > 0
+                    else 0.0
+                )
+                for code in risk_codes
+            ],
+            asset_weight_limits=[
+                (
+                    stock_weight_limit.get(code, max_stock_weight)
+                    if code in target
                     else 0.0
                 )
                 for code in risk_codes

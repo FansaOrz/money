@@ -1,6 +1,7 @@
 """凸优化、真实成本、预测不确定性与不可行诊断。"""
 
 import numpy as np
+import pytest
 
 from app.services.convex_portfolio_optimizer import optimize_portfolio
 
@@ -89,3 +90,24 @@ def test_style_constraints_normalize_partial_stock_investment() -> None:
     ) / invested
     assert result["passed"] is True
     assert normalized_style <= 0.10 + 1e-6
+
+
+def test_non_candidate_current_holding_is_forced_to_exit() -> None:
+    result = optimize_portfolio(
+        codes=["old", "candidate"],
+        alpha=[0.0, 0.02],
+        covariance=np.eye(2) * 0.0001,
+        current_weights=[0.5, 0.5],
+        benchmark_weights=[0.0, 1.0],
+        adv_weight_limits=[0.5, 1.0],
+        asset_weight_limits=[0.0, 1.0],
+        max_stock_weight=1.0,
+        maximum_cash=0.0,
+        max_turnover=2.0,
+        max_tracking_error=1.0,
+        max_annual_volatility=1.0,
+    )
+
+    assert result["passed"] is True
+    assert result["weights"]["old"] <= 1e-7
+    assert result["weights"]["candidate"] == pytest.approx(1.0, abs=1e-6)
