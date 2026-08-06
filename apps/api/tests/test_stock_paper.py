@@ -147,6 +147,35 @@ def test_formal_validation_completion_separates_operational_and_investment_statu
     assert passed["investment_validation_failed_gates"] == []
 
 
+def test_version10_research_record_uses_investment_mandate_without_readiness(
+    db_session: Session,
+) -> None:
+    version = stock_paper.ensure_research_strategy_version(db_session)
+
+    assert version.name == stock_paper.STRATEGY_NAME
+    assert version.status == "research"
+    assert version.params["model_version"] == "stock_rules_v6"
+    assert version.params["formal_validation_status"] == "not_run"
+    assert version.params["factor_weight_policy"] == {
+        "prior": {
+            "quality": 0.30,
+            "value": 0.25,
+            "momentum": 0.20,
+            "trend": 0.15,
+            "lowvol": 0.10,
+        },
+        "minimum_mature_periods": 12,
+        "prior_strength": 24.0,
+        "minimum_family_weight": 0.08,
+        "maximum_family_weight": 0.30,
+        "previous_weight_blend": 0.75,
+        "fit_scope": "training_only_frozen_before_validation",
+    }
+    assert version.mandate["validation_scope"] == "investment_effectiveness"
+    assert version.mandate["investment_approval_eligible"] is True
+    assert stock_paper.ensure_research_strategy_version(db_session).id == version.id
+
+
 def _seed_trial(db: Session) -> tuple[ForwardRepository, date]:
     first_day = date(2025, 1, 1)
     signal_day = first_day + timedelta(days=299)

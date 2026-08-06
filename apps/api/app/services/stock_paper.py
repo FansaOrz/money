@@ -88,7 +88,8 @@ from app.services.stock_repository import (
 )
 from app.timezone import now_cn
 
-STRATEGY_NAME = "A股多因子规则V5-版本9根因修复研究版"
+STRATEGY_NAME = "A股多因子规则V6-版本10验证器与收缩权重版"
+MODEL_VERSION = "stock_rules_v6"
 ACCOUNT_NAME = "A股规则策略模拟账户"
 INITIAL_CAPITAL = Decimal("1000000.00")
 TRIAL_MONTHS = 2
@@ -119,20 +120,21 @@ _PRICE = Decimal("0.000001")
 _WEIGHT = Decimal("0.00000001")
 
 METHODOLOGY = (
-    "A股规则多因子两个月运行链路验证（operational_only）："
+    "A股规则多因子投资有效性与两个月运行链路双重验证："
     "候选池在账户创建时冻结为沪深300+中证500"
     "全部当前成分，且启动前逐只校验日线、行业、财务和PE/PB估值覆盖；"
     "动态剔除ST/停牌/次新/低流动性；"
-    "质量30%（含ROA/应计/稳定性）、价值25%（含SP/股息/FCF）、"
-    "动量20%（12-1/6-1/反转/残差）、趋势15%、低风险10%，"
+    "质量/价值/动量/趋势/低风险先验为30%/25%/20%/15%/10%，"
+    "至少12期成熟标签后才允许IC收缩估计，单族限制8%～30%并惩罚权重跳变；"
     "行业内缩尾和标准化；月频调仓，自由流通市值行业基准，约束单股5%、"
     "单行业20%、市值/Beta/流动性和ADV容量，持仓保留区与最小交易权重"
     "降低抖动；T日收盘生成信号，T+1开盘成交，含最低佣金、卖出印花税、"
     "波动与成交参与率动态滑点；部分成交、公司行为、停牌及涨跌停顺延。"
     "现金按CNY_CASH_FLAT_2PCT_ACT365_V1在每日开盘前计息，区分可用、冻结、"
     "股息应收与已结算可取资金，并逐日做现金守恒校验。"
-    "只验收数据、调度、信号、模拟成交、账本、对账、告警和恢复；"
-    "短期收益不构成Alpha证据，不得据此批准实盘，不构成投资建议，不产生真实订单。"
+    "先通过综合IC、五档、主动Alpha、稳定性与完整验证集扰动门禁，"
+    "再一次性读取留出集；投资证据与运行readiness均通过后才创建前向账户。"
+    "不构成投资建议，不产生真实订单。"
 )
 
 
@@ -471,6 +473,72 @@ def _ready_candidate_codes(db: Session, latest: date) -> list[str]:
     return sorted(set(universe) & daily & industries)
 
 
+def ensure_research_strategy_version(db: Session) -> StrategyVersion:
+    """创建不依赖当前行情 readiness 的版本10研究记录。"""
+    version = db.scalar(
+        select(StrategyVersion)
+        .where(StrategyVersion.name == STRATEGY_NAME)
+        .order_by(StrategyVersion.id.desc())
+        .limit(1)
+    )
+    if version is not None:
+        return version
+    params = {
+        "asset": "cn_stock",
+        "model_version": MODEL_VERSION,
+        "purpose": "investment_effectiveness_then_forward_validation",
+        "validation_scope": "investment_effectiveness",
+        "investment_approval_eligible": True,
+        "created_for": "v9_formal_validation_remediation",
+        "formal_validation_status": "not_run",
+        "formal_validation_scope": "investment_effectiveness",
+        "factor_weight_policy": {
+            "prior": {
+                "quality": 0.30,
+                "value": 0.25,
+                "momentum": 0.20,
+                "trend": 0.15,
+                "lowvol": 0.10,
+            },
+            "minimum_mature_periods": 12,
+            "prior_strength": 24.0,
+            "minimum_family_weight": 0.08,
+            "maximum_family_weight": 0.30,
+            "previous_weight_blend": 0.75,
+            "fit_scope": "training_only_frozen_before_validation",
+        },
+        "validation_protocol": {
+            "purge_days": 21,
+            "embargo_days": 21,
+            "robustness_stage": "pre_holdout_validation",
+            "holdout_evaluations": 1,
+            "holdout_reuse_forbidden": True,
+        },
+        "methodology": METHODOLOGY,
+    }
+    mandate = strategy_mandate.cn_stock_investment_mandate(
+        strategy_name=STRATEGY_NAME,
+        initial_capital=INITIAL_CAPITAL,
+        rebalance_days=20,
+        top_n=TOP_N,
+    )
+    version = StrategyVersion(
+        name=STRATEGY_NAME,
+        initial_capital=INITIAL_CAPITAL,
+        rebalance_interval=20,
+        fee_rate=_weight(COST.commission_rate),
+        top_n=TOP_N,
+        params=params,
+        mandate=mandate,
+        mandate_sha256=strategy_mandate.mandate_sha256(mandate),
+        status="research",
+    )
+    db.add(version)
+    db.commit()
+    db.refresh(version)
+    return version
+
+
 def _ensure_account(
     db: Session, data_date: date
 ) -> tuple[StockPaperAccount, StrategyVersion]:
@@ -537,14 +605,12 @@ def _ensure_account(
     ).hexdigest()
     params = {
         "asset": "cn_stock",
-        "model_version": "stock_rules_v4",
-        "purpose": "two_month_forward_paper_validation",
-        "validation_scope": "operational_only",
-        "investment_approval_eligible": False,
-        "approval_blocker": (
-            "该版本仅验证运行链路；必须创建绑定投资任务书的新版本并通过"
-            "净超额、主动风险、IC显著性、DSR/PBO和成本压力门禁"
-        ),
+        "model_version": MODEL_VERSION,
+        "purpose": "investment_effectiveness_then_forward_validation",
+        "validation_scope": "investment_effectiveness",
+        "investment_approval_eligible": True,
+        "created_for": "v9_formal_validation_remediation",
+        "formal_validation_status": "not_run",
         "indices": list(INDEX_CODES),
         "universe_mode": "frozen_at_trial_start",
         "production_universe_mode": "dynamic_as_of_signal_date",
@@ -582,7 +648,7 @@ def _ensure_account(
         "methodology": METHODOLOGY,
     }
     if version is None:
-        mandate = strategy_mandate.operational_validation_mandate(
+        mandate = strategy_mandate.cn_stock_investment_mandate(
             strategy_name=STRATEGY_NAME,
             initial_capital=INITIAL_CAPITAL,
             rebalance_days=20,
@@ -639,7 +705,7 @@ def prepare_forward_account(
     embargo_days: int = 21,
     create_new_version: bool = False,
 ) -> dict[str, object]:
-    """用系统证据晋级到运行链路模拟；不授予投资有效性或实盘资格。"""
+    """先验证投资有效性，再在 readiness 通过后创建运行链路模拟。"""
     if start >= end:
         raise StockPaperError("验证开始日期必须早于结束日期")
     readiness = get_readiness(db)
@@ -658,18 +724,7 @@ def prepare_forward_account(
         .limit(1)
     )
     if version is None:
-        try:
-            _ensure_account(db, data_date)
-        except StockPaperError:
-            pass
-        version = db.scalar(
-            select(StrategyVersion)
-            .where(StrategyVersion.name == STRATEGY_NAME)
-            .order_by(StrategyVersion.id.desc())
-            .limit(1)
-        )
-    if version is None:
-        raise StockPaperError("研究策略版本创建失败")
+        version = ensure_research_strategy_version(db)
     if (
         version.status in {"paper_operational_validation", "paper"}
         and not create_new_version
@@ -688,6 +743,21 @@ def prepare_forward_account(
     if version.status == "operational_validated" and not create_new_version:
         params = dict(version.params or {})
         validation = dict(params.get("validation") or {})
+        if bool(
+            dict(version.mandate or {}).get("investment_approval_eligible")
+        ):
+            return {
+                "version_id": version.id,
+                "status": version.status,
+                "account_id": None,
+                "forward_account_created": False,
+                "data_date": data_date,
+                "validation": validation,
+                "readiness_blockers": [
+                    "正式历史验证已消费，但投资有效性门禁未通过；"
+                    "该版本禁止重跑或创建前向账户"
+                ],
+            }
         if not readiness.ready:
             return {
                 "version_id": version.id,
@@ -718,6 +788,53 @@ def prepare_forward_account(
                 },
                 actor="system:stock-paper-prepare",
                 reason="当前数据就绪门禁恢复，沿用已冻结历史验证证据创建前向账户",
+            )
+        except ValueError as exc:
+            raise StockPaperError(str(exc)) from exc
+        account, version = _ensure_account(db, data_date)
+        return {
+            "version_id": version.id,
+            "status": version.status,
+            "account_id": account.id,
+            "forward_account_created": True,
+            "data_date": data_date,
+            "validation": validation,
+            "readiness_blockers": [],
+        }
+    if version.status == "investment_validated" and not create_new_version:
+        params = dict(version.params or {})
+        validation = dict(params.get("validation") or {})
+        if not readiness.ready:
+            return {
+                "version_id": version.id,
+                "status": version.status,
+                "account_id": None,
+                "forward_account_created": False,
+                "data_date": data_date,
+                "validation": validation,
+                "readiness_blockers": readiness.blockers,
+            }
+        try:
+            version = strategy_lifecycle.transition(
+                db,
+                version.id,
+                "paper",
+                evidence={
+                    "experiment_snapshot_complete": all(
+                        params.get(key)
+                        for key in (
+                            "git_sha",
+                            "git_worktree_clean",
+                            "candidate_sha256",
+                            "data_as_of",
+                            "validation_sha256",
+                        )
+                    ),
+                    "investment_validation_passed": True,
+                    "validation_sha256": params.get("validation_sha256"),
+                },
+                actor="system:stock-paper-prepare",
+                reason="投资有效性已通过且当前数据就绪，创建两个月运行模拟",
             )
         except ValueError as exc:
             raise StockPaperError(str(exc)) from exc
@@ -792,7 +909,7 @@ def prepare_forward_account(
                 },
             }
         )
-        mandate = strategy_mandate.operational_validation_mandate(
+        mandate = strategy_mandate.cn_stock_investment_mandate(
             strategy_name=STRATEGY_NAME,
             initial_capital=INITIAL_CAPITAL,
             rebalance_days=20,
@@ -839,7 +956,7 @@ def prepare_forward_account(
             if key not in {"validation", "validation_sha256"}
         }
         successor_params["supersedes_version_id"] = version.id
-        mandate = strategy_mandate.operational_validation_mandate(
+        mandate = strategy_mandate.cn_stock_investment_mandate(
             strategy_name=STRATEGY_NAME,
             initial_capital=INITIAL_CAPITAL,
             rebalance_days=20,
@@ -898,6 +1015,22 @@ def prepare_forward_account(
         raise StockPaperError(
             "正式验证区间的历史指数成分不足 800 只，拒绝冻结不完整文件清单"
         )
+    params = dict(version.params or {})
+    params.update(
+        {
+            "candidate_count": len(historical_codes),
+            "candidate_sha256": hashlib.sha256(
+                json.dumps(
+                    historical_codes,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+            "data_as_of": end.isoformat(),
+        }
+    )
+    version.params = params
+    db.commit()
     research_root = Path(get_settings().research_data_dir)
     manifest_paths = discover_research_files(research_root, historical_codes)
     if not manifest_paths:
@@ -1096,6 +1229,7 @@ def prepare_forward_account(
         "comparator_metrics": holdout.get("comparator_metrics"),
         "benchmark_return": holdout.get("benchmark_return"),
         "net_excess_return": holdout.get("net_excess_return"),
+        "max_drawdown": holdout.get("max_drawdown"),
         "active_sharpe": holdout.get("active_sharpe"),
         "tracking_error": holdout.get("tracking_error"),
         "annualized_alpha": holdout.get("annualized_alpha"),
@@ -1143,6 +1277,9 @@ def prepare_forward_account(
         "robustness_neighbor_pass_rate": holdout.get("robustness_neighbor_pass_rate"),
         "cost_2x_excess_return": holdout.get("cost_2x_excess_return"),
         "robustness_gate_status": holdout.get("robustness_gate_status"),
+        "robustness_reference_stage": holdout.get(
+            "robustness_reference_stage"
+        ),
         "validation_scope": "operational_only",
         "validation_sha256": params["validation_sha256"],
         "generated_by": "stock_validation.run_stock_walk_forward",
@@ -1164,8 +1301,79 @@ def prepare_forward_account(
         )
         params = dict(version.params or {})
         params.update(formal_validation_completion_metadata(holdout))
+        investment_eligible = (
+            dict(version.mandate or {}).get(
+                "investment_approval_eligible"
+            )
+            is True
+        )
+        if investment_eligible:
+            investment_evidence = {
+                **evidence,
+                "validation_scope": "investment_effectiveness",
+            }
+            params["investment_validation_evidence"] = investment_evidence
+            approved, investment_failures, investment_gate_results = (
+                strategy_lifecycle.evaluate_gates(
+                    version.status,
+                    "investment_validated",
+                    investment_evidence,
+                    dict(version.mandate or {}),
+                )
+            )
+            params.update(
+                {
+                    "investment_validation_status": (
+                        "evidence_passed"
+                        if approved
+                        else "evidence_failed"
+                    ),
+                    "investment_validation_failed_gates": [
+                        key
+                        for key, result in investment_gate_results.items()
+                        if result.get("passed") is not True
+                    ],
+                    "investment_validation_failures": investment_failures,
+                    "investment_validation_gate_results": (
+                        investment_gate_results
+                    ),
+                }
+            )
         version.params = params
         db.commit()
+        if investment_eligible:
+            if not approved:
+                try:
+                    strategy_lifecycle.transition(
+                        db,
+                        version.id,
+                        "investment_validated",
+                        evidence=investment_evidence,
+                        actor="system:stock-paper-prepare",
+                        reason="一次性留出集投资有效性门禁评估失败",
+                    )
+                except ValueError:
+                    pass
+                return {
+                    "version_id": version.id,
+                    "status": version.status,
+                    "account_id": None,
+                    "forward_account_created": False,
+                    "data_date": data_date,
+                    "validation": validation,
+                    "readiness_blockers": investment_failures,
+                }
+            version = strategy_lifecycle.transition(
+                db,
+                version.id,
+                "investment_validated",
+                evidence=investment_evidence,
+                actor="system:stock-paper-prepare",
+                reason=(
+                    "预注册训练、验证、稳健性与一次性留出集"
+                    "全部通过投资有效性门禁"
+                ),
+            )
         if not readiness.ready:
             return {
                 "version_id": version.id,
@@ -1176,29 +1384,52 @@ def prepare_forward_account(
                 "validation": validation,
                 "readiness_blockers": readiness.blockers,
             }
-        version = strategy_lifecycle.transition(
-            db,
-            version.id,
-            "paper_operational_validation",
-            evidence={
-                "experiment_snapshot_complete": all(
-                    params.get(key)
-                    for key in (
-                        "git_sha",
-                        "git_worktree_clean",
-                        "candidate_sha256",
-                        "data_as_of",
-                        "validation_sha256",
-                    )
+        if investment_eligible:
+            version = strategy_lifecycle.transition(
+                db,
+                version.id,
+                "paper",
+                evidence={
+                    "experiment_snapshot_complete": all(
+                        params.get(key)
+                        for key in (
+                            "git_sha",
+                            "git_worktree_clean",
+                            "candidate_sha256",
+                            "data_as_of",
+                            "validation_sha256",
+                        )
+                    ),
+                    "investment_validation_passed": True,
+                    "validation_sha256": params["validation_sha256"],
+                },
+                actor="system:stock-paper-prepare",
+                reason="投资证据与当前readiness均通过，启动两个月运行模拟",
+            )
+        else:
+            version = strategy_lifecycle.transition(
+                db,
+                version.id,
+                "paper_operational_validation",
+                evidence={
+                    "experiment_snapshot_complete": all(
+                        params.get(key)
+                        for key in (
+                            "git_sha",
+                            "git_worktree_clean",
+                            "candidate_sha256",
+                            "data_as_of",
+                            "validation_sha256",
+                        )
+                    ),
+                    "validation_sha256": params["validation_sha256"],
+                },
+                actor="system:stock-paper-prepare",
+                reason=(
+                    "参数、代码、候选池、数据与运行验证结果均已冻结；"
+                    "仅启动两个月运行链路模拟"
                 ),
-                "validation_sha256": params["validation_sha256"],
-            },
-            actor="system:stock-paper-prepare",
-            reason=(
-                "参数、代码、候选池、数据与运行验证结果均已冻结；"
-                "仅启动两个月运行链路模拟"
-            ),
-        )
+            )
     except ValueError as exc:
         raise StockPaperError(str(exc)) from exc
     account, version = _ensure_account(db, data_date)
