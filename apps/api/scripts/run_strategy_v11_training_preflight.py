@@ -85,6 +85,98 @@ def _compact_challenger(report: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _robustness_precondition(
+    *,
+    ic: dict[str, object],
+    quintile: dict[str, object],
+    active: dict[str, object],
+    development_metrics: dict[str, object],
+) -> dict[str, object]:
+    net_excess = development_metrics.get("net_excess_return")
+    checks = {
+        "positive_net_excess_return": (
+            isinstance(net_excess, (int, float))
+            and not isinstance(net_excess, bool)
+            and float(net_excess) > 0.0
+        ),
+        "composite_ic_proven_positive": bool(
+            dict(dict(ic.get("factors") or {}).get("composite") or {}).get(
+                "proven_positive"
+            )
+        ),
+        "quintile_passed": quintile.get("passed") is True,
+        "active_alpha_passed": active.get("passed") is True,
+    }
+    failures = [name for name, passed in checks.items() if not passed]
+    return {
+        "status": "eligible" if not failures else "blocked_by_baseline",
+        "passed": not failures,
+        "checks": checks,
+        "failures": failures,
+        "policy": "baseline_gates_before_robustness_catalog",
+    }
+
+
+def record_persisted_robustness_block() -> dict[str, object]:
+    """用已持久化基线记录压力目录阻断，不重复运行回测。"""
+    db = SessionLocal()
+    try:
+        version = db.scalar(
+            select(StrategyVersion)
+            .where(StrategyVersion.name == stock_paper.STRATEGY_NAME)
+            .order_by(StrategyVersion.id.desc())
+            .limit(1)
+        )
+        if version is None:
+            raise RuntimeError("版本11研究记录不存在")
+        params = dict(version.params or {})
+        result = dict(params.get("training_preflight") or {})
+        if result.get("kind") != "strategy_v11_training_only_preflight":
+            raise RuntimeError("版本11没有可复用的完整训练预检基线")
+        precondition = _robustness_precondition(
+            ic={"factors": {"composite": dict(result.get("composite_ic") or {})}},
+            quintile=dict(result.get("quintile") or {}),
+            active=dict(result.get("active_alpha") or {}),
+            development_metrics=dict(result.get("development_metrics") or {}),
+        )
+        if precondition["passed"] is True:
+            raise RuntimeError("基线已满足压力测试前置门禁，应执行完整扰动目录")
+        robustness = {
+            "status": "blocked_by_baseline",
+            "passed": False,
+            "reason": "基线投资证据未通过，禁止启动扰动目录",
+            "failed_preconditions": list(precondition["failures"]),
+        }
+        result["robustness_precondition"] = precondition
+        result["robustness"] = robustness
+        result["robustness_scenarios"] = []
+        params["training_preflight"] = result
+        params["training_preflight_status"] = "completed_baseline_robustness_blocked"
+        version.params = params
+        db.add(
+            AuditLog(
+                actor="system:strategy-v11-training-preflight",
+                action="strategy_robustness_blocked",
+                resource_type="strategy_version",
+                resource_id=str(version.id),
+                detail={
+                    "formal_validation_or_holdout_accessed": False,
+                    "reason": robustness["reason"],
+                    "failed_preconditions": list(precondition["failures"]),
+                },
+                created_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+        return {
+            "strategy_version_id": version.id,
+            "robustness_precondition": precondition,
+            "robustness": robustness,
+        }
+    finally:
+        db.close()
+
+
 def run_preflight(*, include_robustness: bool) -> dict[str, object]:
     db = SessionLocal()
     try:
@@ -144,6 +236,13 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             development.daily_returns,
             _benchmark_returns(development),
         )
+        development_metrics = stock_validation._metrics(development)
+        robustness_precondition = _robustness_precondition(
+            ic=ic,
+            quintile=quintile,
+            active=active,
+            development_metrics=development_metrics,
+        )
         challenger_rows = linear_alpha_challenger.rows_from_backtest(fit)
         challenger_rows.extend(linear_alpha_challenger.rows_from_backtest(development))
         challenger = linear_alpha_challenger.walk_forward_linear_challenger(
@@ -161,12 +260,20 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             "reason": "使用 --robustness 才执行完整训练期压力目录",
         }
         if include_robustness:
-            robustness_rows = robustness_scenarios.run_validation_robustness(
-                repository,
-                development_config,
-                development,
-            )
-            robustness = robustness_scenarios.evaluate_robustness(robustness_rows)
+            if robustness_precondition["passed"] is True:
+                robustness_rows = robustness_scenarios.run_validation_robustness(
+                    repository,
+                    development_config,
+                    development,
+                )
+                robustness = robustness_scenarios.evaluate_robustness(robustness_rows)
+            else:
+                robustness = {
+                    "status": "blocked_by_baseline",
+                    "passed": False,
+                    "reason": "基线投资证据未通过，禁止启动扰动目录",
+                    "failed_preconditions": list(robustness_precondition["failures"]),
+                }
 
         composite = dict(dict(ic.get("factors") or {}).get("composite") or {})
         result = {
@@ -186,7 +293,7 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             "frozen_factor_weights": frozen_weights,
             "factor_weight_history": fit.factor_weight_history,
             "fit_metrics": stock_validation._metrics(fit),
-            "development_metrics": stock_validation._metrics(development),
+            "development_metrics": development_metrics,
             "composite_ic": composite,
             "ic_status": ic.get("status"),
             "tested_hypotheses": ic.get("tested_hypotheses"),
@@ -198,13 +305,20 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             "factor_redundancy": {
                 key: value for key, value in redundancy.items() if key != "periods"
             },
+            "robustness_precondition": robustness_precondition,
             "robustness": robustness,
             "robustness_scenarios": robustness_rows,
         }
         params = dict(version.params or {})
         params["training_preflight"] = result
         params["training_preflight_status"] = (
-            "completed_with_robustness" if include_robustness else "completed_baseline"
+            (
+                "completed_with_robustness"
+                if robustness.get("status") != "blocked_by_baseline"
+                else "completed_baseline_robustness_blocked"
+            )
+            if include_robustness
+            else "completed_baseline"
         )
         version.params = params
         db.add(
@@ -243,7 +357,23 @@ def main() -> None:
         action="store_true",
         help="执行完整验证期扰动目录；耗时显著增加",
     )
+    parser.add_argument(
+        "--record-robustness-gate-only",
+        action="store_true",
+        help="仅依据已持久化基线记录压力目录阻断，不重复运行回测",
+    )
     args = parser.parse_args()
+    if args.robustness and args.record_robustness_gate_only:
+        parser.error("两种压力测试模式不可同时使用")
+    if args.record_robustness_gate_only:
+        print(
+            json.dumps(
+                record_persisted_robustness_block(),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return
     print(
         json.dumps(
             run_preflight(include_robustness=args.robustness),
