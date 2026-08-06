@@ -147,6 +147,10 @@ class BacktestConfig:
     min_limit_data_coverage: float = 0.0
     factor_weights: dict[str, float] | None = None  # 因子族权重覆盖（None = 缺省）
     adaptive_ic_weights: bool = False  # 正式模式按已成熟标签滚动收缩
+    factor_window_scale: float = 1.0  # 价格因子窗口统一扰动，仅供预注册稳健性
+    winsor_quantiles: tuple[float, float] = (0.01, 0.99)
+    data_lag_trading_days: int = 0  # 因子输入相对信号日的额外滞后
+    excluded_industries: tuple[str, ...] = ()  # 留一行业稳健性场景
     rebalance_day_offset: int = 0  # 稳健性测试可将月末信号前后平移
     signal_execution_delay_days: int = 1  # 信号后至少等待的交易日数
     order_policy: order_lifecycle.OrderLifecyclePolicy = field(
@@ -1271,10 +1275,21 @@ def run_backtest_panel(
                     )
                     for info in signal_infos
                 ]
+            if config.excluded_industries:
+                excluded_industries = set(config.excluded_industries)
+                signal_infos = [
+                    info
+                    for info in signal_infos
+                    if info.industry not in excluded_industries
+                ]
+            factor_day_index = max(
+                0, i - max(config.data_lag_trading_days, 0)
+            )
+            factor_as_of = calendar_days[factor_day_index]
             universe, filters = strategy.build_universe(
                 signal_infos,
                 panel.bars_by_code,
-                day,
+                factor_as_of,
                 config.min_avg_amount,
                 name_histories=panel.name_histories,
                 research_bars_by_code=panel.research_bars_by_code or None,
@@ -1284,14 +1299,15 @@ def run_backtest_panel(
                     info,
                     panel.research_series(info.code),
                     fundamentals_by_code.get(info.code, []),
-                    day,
+                    factor_as_of,
                 )
                 for info in universe
             ]
             contexts = [
                 ctx
                 for ctx in contexts
-                if factors.history_depth(ctx) >= factors.MIN_HISTORY_DAYS
+                if factors.history_depth(ctx)
+                >= factors.minimum_history_days(config.factor_window_scale)
             ]
             from app.services.factor_residual_model import price_series_returns
             from app.services.ic_weighting import (
@@ -1357,15 +1373,17 @@ def run_backtest_panel(
 
             scored = factors.compute_cross_section(
                 contexts,
-                day,
+                factor_as_of,
                 weights=effective_factor_weights,
                 official_market_returns=price_series_returns(
                     [
                         (market_day, value)
                         for market_day, value in panel.index_series
-                        if market_day <= day
+                        if market_day <= factor_as_of
                     ]
                 ),
+                window_scale=config.factor_window_scale,
+                winsor_quantiles=config.winsor_quantiles,
             )
             signal_value = cash + sum(dividend_receivables.values())
             current_weights: dict[str, float] = {}
@@ -1507,9 +1525,10 @@ def run_backtest_panel(
                     {
                         factor_name: {
                             item.code: (
-                                getattr(item, factor_name)
-                                if factor_name
-                                in {
+                                item.composite
+                                if factor_name == "composite"
+                                else getattr(item, factor_name)
+                                if factor_name in {
                                     "quality",
                                     "value",
                                     "momentum",

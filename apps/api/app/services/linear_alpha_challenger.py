@@ -108,6 +108,7 @@ def walk_forward_linear_challenger(
     minimum_training_periods: int = 12,
     alphas: tuple[float, ...] = (0.01, 0.1, 1.0),
     l1_ratios: tuple[float, ...] = (0.0, 0.5),
+    prediction_start_date: date | None = None,
 ) -> dict[str, object]:
     """每个预测日只用更早标签，并在训练段尾部嵌套选择超参数。"""
     targets = _industry_residual_targets(rows)
@@ -116,7 +117,13 @@ def walk_forward_linear_challenger(
     coefficient_history: list[dict[str, object]] = []
     for position, prediction_date in enumerate(dates):
         training_dates = dates[:position]
-        if len(training_dates) < minimum_training_periods:
+        if (
+            len(training_dates) < minimum_training_periods
+            or (
+                prediction_start_date is not None
+                and prediction_date < prediction_start_date
+            )
+        ):
             continue
         validation_count = max(3, len(training_dates) // 5)
         inner_train_dates = set(training_dates[:-validation_count])
@@ -270,6 +277,11 @@ def walk_forward_linear_challenger(
         "status": "challenger_only",
         "target": "next_holding_period_industry_residual_return",
         "features": list(FEATURES),
+        "prediction_start_date": (
+            prediction_start_date.isoformat()
+            if prediction_start_date is not None
+            else None
+        ),
         "predictions": predictions,
         "coefficient_history": coefficient_history,
         "coefficient_stability": stability,

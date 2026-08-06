@@ -34,3 +34,28 @@ def test_redundant_factor_is_flagged_by_correlation_vif_and_conditional_ic() -> 
         action["pair"] == ["momentum_12_1", "momentum_6_1"]
         for action in report["actions"]
     )
+
+
+def test_one_unavailable_factor_does_not_blank_all_redundancy_metrics() -> None:
+    values = {name: {} for name in REDUNDANCY_FACTORS}
+    returns = {}
+    for index in range(40):
+        code = f"{index:06d}"
+        for offset, factor in enumerate(REDUNDANCY_FACTORS):
+            values[factor][code] = (
+                None
+                if factor == "residual_momentum"
+                else index + ((index * (offset + 3)) % 11) / 10
+            )
+        returns[code] = index / 1000
+
+    report = diagnose_factor_redundancy(
+        [(date(2025, 1, 31), values)],
+        [(date(2025, 1, 31), returns)],
+    )
+
+    assert report["vif_mean"]["momentum_12_1"] is not None
+    assert report["marginal_rank_ic_mean"]["momentum_12_1"] is not None
+    assert report["conditional_rank_ic_mean"]["momentum_12_1"] is not None
+    assert report["vif_mean"]["residual_momentum"] is None
+    assert report["unavailable_factors"] == ["residual_momentum"]

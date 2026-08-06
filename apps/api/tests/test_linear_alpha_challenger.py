@@ -64,3 +64,19 @@ def test_walk_forward_predictions_and_coefficients_are_oos() -> None:
         item for item in second["predictions"] if item["signal_date"] != "2025-06-01"
     ]
     assert first_early == second_early
+
+
+def test_prediction_start_uses_earlier_rows_as_training_only() -> None:
+    rows = _rows()
+    result = walk_forward_linear_challenger(
+        rows,
+        minimum_training_periods=12,
+        prediction_start_date=date(2025, 1, 1),
+    )
+
+    assert result["oos_periods"] == 6
+    assert result["prediction_start_date"] == "2025-01-01"
+    assert min(
+        item["signal_date"] for item in result["predictions"]
+    ) == "2025-01-01"
+    assert result["coefficient_history"][0]["training_end"] < "2025-01-01"

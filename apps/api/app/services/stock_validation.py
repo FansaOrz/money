@@ -375,10 +375,18 @@ def run_stock_walk_forward(
     if len(folds) < 3:
         raise BacktestError("训练段无法形成至少3个带 embargo 的样本外走步折")
 
+    from app.services.linear_alpha_challenger import (
+        AlphaRow,
+        rows_from_backtest,
+        walk_forward_linear_challenger,
+    )
+
     trials: list[dict[str, object]] = []
+    challenger_rows_by_trial: dict[tuple[int, float], list[AlphaRow]] = {}
     for top_n in sorted(set(top_n_grid)):
         for max_weight in sorted(set(max_stock_weight_grid)):
             fold_metrics: list[dict[str, float | int | None]] = []
+            trial_challenger_rows: list[AlphaRow] = []
             for fold_start, fold_end in folds:
                 outcome = run_backtest(
                     config=replace(
@@ -398,6 +406,7 @@ def run_stock_walk_forward(
                     ),
                 )
                 fold_metrics.append(_metrics(outcome))
+                trial_challenger_rows.extend(rows_from_backtest(outcome))
             sharpes = [
                 float(item["sharpe"])
                 for item in fold_metrics
@@ -421,6 +430,7 @@ def run_stock_walk_forward(
                     "folds": fold_metrics,
                 }
             )
+            challenger_rows_by_trial[(top_n, max_weight)] = trial_challenger_rows
     best = max(trials, key=lambda item: float(item["score"]))
     from app.services.backtest_overfitting import cscv_pbo
 
@@ -446,14 +456,64 @@ def run_stock_walk_forward(
         repository=repository,
     )
     _assert_strategy_activity(validation_outcome, stage="验证集")
+    validation_metrics = _metrics(validation_outcome)
+    from app.services.robustness_scenarios import (
+        evaluate_robustness,
+        run_validation_robustness,
+    )
+
+    validation_config = replace(
+        selected,
+        start=validation[0],
+        end=validation[-1],
+    )
+    if robustness_scenario_results is None:
+        robustness_rows = run_validation_robustness(
+            repository,
+            validation_config,
+            validation_outcome,
+            run_backtest_fn=run_backtest,
+        )
+    else:
+        robustness_rows = [
+            {
+                "dimension": "cost_1x",
+                "case": "validation_baseline",
+                "net_excess_return": validation_metrics.get(
+                    "net_excess_return"
+                ),
+                "source": "validation_baseline",
+            },
+            *robustness_scenario_results,
+        ]
+    robustness = evaluate_robustness(robustness_rows)
+    if robustness.get("passed") is not True:
+        failures = "；".join(
+            str(item) for item in robustness.get("failures", [])
+        )
+        raise BacktestError(
+            "验证集稳健性门禁未通过，完全留出集保持未访问："
+            f"{failures}"
+        )
     # 留出集在参数冻结后只调用一次。
     holdout_outcome = run_backtest(
         config=replace(selected, start=holdout[0], end=holdout[-1]),
         repository=repository,
     )
     _assert_strategy_activity(holdout_outcome, stage="留出集")
-    validation_metrics = _metrics(validation_outcome)
     holdout_metrics = _metrics(holdout_outcome)
+    challenger_rows = challenger_rows_by_trial.get(
+        (
+            int(best_params["top_n"]),
+            float(best_params["max_stock_weight"]),
+        ),
+        [],
+    )
+    challenger_rows.extend(rows_from_backtest(validation_outcome))
+    linear_challenger = walk_forward_linear_challenger(
+        challenger_rows,
+        prediction_start_date=validation[0],
+    )
     from app.services.experiment_registry import (
         effective_attempt_count_from_series,
     )
@@ -594,19 +654,6 @@ def run_stock_walk_forward(
         float(validation_metrics["minimum_data_coverage"] or 0.0),
         float(holdout_metrics["minimum_data_coverage"] or 0.0),
     ]
-    from app.services.robustness_scenarios import evaluate_robustness
-
-    robustness = evaluate_robustness(
-        [
-            {
-                "dimension": "cost_1x",
-                "case": "formal_holdout_baseline",
-                "net_excess_return": holdout_metrics.get("net_excess_return"),
-                "source": "run_backtest",
-            },
-            *(robustness_scenario_results or []),
-        ]
-    )
     holdout_metrics.update(
         {
             "robustness_passed": robustness.get("passed"),
@@ -620,6 +667,7 @@ def run_stock_walk_forward(
                 None,
             ),
             "robustness_gate_status": robustness.get("status"),
+            "robustness_reference_stage": "pre_holdout_validation",
         }
     )
     return {
@@ -688,20 +736,7 @@ def run_stock_walk_forward(
             if validation_outcome.factor_weight_history
             else None
         ),
-        "linear_alpha_challenger": (
-            __import__(
-                "app.services.linear_alpha_challenger",
-                fromlist=[
-                    "rows_from_backtest",
-                    "walk_forward_linear_challenger",
-                ],
-            ).walk_forward_linear_challenger(
-                __import__(
-                    "app.services.linear_alpha_challenger",
-                    fromlist=["rows_from_backtest"],
-                ).rows_from_backtest(validation_outcome)
-            )
-        ),
+        "linear_alpha_challenger": linear_challenger,
         "holdout_evaluations": 1,
         "minimum_data_coverage": min(observed_coverages),
         "warnings": [

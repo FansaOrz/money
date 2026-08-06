@@ -46,6 +46,7 @@ def diagnose_factor_redundancy(
     conditional_history: dict[str, list[float]] = {
         name: [] for name in REDUNDANCY_FACTORS
     }
+    available_periods: dict[str, int] = {name: 0 for name in REDUNDANCY_FACTORS}
     per_period: list[dict[str, object]] = []
     for signal_date, factor_map in factor_values_by_date:
         returns = forwards.get(signal_date, {})
@@ -66,28 +67,58 @@ def diagnose_factor_redundancy(
                     key = f"{left}|{right}"
                     pair_history.setdefault(key, []).append(correlation)
                     period_corr[key] = correlation
+        for factor in REDUNDANCY_FACTORS:
+            codes = [
+                code
+                for code, value in factor_map.get(factor, {}).items()
+                if value is not None and code in returns
+            ]
+            if len(codes) < 5:
+                continue
+            marginal = rank_ic(
+                [float(factor_map[factor][code]) for code in codes],
+                [float(returns[code]) for code in codes],
+            )
+            if marginal is not None:
+                ic_history[factor].append(marginal)
+
+        available_factors = [
+            factor
+            for factor in REDUNDANCY_FACTORS
+            if sum(
+                value is not None and code in returns
+                for code, value in factor_map.get(factor, {}).items()
+            )
+            >= 10
+        ]
         all_codes = set().union(
-            *(set(factor_map.get(name, {})) for name in REDUNDANCY_FACTORS)
-        )
+            *(set(factor_map.get(name, {})) for name in available_factors)
+        ) if available_factors else set()
         complete_codes = [
             code
             for code in all_codes
             if all(
                 factor_map.get(name, {}).get(code) is not None
-                for name in REDUNDANCY_FACTORS
+                for name in available_factors
             )
+            and code in returns
         ]
-        if len(complete_codes) >= len(REDUNDANCY_FACTORS) + 3:
+        if (
+            len(available_factors) >= 2
+            and len(complete_codes) >= len(available_factors) + 3
+        ):
             matrix = np.array(
                 [
-                    [float(factor_map[name][code]) for name in REDUNDANCY_FACTORS]
+                    [float(factor_map[name][code]) for name in available_factors]
                     for code in complete_codes
                 ]
             )
             matrix_std = np.std(matrix, axis=0)
             matrix_std[matrix_std <= 1e-15] = 1.0
             matrix = (matrix - np.mean(matrix, axis=0)) / matrix_std
-            for index, factor in enumerate(REDUNDANCY_FACTORS):
+            for factor in available_factors:
+                available_periods[factor] += 1
+            for index, factor in enumerate(available_factors):
                 others = np.delete(matrix, index, axis=1)
                 target = matrix[:, index]
                 design = np.column_stack([np.ones(len(target)), others])
@@ -100,27 +131,19 @@ def diagnose_factor_redundancy(
                 vif_history[factor].append(
                     1.0 / max(1.0 - min(r2, 0.999999), 1e-6)
                 )
-                return_values = [returns.get(code) for code in complete_codes]
-                valid_indices = [
-                    offset
-                    for offset, value in enumerate(return_values)
-                    if value is not None
-                ]
-                if len(valid_indices) >= 5:
-                    marginal = rank_ic(
-                        [target[offset] for offset in valid_indices],
-                        [float(return_values[offset]) for offset in valid_indices],
-                    )
-                    conditional = rank_ic(
-                        [residual[offset] for offset in valid_indices],
-                        [float(return_values[offset]) for offset in valid_indices],
-                    )
-                    if marginal is not None:
-                        ic_history[factor].append(marginal)
-                    if conditional is not None:
-                        conditional_history[factor].append(conditional)
+                conditional = rank_ic(
+                    residual.tolist(),
+                    [float(returns[code]) for code in complete_codes],
+                )
+                if conditional is not None:
+                    conditional_history[factor].append(conditional)
         per_period.append(
-            {"signal_date": signal_date.isoformat(), "correlations": period_corr}
+            {
+                "signal_date": signal_date.isoformat(),
+                "correlations": period_corr,
+                "available_factors": available_factors,
+                "complete_case_count": len(complete_codes),
+            }
         )
     correlation_mean = {
         pair: fmean(values) for pair, values in pair_history.items() if values
@@ -159,6 +182,12 @@ def diagnose_factor_redundancy(
         "vif_mean": vif_mean,
         "marginal_rank_ic_mean": marginal_ic,
         "conditional_rank_ic_mean": conditional_ic,
+        "available_periods": available_periods,
+        "unavailable_factors": [
+            factor
+            for factor, periods in available_periods.items()
+            if periods == 0
+        ],
         "periods": per_period,
         "actions": actions,
         "production_policy": {

@@ -309,32 +309,53 @@ def _fundamental_value_series(
     return [observations[day] for day in sorted(observations)]
 
 
-def momentum_12_1(closes: list[float]) -> float | None:
+def _scaled_window(window: int, scale: float) -> int:
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("factor window scale must be finite and positive")
+    return max(2, round(window * scale))
+
+
+def minimum_history_days(window_scale: float = 1.0) -> int:
+    """返回价格因子所需的最长历史，供股票池和计算层共用。"""
+    return _scaled_window(MOMENTUM_WINDOW, window_scale) + 1
+
+
+def momentum_12_1(
+    closes: list[float],
+    *,
+    window: int = MOMENTUM_WINDOW,
+    skip: int = MOMENTUM_SKIP,
+) -> float | None:
     """12-1 动量：closes[-1-21] / closes[-1-252] - 1。
 
     closes 为打分日 T 截止的收盘价升序序列；T 本身是最后一个点，
     因此 T-252 对应索引 -253，最少需要 253 个点。最近 21 个交易日
     （T 至 T-20）不参与动量收益。
     """
-    if len(closes) < MOMENTUM_WINDOW + 1:
+    if len(closes) < window + 1 or window <= skip:
         return None
-    end_value = closes[-1 - MOMENTUM_SKIP]
-    start_value = closes[-1 - MOMENTUM_WINDOW]
+    end_value = closes[-1 - skip]
+    start_value = closes[-1 - window]
     if start_value <= 0:
         return None
     return end_value / start_value - 1.0
 
 
-def trend_strength(closes: list[float]) -> float | None:
+def trend_strength(
+    closes: list[float],
+    *,
+    short_window: int = TREND_MA_SHORT,
+    long_window: int = TREND_MA_LONG,
+) -> float | None:
     """趋势确认 ∈ [-1, 1]：现价≥MA20、现价≥MA60、MA20≥MA60 各 ±1 归一化。"""
-    if len(closes) < TREND_MA_SHORT:
+    if len(closes) < short_window:
         return None
     price = closes[-1]
-    ma20 = fmean(closes[-TREND_MA_SHORT:])
+    ma20 = fmean(closes[-short_window:])
     score = 1.0 if price >= ma20 else -1.0
     count = 1
-    if len(closes) >= TREND_MA_LONG:
-        ma60 = fmean(closes[-TREND_MA_LONG:])
+    if len(closes) >= long_window:
+        ma60 = fmean(closes[-long_window:])
         score += 1.0 if price >= ma60 else -1.0
         score += 1.0 if ma20 >= ma60 else -1.0
         count += 2
@@ -435,7 +456,12 @@ def _financial_policy_assessments(
     return cash, fcf
 
 
-def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
+def raw_factors(
+    context: StockContext,
+    as_of: date,
+    *,
+    window_scale: float = 1.0,
+) -> dict[str, float | None]:
     """计算单只股票的全部原始因子（未经横截面处理）。
 
     无未来数据：价格序列已在 context 中按 ≤T 截断；基本面按 available_at
@@ -486,22 +512,44 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
         for marker in ("银行", "证券", "保险", "多元金融")
     )
 
+    momentum_window = _scaled_window(252, window_scale)
+    medium_window = _scaled_window(126, window_scale)
+    skip_window = _scaled_window(21, window_scale)
+    reversal_window = _scaled_window(21, window_scale)
+    trend_short = _scaled_window(20, window_scale)
+    trend_long = _scaled_window(60, window_scale)
+    volatility_short = _scaled_window(60, window_scale)
+    volatility_long = _scaled_window(120, window_scale)
+    drawdown_window = _scaled_window(120, window_scale)
+    long_momentum = period_return(closes, momentum_window, skip_window)
+    medium_momentum = period_return(closes, medium_window, skip_window)
     result: dict[str, float | None] = {
-        "momentum_12_1": momentum_12_1(closes),
-        "momentum_6_1": period_return(closes, 126, 21),
-        "short_reversal": (
-            -value if (value := period_return(closes, 21)) is not None else None
+        "momentum_12_1": momentum_12_1(
+            closes,
+            window=momentum_window,
+            skip=skip_window,
         ),
-        "residual_momentum": (
-            period_return(closes, 252, 21) - period_return(closes, 126, 21)
-            if period_return(closes, 252, 21) is not None
-            and period_return(closes, 126, 21) is not None
+        "momentum_6_1": medium_momentum,
+        "short_reversal": (
+            -value
+            if (value := period_return(closes, reversal_window)) is not None
             else None
         ),
-        "trend": trend_strength(closes),
-        "volatility_60": low_volatility(closes, 60),
-        "volatility_120": low_volatility(closes, 120),
-        "max_drawdown_120": maximum_drawdown_factor(closes, 120),
+        "residual_momentum": (
+            long_momentum - medium_momentum
+            if long_momentum is not None and medium_momentum is not None
+            else None
+        ),
+        "trend": trend_strength(
+            closes,
+            short_window=trend_short,
+            long_window=trend_long,
+        ),
+        "volatility_60": low_volatility(closes, volatility_short),
+        "volatility_120": low_volatility(closes, volatility_long),
+        "max_drawdown_120": maximum_drawdown_factor(
+            closes, drawdown_window
+        ),
         "residual_volatility": None,
     }
     result.update({field: None for field in sector_fields})
@@ -756,6 +804,8 @@ def compute_cross_section(
     as_of: date,
     weights: dict[str, float] | None = None,
     official_market_returns: dict[date, float] | None = None,
+    window_scale: float = 1.0,
+    winsor_quantiles: tuple[float, float] = (0.01, 0.99),
 ) -> list[FactorResult]:
     """横截面打分：原始因子 → 行业内 winsorize+z → 族分 → 加权复合分。
 
@@ -789,7 +839,7 @@ def compute_cross_section(
 
     results: list[FactorResult] = []
     for context in contexts:
-        raw = raw_factors(context, as_of)
+        raw = raw_factors(context, as_of, window_scale=window_scale)
         cash_assessment, fcf_assessment = _financial_policy_assessments(context, as_of)
         from app.services.financial_sector_model import assess_financial_sector
 
@@ -846,7 +896,9 @@ def compute_cross_section(
             value for _day, value in sorted(residual_model.residuals.items())
         ]
         residual_volatility = None
-        recent_residuals = residual_values[-120:]
+        recent_residuals = residual_values[
+            -_scaled_window(120, window_scale) :
+        ]
         if len(recent_residuals) >= 20:
             residual_mean = fmean(recent_residuals)
             residual_volatility = -math.sqrt(
@@ -855,10 +907,15 @@ def compute_cross_section(
             )
         # 12-1 残差动量直接复合已保存的模型残差，跳过最近21个交易日。
         momentum_residuals = (
-            residual_values[-252:-21] if len(residual_values) >= 253 else []
+            residual_values[
+                -_scaled_window(252, window_scale) :
+                -_scaled_window(21, window_scale)
+            ]
+            if len(residual_values) >= minimum_history_days(window_scale)
+            else []
         )
         residual_momentum = None
-        if len(momentum_residuals) >= 126:
+        if len(momentum_residuals) >= _scaled_window(126, window_scale):
             compounded = 1.0
             for value in momentum_residuals:
                 compounded *= 1.0 + value
@@ -1011,7 +1068,13 @@ def compute_cross_section(
             "small_industries": list(neutralization.small_industries),
         }
         if neutralization.method == "wls_sqrt_float_market_cap":
-            standardized = zscore(winsorize(neutralization.residuals))
+            standardized = zscore(
+                winsorize(
+                    neutralization.residuals,
+                    lower_q=winsor_quantiles[0],
+                    upper_q=winsor_quantiles[1],
+                )
+            )
             for item in results:
                 item.zscores[factor_name] = standardized[item.code]
                 item.factor_metadata.setdefault(factor_name, {})["neutralization"] = (
@@ -1020,7 +1083,13 @@ def compute_cross_section(
         else:
             for members in by_industry.values():
                 column = {member.code: oriented[member.code] for member in members}
-                zscores = zscore(winsorize(column))
+                zscores = zscore(
+                    winsorize(
+                        column,
+                        lower_q=winsor_quantiles[0],
+                        upper_q=winsor_quantiles[1],
+                    )
+                )
                 for member in members:
                     member.zscores[factor_name] = zscores[member.code]
                     member.factor_metadata.setdefault(factor_name, {})[

@@ -27,6 +27,7 @@ from app.services import (
     benchmark_data,
     corporate_action_master,
     job_queue,
+    linear_alpha_challenger,
     oms,
     pit_warehouse,
     position_lots,
@@ -1045,6 +1046,23 @@ def test_stock_walk_forward_has_embargo_and_holdout_once(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(stock_validation, "run_backtest", fake_run_backtest)
+    challenger_call: dict[str, object] = {}
+    monkeypatch.setattr(
+        linear_alpha_challenger,
+        "rows_from_backtest",
+        lambda outcome: [outcome.calendar[0]],
+    )
+
+    def fake_challenger(rows, *, prediction_start_date=None, **_kwargs):
+        challenger_call["rows"] = list(rows)
+        challenger_call["prediction_start_date"] = prediction_start_date
+        return {"status": "challenger_only", "oos_periods": 1}
+
+    monkeypatch.setattr(
+        linear_alpha_challenger,
+        "walk_forward_linear_challenger",
+        fake_challenger,
+    )
     result = stock_validation.run_stock_walk_forward(
         Repository(),
         BacktestConfig(start=days[0], end=days[-1], candidate_codes=("600001",)),
@@ -1097,6 +1115,11 @@ def test_stock_walk_forward_has_embargo_and_holdout_once(monkeypatch) -> None:
         == 1
     )
     assert not any(initial for _start, _end, initial in calls)
+    assert len(challenger_call["rows"]) == 4
+    assert (
+        challenger_call["prediction_start_date"]
+        == datetime.fromisoformat(result["splits"]["validation"][0]).date()
+    )
 
 
 def test_stock_walk_forward_rejects_cash_only_fold(monkeypatch) -> None:

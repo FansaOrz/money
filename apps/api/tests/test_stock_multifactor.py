@@ -1606,6 +1606,11 @@ def test_run_backtest_with_mock_repository() -> None:
     assert outcome.final_value > 0
     assert outcome.rebalances
     assert len(outcome.equity) == len(outcome.calendar) == len(outcome.benchmark)
+    assert outcome.factor_values_by_date
+    factors_by_date = dict(outcome.factor_values_by_date)
+    scores_by_date = dict(outcome.scores_by_date)
+    for signal_date, scores in scores_by_date.items():
+        assert factors_by_date[signal_date]["composite"] == scores
     # 等权/指数基准与策略逐日对齐
     assert outcome.benchmark[0] == pytest.approx(1.0)
 
