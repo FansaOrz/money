@@ -829,6 +829,7 @@ def run_backtest_panel(
     last_signal_info: tuple[date, dict[str, float], dict[str, float]] | None = None
     limit_checks = 0
     authoritative_limit_checks = 0
+    missing_limit_checks_by_code: Counter[str] = Counter()
 
     for i, day in enumerate(calendar_days):
         for code, release_day in list(restricted_until.items()):
@@ -1818,6 +1819,8 @@ def run_backtest_panel(
                         limit_checks += 1
                         if bar.up_limit is not None and bar.down_limit is not None:
                             authoritative_limit_checks += 1
+                        else:
+                            missing_limit_checks_by_code[code] += 1
                 ok, reason = can_trade(
                     bar,
                     prev_close,
@@ -2359,9 +2362,14 @@ def run_backtest_panel(
         raise BacktestError("回测区间内无任何交易日，无法构造净值曲线")
     limit_coverage = authoritative_limit_checks / limit_checks if limit_checks else 1.0
     if limit_coverage + 1e-12 < config.min_limit_data_coverage:
+        missing_detail = "、".join(
+            f"{code}={count}"
+            for code, count in missing_limit_checks_by_code.most_common(20)
+        )
         raise BacktestError(
             f"权威涨跌停数据覆盖率 {limit_coverage:.2%} 低于正式门槛 "
-            f"{config.min_limit_data_coverage:.2%}，禁止大量使用规则回退"
+            f"{config.min_limit_data_coverage:.2%}，禁止大量使用规则回退；"
+            f"缺失检查最多的证券：{missing_detail or '无'}"
         )
 
     daily_returns = [
