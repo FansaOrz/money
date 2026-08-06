@@ -90,6 +90,7 @@ from app.services.stock_repository import (
 from app.timezone import now_cn
 
 STRATEGY_NAME = "A股多因子规则V7-版本11零中心证据门控版"
+OPERATIONAL_SHADOW_NAME = "A股多因子规则V7-版本12运行影子镜像"
 MODEL_VERSION = "stock_rules_v7"
 ACCOUNT_NAME = "A股规则策略模拟账户"
 INITIAL_CAPITAL = Decimal("1000000.00")
@@ -442,14 +443,48 @@ def _persist_field_readiness(
         }
         for code in universe
     }
+    version = db.get(StrategyVersion, strategy_version_id)
     return save_readiness(
         db,
-        STRATEGY_NAME,
+        version.name if version is not None else STRATEGY_NAME,
         signal_date,
         rows,
         strategy_version_id=strategy_version_id,
         data_snapshot_sha256=data_snapshot_sha256,
     )
+
+
+def _active_forward_version(db: Session) -> StrategyVersion | None:
+    """运行影子优先；不存在时才回退当前投资研究版本。"""
+    shadow = db.scalar(
+        select(StrategyVersion)
+        .where(StrategyVersion.name == OPERATIONAL_SHADOW_NAME)
+        .order_by(StrategyVersion.id.desc())
+        .limit(1)
+    )
+    if shadow is not None:
+        return shadow
+    return db.scalar(
+        select(StrategyVersion)
+        .where(StrategyVersion.name == STRATEGY_NAME)
+        .order_by(StrategyVersion.id.desc())
+        .limit(1)
+    )
+
+
+def _frozen_forward_factor_weights(
+    version: StrategyVersion | None,
+) -> dict[str, float]:
+    """兼容正式验证顶层字段与版本11训练预检内的冻结权重。"""
+    if version is None:
+        return {}
+    params = dict(version.params or {})
+    direct = dict(params.get("frozen_adaptive_factor_weights") or {})
+    if direct:
+        return {str(key): float(value) for key, value in direct.items()}
+    preflight = dict(params.get("training_preflight") or {})
+    nested = dict(preflight.get("frozen_factor_weights") or {})
+    return {str(key): float(value) for key, value in nested.items()}
 
 
 def _ready_candidate_codes(db: Session, latest: date) -> list[str]:
@@ -563,12 +598,7 @@ def ensure_research_strategy_version(db: Session) -> StrategyVersion:
 def _ensure_account(
     db: Session, data_date: date
 ) -> tuple[StockPaperAccount, StrategyVersion]:
-    version = db.scalar(
-        select(StrategyVersion)
-        .where(StrategyVersion.name == STRATEGY_NAME)
-        .order_by(StrategyVersion.id.desc())
-        .limit(1)
-    )
+    version = _active_forward_version(db)
     if version is not None:
         account = db.scalar(
             select(StockPaperAccount).where(
@@ -1517,11 +1547,7 @@ def _generate_signal(
         if stock_factors.history_depth(item) >= stock_factors.MIN_HISTORY_DAYS
     ]
     version = db.get(StrategyVersion, account.strategy_version_id)
-    frozen_weights = (
-        dict((version.params or {}).get("frozen_adaptive_factor_weights") or {})
-        if version is not None
-        else {}
-    )
+    frozen_weights = _frozen_forward_factor_weights(version)
     scored = stock_factors.compute_cross_section(
         contexts,
         signal_date,

@@ -18,8 +18,9 @@ from app.models import (
     StockPaperSignal,
     StockPaperTrade,
     StockValuation,
+    StrategyVersion,
 )
-from app.services import stock_paper
+from app.services import stock_paper, strategy_mandate
 from app.services.stock_repository import (
     Fundamentals,
     StockBar,
@@ -185,6 +186,59 @@ def test_version11_research_record_uses_investment_mandate_without_readiness(
     )
     assert audit is not None
     assert audit.detail["model_version"] == "stock_rules_v7"
+
+
+def test_nested_v11_preflight_weights_are_used_for_forward_signal(
+    db_session: Session,
+) -> None:
+    version = stock_paper.ensure_research_strategy_version(db_session)
+    params = dict(version.params)
+    params["training_preflight"] = {
+        "frozen_factor_weights": {
+            "quality": 0.0,
+            "value": 0.28,
+            "momentum": 0.50,
+            "trend": 0.02,
+            "lowvol": 0.20,
+        }
+    }
+    version.params = params
+    db_session.commit()
+
+    assert stock_paper._frozen_forward_factor_weights(version) == {
+        "quality": 0.0,
+        "value": 0.28,
+        "momentum": 0.50,
+        "trend": 0.02,
+        "lowvol": 0.20,
+    }
+
+
+def test_operational_shadow_is_preferred_as_active_forward_version(
+    db_session: Session,
+) -> None:
+    research = stock_paper.ensure_research_strategy_version(db_session)
+    mandate = strategy_mandate.operational_validation_mandate(
+        strategy_name=stock_paper.OPERATIONAL_SHADOW_NAME,
+        initial_capital=stock_paper.INITIAL_CAPITAL,
+        rebalance_days=20,
+        top_n=stock_paper.TOP_N,
+    )
+    shadow = StrategyVersion(
+        name=stock_paper.OPERATIONAL_SHADOW_NAME,
+        initial_capital=stock_paper.INITIAL_CAPITAL,
+        rebalance_interval=20,
+        fee_rate=research.fee_rate,
+        top_n=stock_paper.TOP_N,
+        params={"model_version": stock_paper.MODEL_VERSION},
+        mandate=mandate,
+        mandate_sha256=strategy_mandate.mandate_sha256(mandate),
+        status="research",
+    )
+    db_session.add(shadow)
+    db_session.commit()
+
+    assert stock_paper._active_forward_version(db_session).id == shadow.id
 
 
 def _seed_trial(db: Session) -> tuple[ForwardRepository, date]:

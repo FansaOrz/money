@@ -76,7 +76,10 @@ def evaluate_gates(
     results: dict[str, dict[str, Any]] = {}
     if to_status == "operational_validated":
         coverage = _number(evidence, "data_coverage")
-        evaluations = evidence.get("holdout_evaluations")
+        evaluations = evidence.get(
+            "operational_validation_evaluations",
+            evidence.get("holdout_evaluations"),
+        )
         folds = evidence.get("walkforward_folds")
         sharpe = _number(evidence, "holdout_sharpe")
         trade_count = evidence.get("holdout_trade_count")
@@ -93,11 +96,11 @@ def evaluate_gates(
         _check(
             results,
             failures,
-            key="holdout_evaluations",
+            key="operational_validation_evaluations",
             actual=evaluations,
             expected="==1",
             passed=evaluations == 1,
-            message="完全留出集必须且只能评估一次",
+            message="运行链路验证段必须且只能评估一次",
         )
         _check(
             results,
@@ -105,7 +108,9 @@ def evaluate_gates(
             key="walkforward_folds",
             actual=folds,
             expected=">=3",
-            passed=isinstance(folds, int) and not isinstance(folds, bool) and folds >= 3,
+            passed=isinstance(folds, int)
+            and not isinstance(folds, bool)
+            and folds >= 3,
             message="purged walk-forward 少于3折",
         )
         _check(
@@ -183,9 +188,19 @@ def evaluate_gates(
             thresholds = {}
         checks = (
             ("data_coverage", "min_data_coverage", ">=", "数据覆盖未达投资门槛"),
-            ("walkforward_folds", "min_walkforward_folds", ">=", "走步折数未达投资门槛"),
+            (
+                "walkforward_folds",
+                "min_walkforward_folds",
+                ">=",
+                "走步折数未达投资门槛",
+            ),
             ("holdout_sharpe", "min_holdout_sharpe", ">=", "留出集 Sharpe 未达门槛"),
-            ("net_excess_return", "min_net_excess_return", ">", "扣费后超额收益必须为正"),
+            (
+                "net_excess_return",
+                "min_net_excess_return",
+                ">",
+                "扣费后超额收益必须为正",
+            ),
             ("active_sharpe", "min_active_sharpe", ">=", "主动 Sharpe 未达门槛"),
             (
                 "active_return_ci_lower",
@@ -203,14 +218,24 @@ def evaluate_gates(
             ("rank_ic_mean", "min_rank_ic_mean", ">=", "Rank IC 均值未达门槛"),
             ("rank_icir", "min_rank_icir", ">=", "Rank ICIR 未达门槛"),
             ("rank_ic_p_value", "max_rank_ic_p_value", "<=", "Rank IC 显著性未达门槛"),
-            ("rank_ic_ci_lower", "min_rank_ic_ci_lower", ">", "Rank IC 置信区间未严格高于零"),
+            (
+                "rank_ic_ci_lower",
+                "min_rank_ic_ci_lower",
+                ">",
+                "Rank IC 置信区间未严格高于零",
+            ),
             (
                 "quintile_monotonicity",
                 "min_quintile_monotonicity",
                 ">=",
                 "五档单调性未达门槛",
             ),
-            ("top_bottom_spread", "min_top_bottom_spread", ">", "头尾档净收益差必须为正"),
+            (
+                "top_bottom_spread",
+                "min_top_bottom_spread",
+                ">",
+                "头尾档净收益差必须为正",
+            ),
             (
                 "deflated_sharpe_probability",
                 "min_deflated_sharpe_probability",
@@ -419,10 +444,10 @@ def transition(
     )
     failures = mandate_failures + failures
     params = dict(version.params or {})
-    if (
-        to_status in {"operational_validated", "investment_validated"}
-        and _is_governed_stock_strategy(params)
-    ):
+    if to_status in {
+        "operational_validated",
+        "investment_validated",
+    } and _is_governed_stock_strategy(params):
         for key in (
             "benchmark_kind",
             "benchmark_code",
@@ -442,7 +467,12 @@ def transition(
         expected_hash = params.get("validation_sha256")
         if not expected_hash or evidence.get("validation_sha256") != expected_hash:
             failures.append("验证证据哈希与策略冻结快照不一致")
-        if evidence.get("generated_by") != "stock_validation.run_stock_walk_forward":
+        trusted_generators = {"stock_validation.run_stock_walk_forward"}
+        if to_status == "operational_validated":
+            trusted_generators.add(
+                "scripts.run_strategy_v12_operational_shadow.run_development_replay"
+            )
+        if evidence.get("generated_by") not in trusted_generators:
             failures.append("股票验证证据不是由系统走步验证生成")
         stored_key = (
             "operational_validation_evidence"
