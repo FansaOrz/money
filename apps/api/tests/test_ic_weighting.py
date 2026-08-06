@@ -43,8 +43,17 @@ def test_future_label_is_excluded_and_weights_are_capped() -> None:
     with_future = estimate_ic_weights([known, future_bad], as_of=as_of)
     without_future = estimate_ic_weights([known], as_of=as_of)
     assert with_future.weights == without_future.weights
-    assert max(with_future.weights.values()) <= 0.35 + 1e-12
+    assert max(with_future.weights.values()) <= 0.30 + 1e-12
+    assert min(with_future.weights.values()) >= 0.08 - 1e-12
     assert abs(sum(with_future.weights.values()) - 1.0) < 1e-12
+    assert with_future.status == "robust_prior_fallback"
+    assert with_future.weights == {
+        "quality": 0.30,
+        "value": 0.25,
+        "momentum": 0.20,
+        "trend": 0.15,
+        "lowvol": 0.10,
+    }
 
 
 def test_weight_history_is_deterministic_and_shrunk_toward_prior() -> None:
@@ -53,9 +62,55 @@ def test_weight_history_is_deterministic_and_shrunk_toward_prior() -> None:
         _observation(2, 3),
         _observation(3, 4),
     ]
-    first = estimate_ic_weights(observations, as_of=date(2025, 5, 1))
-    second = estimate_ic_weights(observations, as_of=date(2025, 5, 1))
+    first = estimate_ic_weights(
+        observations,
+        as_of=date(2025, 5, 1),
+        minimum_periods=3,
+    )
+    second = estimate_ic_weights(
+        observations,
+        as_of=date(2025, 5, 1),
+        minimum_periods=3,
+    )
     assert first == second
-    assert first.status == "trained"
+    assert first.status == "trained_shrunk"
     assert first.observation_counts["quality"] == 3
     assert first.shrunk_ic["quality"] < 1.0
+
+
+def test_previous_weight_blend_penalizes_weight_turnover() -> None:
+    observations = [
+        _observation(1, 2),
+        _observation(2, 3),
+        _observation(3, 4),
+    ]
+    unblended = estimate_ic_weights(
+        observations,
+        as_of=date(2025, 5, 1),
+        minimum_periods=3,
+        previous_weight_blend=0.0,
+        previous_weights={
+            "quality": 0.10,
+            "value": 0.20,
+            "momentum": 0.20,
+            "trend": 0.20,
+            "lowvol": 0.30,
+        },
+    )
+    blended = estimate_ic_weights(
+        observations,
+        as_of=date(2025, 5, 1),
+        minimum_periods=3,
+        previous_weight_blend=0.75,
+        previous_weights={
+            "quality": 0.10,
+            "value": 0.20,
+            "momentum": 0.20,
+            "trend": 0.20,
+            "lowvol": 0.30,
+        },
+    )
+    assert blended.status == "trained_shrunk_turnover_penalized"
+    assert abs(blended.weights["lowvol"] - 0.30) < abs(
+        unblended.weights["lowvol"] - 0.30
+    )

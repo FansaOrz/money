@@ -821,6 +821,7 @@ def run_backtest_panel(
     scores_by_date: list[tuple[date, dict[str, float]]] = []
     factor_values_by_date: list[tuple[date, dict[str, dict[str, float | None]]]] = []
     factor_weight_history: list[dict[str, object]] = []
+    previous_estimated_factor_weights: dict[str, float] | None = None
     ic_training_observations: list[object] = []
     last_family_signal: tuple[date, dict[str, dict[str, float | None]]] | None = None
     groups_by_date: list[tuple[date, dict[str, tuple[str, str]]]] = []
@@ -1345,8 +1346,12 @@ def run_backtest_panel(
                 weight_estimate = estimate_ic_weights(
                     ic_training_observations,  # type: ignore[arg-type]
                     as_of=day,
+                    previous_weights=previous_estimated_factor_weights,
                 )
                 effective_factor_weights = weight_estimate.weights
+                previous_estimated_factor_weights = dict(
+                    weight_estimate.weights
+                )
                 factor_weight_history.append(
                     {
                         "as_of": day.isoformat(),
@@ -1368,6 +1373,10 @@ def run_backtest_panel(
                         "half_life_periods": weight_estimate.half_life_periods,
                         "prior_strength": weight_estimate.prior_strength,
                         "maximum_weight": weight_estimate.maximum_weight,
+                        "minimum_weight": weight_estimate.minimum_weight,
+                        "previous_weight_blend": (
+                            weight_estimate.previous_weight_blend
+                        ),
                     }
                 )
 

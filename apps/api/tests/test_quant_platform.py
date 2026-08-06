@@ -1011,8 +1011,10 @@ def test_stock_walk_forward_has_embargo_and_holdout_once(monkeypatch) -> None:
             return TradeCalendar(days)
 
     calls: list[tuple[datetime.date, datetime.date, bool]] = []
+    configs: list[BacktestConfig] = []
 
     def fake_run_backtest(*, config, repository):
+        configs.append(config)
         calls.append((config.start, config.end, config.initial_signal))
         curve_days = [day for day in days if config.start <= day <= config.end]
         equity = [1_000_000.0 + index for index in range(len(curve_days))]
@@ -1115,11 +1117,29 @@ def test_stock_walk_forward_has_embargo_and_holdout_once(monkeypatch) -> None:
         == 1
     )
     assert not any(initial for _start, _end, initial in calls)
-    assert len(challenger_call["rows"]) == 4
+    assert len(challenger_call["rows"]) == 2
     assert (
         challenger_call["prediction_start_date"]
         == datetime.fromisoformat(result["splits"]["validation"][0]).date()
     )
+    assert result["factor_weight_training_scope"] == {
+        "start": result["splits"]["train"][0],
+        "end": result["splits"]["train"][1],
+        "frozen_before_validation": True,
+    }
+    validation_range = tuple(
+        datetime.fromisoformat(value).date()
+        for value in result["splits"]["validation"]
+    )
+    validation_config = next(
+        config
+        for config in configs
+        if (config.start, config.end) == validation_range
+    )
+    assert validation_config.factor_weights == (
+        result["frozen_adaptive_factor_weights"]
+    )
+    assert validation_config.adaptive_ic_weights is False
 
 
 def test_stock_walk_forward_rejects_cash_only_fold(monkeypatch) -> None:

@@ -294,7 +294,7 @@ def run_validation_robustness(
     family_weights = (
         dict(baseline.factor_weight_history[-1]["weights"])
         if baseline.factor_weight_history
-        else dict(stock_factors.DEFAULT_FAMILY_WEIGHTS)
+        else dict(base.factor_weights or stock_factors.DEFAULT_FAMILY_WEIGHTS)
     )
     for family in sorted(family_weights):
         for multiplier in (0.8, 1.2):

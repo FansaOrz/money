@@ -16,6 +16,13 @@ ROBUST_PRIOR_IC = {
     "trend": 0.005,
     "lowvol": 0.010,
 }
+PRIOR_FAMILY_WEIGHTS = {
+    "quality": 0.30,
+    "value": 0.25,
+    "momentum": 0.20,
+    "trend": 0.15,
+    "lowvol": 0.10,
+}
 
 
 @dataclass(frozen=True)
@@ -38,7 +45,60 @@ class IcWeightEstimate:
     half_life_periods: float
     prior_strength: float
     maximum_weight: float
+    minimum_weight: float
+    previous_weight_blend: float
     status: str
+
+
+def _bounded_weights(
+    signals: dict[str, float],
+    *,
+    minimum_weight: float,
+    maximum_weight: float,
+) -> dict[str, float]:
+    if (
+        minimum_weight < 0
+        or maximum_weight <= 0
+        or minimum_weight > maximum_weight
+        or minimum_weight * len(FAMILIES) > 1.0 + 1e-12
+        or maximum_weight * len(FAMILIES) < 1.0 - 1e-12
+    ):
+        raise ValueError("infeasible family weight bounds")
+    positive = {
+        family: max(float(signals.get(family, 0.0)), 0.0)
+        for family in FAMILIES
+    }
+    if sum(positive.values()) <= 0:
+        positive = dict(PRIOR_FAMILY_WEIGHTS)
+    low = 0.0
+    high = 1.0
+    while sum(
+        min(max(high * positive[name], minimum_weight), maximum_weight)
+        for name in FAMILIES
+    ) < 1.0:
+        high *= 2.0
+    for _ in range(100):
+        middle = (low + high) / 2.0
+        total = sum(
+            min(
+                max(middle * positive[name], minimum_weight),
+                maximum_weight,
+            )
+            for name in FAMILIES
+        )
+        if total < 1.0:
+            low = middle
+        else:
+            high = middle
+    weights = {
+        name: min(
+            max(high * positive[name], minimum_weight),
+            maximum_weight,
+        )
+        for name in FAMILIES
+    }
+    total = sum(weights.values())
+    return {name: value / total for name, value in weights.items()}
 
 
 def estimate_ic_weights(
@@ -46,9 +106,12 @@ def estimate_ic_weights(
     *,
     as_of: date,
     half_life_periods: float = 12.0,
-    prior_strength: float = 12.0,
-    maximum_weight: float = 0.35,
-    minimum_periods: int = 3,
+    prior_strength: float = 24.0,
+    maximum_weight: float = 0.30,
+    minimum_weight: float = 0.08,
+    minimum_periods: int = 12,
+    previous_weights: dict[str, float] | None = None,
+    previous_weight_blend: float = 0.75,
 ) -> IcWeightEstimate:
     """未来标签未成熟（label_available_at > as_of）的观察绝不参与。"""
     usable = sorted(
@@ -103,32 +166,34 @@ def estimate_ic_weights(
             effective_n * weighted_mean
             + prior_strength * ROBUST_PRIOR_IC[family]
         ) / (effective_n + prior_strength)
-    positive = {family: max(value, 0.0) for family, value in shrunk.items()}
-    total = sum(positive.values())
-    if total <= 0:
-        weights = {family: 0.0 for family in FAMILIES}
-    else:
-        weights = {family: value / total for family, value in positive.items()}
-        for _ in range(len(FAMILIES) + 1):
-            capped = {
-                family
-                for family, value in weights.items()
-                if value > maximum_weight + 1e-15
-            }
-            if not capped:
-                break
-            fixed = maximum_weight * len(capped)
-            remaining_names = [name for name in FAMILIES if name not in capped]
-            remaining_raw = sum(positive[name] for name in remaining_names)
-            for name in capped:
-                weights[name] = maximum_weight
-            for name in remaining_names:
-                weights[name] = (
-                    (1.0 - fixed) * positive[name] / remaining_raw
-                    if remaining_raw > 0
-                    else 0.0
-                )
     enough = all(count >= minimum_periods for count in counts.values())
+    if not enough:
+        weights = dict(PRIOR_FAMILY_WEIGHTS)
+        status = "robust_prior_fallback"
+    else:
+        target = _bounded_weights(
+            shrunk,
+            minimum_weight=minimum_weight,
+            maximum_weight=maximum_weight,
+        )
+        if previous_weights is not None:
+            blend = min(max(previous_weight_blend, 0.0), 1.0)
+            previous = _bounded_weights(
+                previous_weights,
+                minimum_weight=minimum_weight,
+                maximum_weight=maximum_weight,
+            )
+            weights = {
+                family: (
+                    blend * previous[family]
+                    + (1.0 - blend) * target[family]
+                )
+                for family in FAMILIES
+            }
+            status = "trained_shrunk_turnover_penalized"
+        else:
+            weights = target
+            status = "trained_shrunk"
     return IcWeightEstimate(
         as_of=as_of,
         weights=weights,
@@ -140,5 +205,7 @@ def estimate_ic_weights(
         half_life_periods=half_life_periods,
         prior_strength=prior_strength,
         maximum_weight=maximum_weight,
-        status="trained" if enough else "robust_prior_shrunk",
+        minimum_weight=minimum_weight,
+        previous_weight_blend=previous_weight_blend,
+        status=status,
     )

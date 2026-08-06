@@ -376,17 +376,14 @@ def run_stock_walk_forward(
         raise BacktestError("训练段无法形成至少3个带 embargo 的样本外走步折")
 
     from app.services.linear_alpha_challenger import (
-        AlphaRow,
         rows_from_backtest,
         walk_forward_linear_challenger,
     )
 
     trials: list[dict[str, object]] = []
-    challenger_rows_by_trial: dict[tuple[int, float], list[AlphaRow]] = {}
     for top_n in sorted(set(top_n_grid)):
         for max_weight in sorted(set(max_stock_weight_grid)):
             fold_metrics: list[dict[str, float | int | None]] = []
-            trial_challenger_rows: list[AlphaRow] = []
             for fold_start, fold_end in folds:
                 outcome = run_backtest(
                     config=replace(
@@ -406,7 +403,6 @@ def run_stock_walk_forward(
                     ),
                 )
                 fold_metrics.append(_metrics(outcome))
-                trial_challenger_rows.extend(rows_from_backtest(outcome))
             sharpes = [
                 float(item["sharpe"])
                 for item in fold_metrics
@@ -430,7 +426,6 @@ def run_stock_walk_forward(
                     "folds": fold_metrics,
                 }
             )
-            challenger_rows_by_trial[(top_n, max_weight)] = trial_challenger_rows
     best = max(trials, key=lambda item: float(item["score"]))
     from app.services.backtest_overfitting import cscv_pbo
 
@@ -450,6 +445,26 @@ def run_stock_walk_forward(
         top_n=int(best_params["top_n"]),
         max_stock_weight=float(best_params["max_stock_weight"]),
         initial_signal=False,
+    )
+    training_fit_outcome = run_backtest(
+        config=replace(selected, start=train[0], end=train[-1]),
+        repository=repository,
+    )
+    _assert_strategy_activity(
+        training_fit_outcome,
+        stage="完整训练段最终拟合",
+    )
+    from app.services.stock_factors import DEFAULT_FAMILY_WEIGHTS
+
+    frozen_factor_weights = (
+        dict(training_fit_outcome.factor_weight_history[-1]["weights"])
+        if training_fit_outcome.factor_weight_history
+        else dict(selected.factor_weights or DEFAULT_FAMILY_WEIGHTS)
+    )
+    selected = replace(
+        selected,
+        adaptive_ic_weights=False,
+        factor_weights=frozen_factor_weights,
     )
     validation_outcome = run_backtest(
         config=replace(selected, start=validation[0], end=validation[-1]),
@@ -502,13 +517,7 @@ def run_stock_walk_forward(
     )
     _assert_strategy_activity(holdout_outcome, stage="留出集")
     holdout_metrics = _metrics(holdout_outcome)
-    challenger_rows = challenger_rows_by_trial.get(
-        (
-            int(best_params["top_n"]),
-            float(best_params["max_stock_weight"]),
-        ),
-        [],
-    )
+    challenger_rows = rows_from_backtest(training_fit_outcome)
     challenger_rows.extend(rows_from_backtest(validation_outcome))
     linear_challenger = walk_forward_linear_challenger(
         challenger_rows,
@@ -695,7 +704,10 @@ def run_stock_walk_forward(
                 "standardization",
                 "missing_value_policy",
                 "neutralization",
+            ],
+            "final_training_fit": [
                 "ic_weight_estimation",
+                "linear_challenger_training_rows",
             ],
         },
         "splits": {
@@ -730,12 +742,16 @@ def run_stock_walk_forward(
                 validation_outcome.forward_returns,
             )
         ),
-        "adaptive_factor_weight_history": (validation_outcome.factor_weight_history),
-        "frozen_adaptive_factor_weights": (
-            dict(validation_outcome.factor_weight_history[-1]["weights"])
-            if validation_outcome.factor_weight_history
-            else None
+        "training_fit": _metrics(training_fit_outcome),
+        "adaptive_factor_weight_history": (
+            training_fit_outcome.factor_weight_history
         ),
+        "frozen_adaptive_factor_weights": frozen_factor_weights,
+        "factor_weight_training_scope": {
+            "start": train[0].isoformat(),
+            "end": train[-1].isoformat(),
+            "frozen_before_validation": True,
+        },
         "linear_alpha_challenger": linear_challenger,
         "holdout_evaluations": 1,
         "minimum_data_coverage": min(observed_coverages),
