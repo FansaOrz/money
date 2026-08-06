@@ -2118,7 +2118,8 @@ def test_pending_orders_overridden_warns() -> None:
     )
     assert len(outcome.rebalances) == 2
     first, second = outcome.rebalances
-    assert first.target.get(code) == pytest.approx(0.05)
+    assert 0 < first.target.get(code, 0.0) <= 0.05
+    assert first.diagnostics["continuous_target_weights"][code] == pytest.approx(0.05)
     # 2-3/2-4 涨停顺延，首期买入最终在 2-5 成交（顺延保住首期，不静默丢）
     assert code in first.blocked_codes
     buys = [fill for fill in first.fills if fill.action == "buy"]
@@ -2169,7 +2170,10 @@ def test_pending_orders_dropped_by_new_signal_warns() -> None:
     )
     # 起点强制信号 + 两个月末信号：起点期订单顺延至 10-31 信号日被覆盖
     assert len(outcome.rebalances) == 3
-    assert outcome.rebalances[0].target.get(code) == pytest.approx(0.05)
+    assert 0 < outcome.rebalances[0].target.get(code, 0.0) <= 0.05
+    assert outcome.rebalances[0].diagnostics["continuous_target_weights"][
+        code
+    ] == pytest.approx(0.05)
     assert any("覆盖" in w for w in outcome.warnings)
     assert any("覆盖" in w for w in outcome.rebalances[0].warnings)
 

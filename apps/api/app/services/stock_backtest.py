@@ -1284,9 +1284,7 @@ def run_backtest_panel(
                     for info in signal_infos
                     if info.industry not in excluded_industries
                 ]
-            factor_day_index = max(
-                0, i - max(config.data_lag_trading_days, 0)
-            )
+            factor_day_index = max(0, i - max(config.data_lag_trading_days, 0))
             factor_as_of = calendar_days[factor_day_index]
             universe, filters = strategy.build_universe(
                 signal_infos,
@@ -1350,9 +1348,7 @@ def run_backtest_panel(
                     previous_weights=previous_estimated_factor_weights,
                 )
                 effective_factor_weights = weight_estimate.weights
-                previous_estimated_factor_weights = dict(
-                    weight_estimate.weights
-                )
+                previous_estimated_factor_weights = dict(weight_estimate.weights)
                 factor_weight_history.append(
                     {
                         "as_of": day.isoformat(),
@@ -1446,14 +1442,15 @@ def run_backtest_panel(
                 is not None
                 and price > 0
             }
-            executable_target = dict(plan.target_weights)
+            continuous_target = dict(plan.target_weights)
+            executable_target = dict(continuous_target)
             if (
                 signal_value > 0
                 and decision_prices
-                and len(decision_prices) == len(plan.target_weights)
+                and len(decision_prices) == len(continuous_target)
             ):
                 discrete = discretize_portfolio(
-                    target_weights=plan.target_weights,
+                    target_weights=continuous_target,
                     prices=decision_prices,
                     portfolio_value=signal_value,
                     lot_sizes={
@@ -1461,13 +1458,24 @@ def run_backtest_panel(
                         for code in plan.target_weights
                     },
                     max_stock_weight=config.max_stock_weight,
+                    minimum_holdings=min(
+                        config.minimum_holdings,
+                        len(continuous_target),
+                    ),
                 )
                 plan.diagnostics["discrete_feasibility"] = discrete
                 if discrete["passed"] is True:
-                    executable_target = dict(discrete["actual_weights"])
+                    executable_target = {
+                        code: float(weight)
+                        for code, weight in dict(discrete["actual_weights"]).items()
+                        if float(weight) > 0
+                    }
                 else:
                     plan.warnings.append("整手离散后违反硬约束，本期拒绝生成下单目标")
                     executable_target = {}
+            plan.diagnostics["continuous_target_weights"] = continuous_target
+            plan.target_weights = executable_target
+            plan.invested_weight = round(sum(executable_target.values()), 6)
             plan.diagnostics["selection_funnel"] = {
                 "signal_stock_count": len(signal_infos),
                 "universe_passed_count": len(universe),
@@ -1475,7 +1483,8 @@ def run_backtest_panel(
                 "history_eligible_count": len(contexts),
                 "scored_count": len(scored),
                 "factor_eligible_count": sum(item.eligible for item in scored),
-                "target_count": len(plan.target_weights),
+                "continuous_target_count": len(continuous_target),
+                "target_count": len(executable_target),
                 "executable_target_count": len(executable_target),
             }
             plan.diagnostics["universe_exclusion_reasons"] = dict(
@@ -1523,7 +1532,7 @@ def run_backtest_panel(
                     ),
                     "remaining_shares": 0.0,
                 }
-                for code in set(shares) | set(plan.target_weights)
+                for code in set(shares) | set(executable_target)
                 if code not in restricted_assets
             }
             pending_signal_date = day
@@ -1538,7 +1547,8 @@ def run_backtest_panel(
                                 item.composite
                                 if factor_name == "composite"
                                 else getattr(item, factor_name)
-                                if factor_name in {
+                                if factor_name
+                                in {
                                     "quality",
                                     "value",
                                     "momentum",

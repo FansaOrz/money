@@ -1596,6 +1596,55 @@ def _generate_signal(
         )
     except stock_strategy.IndustryCoverageError as exc:
         raise StockPaperError(str(exc)) from exc
+    from app.services.portfolio_risk_controls import discretize_portfolio
+
+    continuous_target = dict(plan.target_weights)
+    decision_prices = {
+        code: price
+        for code in continuous_target
+        if (
+            price := stock_backtest._last_price_before(
+                panel.bars_by_code.get(code, []),
+                signal_date,
+                None,
+            )
+        )
+        is not None
+        and price > 0
+    }
+    executable_target = dict(continuous_target)
+    if (
+        _total > 0
+        and decision_prices
+        and len(decision_prices) == len(continuous_target)
+    ):
+        discrete = discretize_portfolio(
+            target_weights=continuous_target,
+            prices=decision_prices,
+            portfolio_value=_total,
+            lot_sizes={
+                code: trading_rules.quantity_rule(
+                    code,
+                    signal_date,
+                ).buy_increment
+                for code in continuous_target
+            },
+            max_stock_weight=MAX_STOCK_WEIGHT,
+            minimum_holdings=min(MINIMUM_HOLDINGS, len(continuous_target)),
+        )
+        plan.diagnostics["discrete_feasibility"] = discrete
+        if discrete["passed"] is True:
+            executable_target = {
+                code: float(weight)
+                for code, weight in dict(discrete["actual_weights"]).items()
+                if float(weight) > 0
+            }
+        else:
+            plan.warnings.append("整手离散后违反硬约束，本期拒绝生成下单目标")
+            executable_target = {}
+    plan.diagnostics["continuous_target_weights"] = continuous_target
+    plan.target_weights = executable_target
+    plan.invested_weight = round(sum(executable_target.values()), 6)
     ranked = sorted(scored, key=lambda item: item.composite, reverse=True)
     from app.services.financial_ratio_policy import persist_factor_policy_issues
 
