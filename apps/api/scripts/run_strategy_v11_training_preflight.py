@@ -1,4 +1,4 @@
-"""版本10训练期开发预检；严格不调用正式走步/留出入口。"""
+"""版本11训练期开发预检；严格不调用正式走步/留出入口。"""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             version = stock_paper.ensure_research_strategy_version(db)
         if version.status != "research":
             raise RuntimeError(
-                f"版本10当前状态为 {version.status}，训练预检只允许 research"
+                f"版本11当前状态为 {version.status}，训练预检只允许 research"
             )
         repository = load_repository(db)
         if repository is None:
@@ -112,9 +112,7 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             ),
             repository=repository,
         )
-        stock_validation._assert_strategy_activity(
-            fit, stage="版本10训练拟合段"
-        )
+        stock_validation._assert_strategy_activity(fit, stage="版本11训练拟合段")
         frozen_weights = (
             dict(fit.factor_weight_history[-1]["weights"])
             if fit.factor_weight_history
@@ -131,7 +129,7 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             repository=repository,
         )
         stock_validation._assert_strategy_activity(
-            development, stage="版本10开发验证段"
+            development, stage="版本11开发验证段（版本10后重复使用）"
         )
 
         ic = ic_significance.factor_ic_significance(
@@ -147,9 +145,7 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             _benchmark_returns(development),
         )
         challenger_rows = linear_alpha_challenger.rows_from_backtest(fit)
-        challenger_rows.extend(
-            linear_alpha_challenger.rows_from_backtest(development)
-        )
+        challenger_rows.extend(linear_alpha_challenger.rows_from_backtest(development))
         challenger = linear_alpha_challenger.walk_forward_linear_challenger(
             challenger_rows,
             prediction_start_date=DEVELOPMENT_START,
@@ -165,22 +161,16 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             "reason": "使用 --robustness 才执行完整训练期压力目录",
         }
         if include_robustness:
-            robustness_rows = (
-                robustness_scenarios.run_validation_robustness(
-                    repository,
-                    development_config,
-                    development,
-                )
+            robustness_rows = robustness_scenarios.run_validation_robustness(
+                repository,
+                development_config,
+                development,
             )
-            robustness = robustness_scenarios.evaluate_robustness(
-                robustness_rows
-            )
+            robustness = robustness_scenarios.evaluate_robustness(robustness_rows)
 
-        composite = dict(
-            dict(ic.get("factors") or {}).get("composite") or {}
-        )
+        composite = dict(dict(ic.get("factors") or {}).get("composite") or {})
         result = {
-            "kind": "strategy_v10_training_only_preflight",
+            "kind": "strategy_v11_training_only_preflight",
             "strategy_version_id": version.id,
             "generated_at": datetime.now(UTC).isoformat(),
             "data_policy": {
@@ -190,7 +180,8 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
                     DEVELOPMENT_END.isoformat(),
                 ],
                 "formal_validation_or_holdout_accessed": False,
-                "allowed_use": "development_only",
+                "development_reused_after_v10": True,
+                "allowed_use": "iterative_development_only",
             },
             "frozen_factor_weights": frozen_weights,
             "factor_weight_history": fit.factor_weight_history,
@@ -200,16 +191,12 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
             "ic_status": ic.get("status"),
             "tested_hypotheses": ic.get("tested_hypotheses"),
             "quintile": {
-                key: value
-                for key, value in quintile.items()
-                if key != "periods"
+                key: value for key, value in quintile.items() if key != "periods"
             },
             "active_alpha": active,
             "linear_challenger": _compact_challenger(challenger),
             "factor_redundancy": {
-                key: value
-                for key, value in redundancy.items()
-                if key != "periods"
+                key: value for key, value in redundancy.items() if key != "periods"
             },
             "robustness": robustness,
             "robustness_scenarios": robustness_rows,
@@ -217,14 +204,12 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
         params = dict(version.params or {})
         params["training_preflight"] = result
         params["training_preflight_status"] = (
-            "completed_with_robustness"
-            if include_robustness
-            else "completed_baseline"
+            "completed_with_robustness" if include_robustness else "completed_baseline"
         )
         version.params = params
         db.add(
             AuditLog(
-                actor="system:strategy-v10-training-preflight",
+                actor="system:strategy-v11-training-preflight",
                 action="strategy_training_preflight",
                 resource_type="strategy_version",
                 resource_id=str(version.id),
@@ -236,9 +221,9 @@ def run_preflight(*, include_robustness: bool) -> dict[str, object]:
                     "formal_validation_or_holdout_accessed": False,
                     "include_robustness": include_robustness,
                     "frozen_factor_weights": frozen_weights,
-                    "development_net_excess_return": result[
-                        "development_metrics"
-                    ]["net_excess_return"],
+                    "development_net_excess_return": result["development_metrics"][
+                        "net_excess_return"
+                    ],
                     "composite_ic_status": result["ic_status"],
                     "robustness_status": robustness.get("status"),
                 },

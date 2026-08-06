@@ -89,8 +89,8 @@ from app.services.stock_repository import (
 )
 from app.timezone import now_cn
 
-STRATEGY_NAME = "A股多因子规则V6-版本10验证器与收缩权重版"
-MODEL_VERSION = "stock_rules_v6"
+STRATEGY_NAME = "A股多因子规则V7-版本11零中心证据门控版"
+MODEL_VERSION = "stock_rules_v7"
 ACCOUNT_NAME = "A股规则策略模拟账户"
 INITIAL_CAPITAL = Decimal("1000000.00")
 TRIAL_MONTHS = 2
@@ -125,8 +125,9 @@ METHODOLOGY = (
     "候选池在账户创建时冻结为沪深300+中证500"
     "全部当前成分，且启动前逐只校验日线、行业、财务和PE/PB估值覆盖；"
     "动态剔除ST/停牌/次新/低流动性；"
-    "质量/价值/动量/趋势/低风险先验为30%/25%/20%/15%/10%，"
-    "至少12期成熟标签后才允许IC收缩估计，单族限制8%～30%并惩罚权重跳变；"
+    "训练未成熟前质量/价值/动量/趋势/低风险结构先验为"
+    "30%/25%/20%/15%/10%；至少12期成熟标签后只向零收缩IC，"
+    "负证据允许因子退出，单族上限50%并以50%前值混合惩罚权重跳变；"
     "行业内缩尾和标准化；月频调仓，自由流通市值行业基准，约束单股5%、"
     "单行业20%、市值/Beta/流动性和ADV容量，持仓保留区与最小交易权重"
     "降低抖动；T日收盘生成信号，T+1开盘成交，含最低佣金、卖出印花税、"
@@ -475,7 +476,7 @@ def _ready_candidate_codes(db: Session, latest: date) -> list[str]:
 
 
 def ensure_research_strategy_version(db: Session) -> StrategyVersion:
-    """创建不依赖当前行情 readiness 的版本10研究记录。"""
+    """创建不依赖当前行情 readiness 的版本11研究记录。"""
     version = db.scalar(
         select(StrategyVersion)
         .where(StrategyVersion.name == STRATEGY_NAME)
@@ -490,7 +491,7 @@ def ensure_research_strategy_version(db: Session) -> StrategyVersion:
         "purpose": "investment_effectiveness_then_forward_validation",
         "validation_scope": "investment_effectiveness",
         "investment_approval_eligible": True,
-        "created_for": "v9_formal_validation_remediation",
+        "created_for": "v10_training_preflight_remediation",
         "formal_validation_status": "not_run",
         "formal_validation_scope": "investment_effectiveness",
         "factor_weight_policy": {
@@ -502,10 +503,12 @@ def ensure_research_strategy_version(db: Session) -> StrategyVersion:
                 "lowvol": 0.10,
             },
             "minimum_mature_periods": 12,
-            "prior_strength": 24.0,
-            "minimum_family_weight": 0.08,
-            "maximum_family_weight": 0.30,
-            "previous_weight_blend": 0.75,
+            "ic_prior": "zero_centered",
+            "prior_strength": 12.0,
+            "minimum_family_weight": 0.0,
+            "maximum_family_weight": 0.50,
+            "previous_weight_blend": 0.50,
+            "negative_evidence_policy": "target_weight_zero",
             "fit_scope": "training_only_frozen_before_validation",
         },
         "validation_protocol": {
@@ -539,7 +542,7 @@ def ensure_research_strategy_version(db: Session) -> StrategyVersion:
     db.refresh(version)
     db.add(
         AuditLog(
-            actor="system:strategy-v10-bootstrap",
+            actor="system:strategy-v11-bootstrap",
             action="strategy_version_created",
             resource_type="strategy_version",
             resource_id=str(version.id),
@@ -761,9 +764,7 @@ def prepare_forward_account(
     if version.status == "operational_validated" and not create_new_version:
         params = dict(version.params or {})
         validation = dict(params.get("validation") or {})
-        if bool(
-            dict(version.mandate or {}).get("investment_approval_eligible")
-        ):
+        if bool(dict(version.mandate or {}).get("investment_approval_eligible")):
             return {
                 "version_id": version.id,
                 "status": version.status,
@@ -1295,9 +1296,7 @@ def prepare_forward_account(
         "robustness_neighbor_pass_rate": holdout.get("robustness_neighbor_pass_rate"),
         "cost_2x_excess_return": holdout.get("cost_2x_excess_return"),
         "robustness_gate_status": holdout.get("robustness_gate_status"),
-        "robustness_reference_stage": holdout.get(
-            "robustness_reference_stage"
-        ),
+        "robustness_reference_stage": holdout.get("robustness_reference_stage"),
         "validation_scope": "operational_only",
         "validation_sha256": params["validation_sha256"],
         "generated_by": "stock_validation.run_stock_walk_forward",
@@ -1320,10 +1319,7 @@ def prepare_forward_account(
         params = dict(version.params or {})
         params.update(formal_validation_completion_metadata(holdout))
         investment_eligible = (
-            dict(version.mandate or {}).get(
-                "investment_approval_eligible"
-            )
-            is True
+            dict(version.mandate or {}).get("investment_approval_eligible") is True
         )
         if investment_eligible:
             investment_evidence = {
@@ -1342,9 +1338,7 @@ def prepare_forward_account(
             params.update(
                 {
                     "investment_validation_status": (
-                        "evidence_passed"
-                        if approved
-                        else "evidence_failed"
+                        "evidence_passed" if approved else "evidence_failed"
                     ),
                     "investment_validation_failed_gates": [
                         key
@@ -1352,9 +1346,7 @@ def prepare_forward_account(
                         if result.get("passed") is not True
                     ],
                     "investment_validation_failures": investment_failures,
-                    "investment_validation_gate_results": (
-                        investment_gate_results
-                    ),
+                    "investment_validation_gate_results": (investment_gate_results),
                 }
             )
         version.params = params
@@ -1387,10 +1379,7 @@ def prepare_forward_account(
                 "investment_validated",
                 evidence=investment_evidence,
                 actor="system:stock-paper-prepare",
-                reason=(
-                    "预注册训练、验证、稳健性与一次性留出集"
-                    "全部通过投资有效性门禁"
-                ),
+                reason=("预注册训练、验证、稳健性与一次性留出集全部通过投资有效性门禁"),
             )
         if not readiness.ready:
             return {
