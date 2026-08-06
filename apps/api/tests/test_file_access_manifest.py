@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.models import DataFileAccessLog
 from app.services.file_access_manifest import (
     FileManifestMismatch,
+    discover_research_files,
     file_observation,
     freeze_manifest,
     verify_accesses,
@@ -53,3 +54,24 @@ def test_replaced_or_unregistered_file_cannot_silently_rerun(
         row.status for row in db_session.query(DataFileAccessLog).all()
     }
     assert statuses == {"verified", "hash_mismatch", "unregistered"}
+
+
+def test_discovery_includes_global_index_industry_and_benchmark_files(
+    tmp_path: Path,
+) -> None:
+    expected = [
+        tmp_path / "daily/raw/600001.parquet",
+        tmp_path / "tushare_snapshot/stocks/daily/600001.SH.parquet",
+        tmp_path / "tushare_snapshot/global/trade_cal/SSE.parquet",
+        tmp_path / "tushare_snapshot/indices/index_weight/000300.SH/2024.parquet",
+        tmp_path / "tushare_snapshot/industries/sw2021/L1.parquet",
+        tmp_path / "benchmarks/H00906.json",
+        tmp_path / "indices/official_current/000300.xls",
+    ]
+    for path in expected:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"frozen")
+
+    discovered = discover_research_files(tmp_path, ["600001"])
+
+    assert set(discovered) == set(expected)

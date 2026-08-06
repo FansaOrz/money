@@ -31,6 +31,15 @@ ALLOWED_TRANSITIONS = {
 }
 
 
+def _is_governed_stock_strategy(params: dict[str, object]) -> bool:
+    """V4 及其后续规则股票版本必须使用同一套冻结证据门禁。"""
+    model = str(params.get("model_version") or "")
+    if not model.startswith("stock_rules_v"):
+        return False
+    suffix = model.removeprefix("stock_rules_v")
+    return suffix.isdigit() and int(suffix) >= 4
+
+
 def _number(evidence: dict[str, object], key: str) -> float | None:
     value = evidence.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -412,7 +421,7 @@ def transition(
     params = dict(version.params or {})
     if (
         to_status in {"operational_validated", "investment_validated"}
-        and params.get("model_version") == "stock_rules_v4"
+        and _is_governed_stock_strategy(params)
     ):
         for key in (
             "benchmark_kind",
@@ -449,7 +458,7 @@ def transition(
                     failures.append(f"调用证据与系统冻结值不一致：{key}")
     if (
         to_status in {"paper_operational_validation", "paper"}
-        and params.get("model_version") == "stock_rules_v4"
+        and _is_governed_stock_strategy(params)
         and evidence.get("validation_sha256") != params.get("validation_sha256")
     ):
         failures.append("前向版本未绑定已冻结的验证证据")

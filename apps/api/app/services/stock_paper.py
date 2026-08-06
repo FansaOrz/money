@@ -46,6 +46,7 @@ from app.models import (
     StockPaperSignal,
     StockPaperTrade,
     StockSyncState,
+    StockUniverseSnapshot,
     StockValuation,
     StrategyVersion,
 )
@@ -87,7 +88,7 @@ from app.services.stock_repository import (
 )
 from app.timezone import now_cn
 
-STRATEGY_NAME = "A股多因子规则V4-全链路治理版两个月前向验证"
+STRATEGY_NAME = "A股多因子规则V5-版本9根因修复研究版"
 ACCOUNT_NAME = "A股规则策略模拟账户"
 INITIAL_CAPITAL = Decimal("1000000.00")
 TRIAL_MONTHS = 2
@@ -844,6 +845,48 @@ def prepare_forward_account(
     db.commit()
 
     repository = _repo(db)
+    from app.config import get_settings
+    from app.services.file_access_manifest import (
+        discover_research_files,
+        freeze_manifest,
+    )
+
+    historical_codes = sorted(
+        {
+            str(code).zfill(6)
+            for code in db.scalars(
+                select(StockUniverseSnapshot.stock_code)
+                .where(
+                    StockUniverseSnapshot.index_code.in_(INDEX_CODES),
+                    StockUniverseSnapshot.snapshot_date.between(start, end),
+                )
+                .distinct()
+            ).all()
+        }
+    )
+    if len(historical_codes) < EXPECTED_UNIVERSE_COUNT:
+        raise StockPaperError(
+            "正式验证区间的历史指数成分不足 800 只，拒绝冻结不完整文件清单"
+        )
+    research_root = Path(get_settings().research_data_dir)
+    manifest_paths = discover_research_files(research_root, historical_codes)
+    if not manifest_paths:
+        raise StockPaperError("没有可冻结的正式研究文件")
+    file_manifest_snapshot = freeze_manifest(
+        db,
+        root=research_root,
+        paths=manifest_paths,
+    )
+    params = dict(version.params or {})
+    params.update(
+        {
+            "file_manifest_snapshot_sha256": file_manifest_snapshot,
+            "file_manifest_file_count": len(manifest_paths),
+            "historical_candidate_count": len(historical_codes),
+        }
+    )
+    version.params = params
+    db.commit()
     base = stock_backtest.BacktestConfig(
         start=start,
         end=end,
@@ -865,6 +908,10 @@ def prepare_forward_account(
         benchmark_return_kind="gross_total_return",
         min_limit_data_coverage=0.99,
         cost=COST,
+        strategy_version_id=version.id,
+        data_snapshot_sha256=file_manifest_snapshot,
+        file_manifest_snapshot_sha256=file_manifest_snapshot,
+        strict_file_manifest=True,
     )
     experiment = experiment_registry.preregister_experiment(
         db,

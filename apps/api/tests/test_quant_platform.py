@@ -695,6 +695,33 @@ def test_stock_strategy_validation_evidence_cannot_be_faked(db_session) -> None:
     assert version.status == "operational_validated"
 
 
+def test_stock_strategy_v5_cannot_bypass_frozen_evidence(db_session) -> None:
+    version = _version(db_session, operational_only=True)
+    version.params = {
+        "model_version": "stock_rules_v5",
+        "validation_sha256": "frozen-hash",
+    }
+    db_session.commit()
+
+    with pytest.raises(ValueError, match="冻结字段"):
+        strategy_lifecycle.transition(
+            db_session,
+            version.id,
+            "operational_validated",
+            evidence={
+                "data_coverage": 0.99,
+                "holdout_evaluations": 1,
+                "walkforward_folds": 3,
+                "holdout_sharpe": 0.5,
+                "holdout_trade_count": 12,
+                "holdout_turnover": 0.4,
+                "validation_scope": "operational_only",
+            },
+            actor="attacker",
+            reason="V5 不能绕过 V4 已有的冻结证据门禁",
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "forged"),
     [

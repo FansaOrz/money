@@ -32,19 +32,19 @@ def discover_research_files(root: Path, codes: list[str]) -> list[Path]:
             continue
         for code in wanted:
             paths.update(dataset_dir.glob(f"{code}.*.parquet"))
+    # 股票仓储还会读取全局交易日历、证券主表、月末估值横截面、行业目录、
+    # 指数权重和受治理基准源。正式清单必须覆盖所有潜在读取路径，不能只冻结
+    # 逐股文件后让基准或行业文件以 unregistered 形式进入实验。
     for relative in (
-        "tushare_snapshot/global/trade_cal/SSE.parquet",
-        "tushare_snapshot/global/namechange/all.parquet",
+        "tushare_snapshot/global",
+        "tushare_snapshot/indices",
+        "tushare_snapshot/industries",
+        "benchmarks",
+        "indices/official_current",
     ):
-        path = root / relative
-        if path.is_file():
-            paths.add(path)
-    basic = root / "tushare_snapshot" / "global" / "stock_basic_full"
-    if basic.is_dir():
-        paths.update(basic.glob("*.parquet"))
-    monthly = root / "tushare_snapshot" / "global" / "daily_basic_monthly"
-    if monthly.is_dir():
-        paths.update(monthly.glob("*.parquet"))
+        directory = root / relative
+        if directory.is_dir():
+            paths.update(path for path in directory.rglob("*") if path.is_file())
     return sorted(paths)
 
 
