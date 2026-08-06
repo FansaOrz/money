@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AuditLog,
     IndexConstituent,
     DataSourceSLAState,
     StockDailyBar,
@@ -174,6 +175,14 @@ def test_version10_research_record_uses_investment_mandate_without_readiness(
     assert version.mandate["validation_scope"] == "investment_effectiveness"
     assert version.mandate["investment_approval_eligible"] is True
     assert stock_paper.ensure_research_strategy_version(db_session).id == version.id
+    audit = db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.action == "strategy_version_created",
+            AuditLog.resource_id == str(version.id),
+        )
+    )
+    assert audit is not None
+    assert audit.detail["model_version"] == "stock_rules_v6"
 
 
 def _seed_trial(db: Session) -> tuple[ForwardRepository, date]:

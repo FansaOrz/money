@@ -30,6 +30,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AuditLog,
     CorporateActionReviewCase,
     IndexConstituent,
     StockDailyBar,
@@ -536,6 +537,23 @@ def ensure_research_strategy_version(db: Session) -> StrategyVersion:
     db.add(version)
     db.commit()
     db.refresh(version)
+    db.add(
+        AuditLog(
+            actor="system:strategy-v10-bootstrap",
+            action="strategy_version_created",
+            resource_type="strategy_version",
+            resource_id=str(version.id),
+            detail={
+                "name": version.name,
+                "model_version": MODEL_VERSION,
+                "status": version.status,
+                "mandate_sha256": version.mandate_sha256,
+                "created_for": params["created_for"],
+            },
+            created_at=datetime.now(UTC),
+        )
+    )
+    db.commit()
     return version
 
 
