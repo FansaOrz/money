@@ -5,6 +5,7 @@ from datetime import date
 import pytest
 
 from app.services.historical_price_limits import (
+    dated_name_as_of,
     derive_price_limit,
     names_prove_non_st,
     round_price_tick,
@@ -35,3 +36,13 @@ def test_name_evidence_must_be_non_empty_and_never_st() -> None:
 def test_price_tick_rounding_is_deterministic() -> None:
     assert round_price_tick(11.055) == pytest.approx(11.06)
     assert round_price_tick(9.045) == pytest.approx(9.05)
+
+
+def test_dated_name_evidence_allows_post_st_interval_without_losing_history() -> None:
+    periods = [
+        (date(2010, 4, 28), date(2011, 4, 13), "*ST鑫新"),
+        (date(2011, 4, 14), None, "中文传媒"),
+    ]
+    assert dated_name_as_of(periods, date(2010, 5, 4)) == "*ST鑫新"
+    assert dated_name_as_of(periods, date(2021, 9, 1)) == "中文传媒"
+    assert dated_name_as_of(periods, date(2010, 4, 27)) is None

@@ -8,7 +8,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from app.services.price_limit_rules import price_limit_rule
 
-ALGORITHM_VERSION = "VALIDATED_DERIVED_LIMIT_V1"
+ALGORITHM_VERSION = "VALIDATED_DERIVED_LIMIT_V2"
 PRICE_TICK = Decimal("0.01")
 
 
@@ -28,9 +28,7 @@ class DerivedPriceLimit:
 
 def round_price_tick(value: float) -> float:
     """按 A 股分位价格单位进行确定性四舍五入。"""
-    return float(
-        Decimal(str(value)).quantize(PRICE_TICK, rounding=ROUND_HALF_UP)
-    )
+    return float(Decimal(str(value)).quantize(PRICE_TICK, rounding=ROUND_HALF_UP))
 
 
 def names_prove_non_st(names: list[str]) -> bool:
@@ -39,6 +37,25 @@ def names_prove_non_st(names: list[str]) -> bool:
     return bool(normalized) and all(
         "ST" not in name and "退" not in name for name in normalized
     )
+
+
+def dated_name_as_of(
+    periods: list[tuple[date, date | None, str]],
+    day: date,
+) -> str | None:
+    """从带起止日的名称证据中取得当日名称；冲突或缺口均拒绝猜测。"""
+    active = [
+        (start, name)
+        for start, end, name in periods
+        if start <= day and (end is None or day <= end)
+    ]
+    if not active:
+        return None
+    latest_start = max(start for start, _name in active)
+    names = {
+        name.strip() for start, name in active if start == latest_start and name.strip()
+    }
+    return next(iter(names)) if len(names) == 1 else None
 
 
 def derive_price_limit(
@@ -82,6 +99,7 @@ def derive_price_limit(
 __all__ = [
     "ALGORITHM_VERSION",
     "DerivedPriceLimit",
+    "dated_name_as_of",
     "derive_price_limit",
     "names_prove_non_st",
     "round_price_tick",
