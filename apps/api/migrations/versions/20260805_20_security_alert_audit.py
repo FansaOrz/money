@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 
 from alembic import op
 import sqlalchemy as sa
@@ -17,6 +18,19 @@ revision = "20260805_20"
 down_revision = "20260805_19"
 branch_labels = None
 depends_on = None
+
+
+def _canonical_created_at(value: object) -> str:
+    created = (
+        datetime.fromisoformat(value)
+        if isinstance(value, str)
+        else value
+    )
+    if not isinstance(created, datetime):
+        raise TypeError("audit created_at is not a datetime")
+    if created.tzinfo:
+        created = created.astimezone(UTC).replace(tzinfo=None)
+    return created.isoformat(timespec="microseconds")
 
 
 def upgrade() -> None:
@@ -48,9 +62,7 @@ def upgrade() -> None:
             "resource_id": row["resource_id"],
             "correlation_id": row["correlation_id"],
             "detail": detail,
-            "created_at": (
-                created.isoformat() if hasattr(created, "isoformat") else str(created)
-            ),
+            "created_at": _canonical_created_at(created),
         }
         entry_hash = hashlib.sha256(
             json.dumps(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import UTC, datetime
 
@@ -61,6 +63,50 @@ def test_audit_hash_chain_and_database_immutability(db_session) -> None:
         db_session.execute(text("UPDATE audit_logs SET actor='tampered'"))
         db_session.commit()
     db_session.rollback()
+
+
+def test_audit_hash_chain_accepts_exact_legacy_migration_timestamp(
+    db_session,
+) -> None:
+    created_at = "2026-08-04 16:15:21.774656"
+    payload = {
+        "previous_hash": "0" * 64,
+        "actor": "legacy-migration",
+        "action": "backfilled",
+        "resource_type": "strategy",
+        "resource_id": "1",
+        "correlation_id": None,
+        "detail": {"status": "legacy"},
+        "created_at": created_at,
+    }
+    entry_hash = hashlib.sha256(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    db_session.execute(
+        text(
+            """
+            INSERT INTO audit_logs (
+                actor, action, resource_type, resource_id, correlation_id,
+                detail, created_at, previous_hash, entry_hash
+            ) VALUES (
+                :actor, :action, :resource_type, :resource_id, NULL,
+                :detail, :created_at, :previous_hash, :entry_hash
+            )
+            """
+        ),
+        {
+            **payload,
+            "detail": json.dumps(payload["detail"]),
+            "entry_hash": entry_hash,
+        },
+    )
+    db_session.commit()
+
+    result = audit_chain.verify_audit_chain(db_session)
+    assert result["ok"] is True
+    assert result["legacy_encoding_count"] == 1
 
 
 def test_encrypted_offsite_backup_restores_without_source_directory(
