@@ -63,3 +63,29 @@ def test_style_constraints_accept_per_factor_limits() -> None:
 
     assert result["passed"] is True
     assert abs(result["weights"]["a"] - result["weights"]["b"]) <= 0.10 + 1e-6
+
+
+def test_style_constraints_normalize_partial_stock_investment() -> None:
+    result = optimize_portfolio(
+        codes=["a", "b"],
+        alpha=[0.03, 0.0],
+        covariance=np.eye(2) * 0.0001,
+        current_weights=[0.0, 0.0],
+        benchmark_weights=[0.5, 0.5],
+        style_exposures=np.asarray([[1.0], [-1.0]]),
+        benchmark_style_exposures=[0.0],
+        max_style_active_exposure=0.10,
+        max_stock_weight=0.5,
+        minimum_cash=0.5,
+        maximum_cash=0.5,
+        max_turnover=2.0,
+        max_tracking_error=1.0,
+        max_annual_volatility=1.0,
+    )
+
+    invested = result["weights"]["a"] + result["weights"]["b"]
+    normalized_style = (
+        result["weights"]["a"] - result["weights"]["b"]
+    ) / invested
+    assert result["passed"] is True
+    assert normalized_style <= 0.10 + 1e-6

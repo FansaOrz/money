@@ -208,7 +208,14 @@ def optimize_portfolio(
         style = np.asarray(style_exposures, dtype=float)
         target = np.asarray(benchmark_style_exposures, dtype=float)
         style_limit = np.asarray(max_style_active_exposure, dtype=float)
-        constraints.append(cp.abs(style.T @ weights - target) <= style_limit)
+        # 风格暴露描述的是股票资产内部结构。有现金仓位时，组合风格和
+        # 容忍区间都应按股票仓位归一化；否则求解器按总资产验收、下游
+        # 按股票仓位验收，会出现“optimal 后又被清空”的口径矛盾。
+        invested_weight = cp.sum(weights)
+        constraints.append(
+            cp.abs(style.T @ weights - target * invested_weight)
+            <= style_limit * invested_weight
+        )
         constraint_names.append("style_active_exposure")
     problem = cp.Problem(objective, constraints)
     try:
