@@ -855,10 +855,21 @@ def compute_cross_section(
                 market_by_date.setdefault(usable[index].trade_date, []).append(value)
         returns_by_code[context.info.code] = returns
     from app.services.factor_residual_model import (
+        build_return_proxy_aggregate,
         estimate_residual_model,
-        leave_one_out_proxy,
+        leave_one_out_from_aggregate,
     )
 
+    market_proxy_aggregate = build_return_proxy_aggregate(returns_by_code)
+    industry_proxy_aggregates = {
+        industry: build_return_proxy_aggregate(
+            returns_by_code,
+            eligible_codes={
+                item.info.code for item in contexts if item.info.industry == industry
+            },
+        )
+        for industry in {item.info.industry for item in contexts}
+    }
     results: list[FactorResult] = []
     for context in contexts:
         raw = raw_factors(context, as_of, window_scale=window_scale)
@@ -895,17 +906,16 @@ def compute_cross_section(
             market_proxy = official_market_returns
             market_source = "official_total_return_index"
         else:
-            market_proxy = leave_one_out_proxy(returns_by_code, context.info.code)
+            market_proxy = leave_one_out_from_aggregate(
+                market_proxy_aggregate,
+                context.info.code,
+                own_returns,
+            )
             market_source = "leave_one_out_investable_universe"
-        same_industry_codes = {
-            item.info.code
-            for item in contexts
-            if item.info.industry == context.info.industry
-        }
-        industry_proxy = leave_one_out_proxy(
-            returns_by_code,
+        industry_proxy = leave_one_out_from_aggregate(
+            industry_proxy_aggregates[context.info.industry],
             context.info.code,
-            eligible_codes=same_industry_codes,
+            own_returns,
         )
         residual_model = estimate_residual_model(
             own_returns,

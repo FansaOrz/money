@@ -5,7 +5,9 @@ from datetime import date, timedelta
 import pytest
 
 from app.services.factor_residual_model import (
+    build_return_proxy_aggregate,
     estimate_residual_model,
+    leave_one_out_from_aggregate,
     leave_one_out_proxy,
 )
 from app.services.stock_factors import residual_momentum_from_returns
@@ -22,6 +24,36 @@ def test_leave_one_out_proxy_is_unchanged_when_own_stock_changes() -> None:
     original["A"] = {day: value * 100 for day, value in original["A"].items()}
     after = leave_one_out_proxy(original, "A")
     assert before == after
+
+
+def test_preaggregated_leave_one_out_numerically_matches_direct_scan() -> None:
+    start = date(2025, 1, 1)
+    returns = {
+        code: {
+            start + timedelta(days=index): (index + offset) / 10_000
+            for index in range(80)
+            if not (offset == 3 and index % 11 == 0)
+        }
+        for offset, code in enumerate(("A", "B", "C", "D", "E", "F", "G"))
+    }
+    aggregate = build_return_proxy_aggregate(returns)
+
+    by_date: dict[date, list[float]] = {}
+    for code, series in returns.items():
+        if code == "C":
+            continue
+        for day, value in series.items():
+            by_date.setdefault(day, []).append(value)
+    expected = {
+        day: sum(values) / len(values)
+        for day, values in by_date.items()
+        if len(values) >= 5
+    }
+    actual = leave_one_out_from_aggregate(aggregate, "C", returns["C"])
+
+    assert actual.keys() == expected.keys()
+    for day, value in expected.items():
+        assert actual[day] == pytest.approx(value, abs=1e-15)
 
 
 def test_market_and_industry_model_saves_window_and_diagnostics() -> None:

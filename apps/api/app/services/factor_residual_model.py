@@ -23,9 +23,22 @@ class ResidualModelResult:
     missing_dates: int
 
 
+@dataclass(frozen=True)
+class ReturnProxyAggregate:
+    """一组股票逐日收益的总和/计数，可 O(交易日) 精确剔除任一成分股。"""
+
+    codes: frozenset[str]
+    totals: dict[date, float]
+    counts: dict[date, int]
+
+
 def price_series_returns(points: list[tuple[date, float]]) -> dict[date, float]:
     ordered = sorted(
-        ((day, float(value)) for day, value in points if value is not None and value > 0),
+        (
+            (day, float(value))
+            for day, value in points
+            if value is not None and value > 0
+        ),
         key=lambda item: item[0],
     )
     return {
@@ -33,6 +46,53 @@ def price_series_returns(points: list[tuple[date, float]]) -> dict[date, float]:
         for index in range(1, len(ordered))
         if ordered[index - 1][1] > 0
     }
+
+
+def build_return_proxy_aggregate(
+    returns_by_code: dict[str, dict[date, float]],
+    *,
+    eligible_codes: set[str] | None = None,
+) -> ReturnProxyAggregate:
+    """预聚合允许股票的逐日收益；不改变等权市场代理口径。"""
+    # 保留既有 API 语义：未传或传入空集合都表示使用全部股票。
+    allowed = (
+        set(eligible_codes) & set(returns_by_code)
+        if eligible_codes
+        else set(returns_by_code)
+    )
+    totals: dict[date, float] = {}
+    counts: dict[date, int] = {}
+    # 按调用方字典的稳定顺序累加，使结果与原逐只扫描实现逐位一致。
+    for other_code, series in returns_by_code.items():
+        if other_code not in allowed:
+            continue
+        for day, value in series.items():
+            totals[day] = totals.get(day, 0.0) + value
+            counts[day] = counts.get(day, 0) + 1
+    return ReturnProxyAggregate(
+        codes=frozenset(allowed),
+        totals=totals,
+        counts=counts,
+    )
+
+
+def leave_one_out_from_aggregate(
+    aggregate: ReturnProxyAggregate,
+    code: str,
+    own_returns: dict[date, float],
+    *,
+    minimum_constituents: int = 5,
+) -> dict[date, float]:
+    """从预聚合值中精确减去自身，结果等价于逐只重新扫描。"""
+    own_is_included = code in aggregate.codes
+    proxy: dict[date, float] = {}
+    for day, total in aggregate.totals.items():
+        own_value = own_returns.get(day) if own_is_included else None
+        count = aggregate.counts[day] - (1 if own_value is not None else 0)
+        if count < minimum_constituents:
+            continue
+        proxy[day] = (total - (own_value or 0.0)) / count
+    return proxy
 
 
 def leave_one_out_proxy(
@@ -43,18 +103,16 @@ def leave_one_out_proxy(
     minimum_constituents: int = 5,
 ) -> dict[date, float]:
     """逐日严格排除目标股票，代理不会被该股票自身机械污染。"""
-    allowed = eligible_codes or set(returns_by_code)
-    by_date: dict[date, list[float]] = {}
-    for other_code, series in returns_by_code.items():
-        if other_code == code or other_code not in allowed:
-            continue
-        for day, value in series.items():
-            by_date.setdefault(day, []).append(value)
-    return {
-        day: sum(values) / len(values)
-        for day, values in by_date.items()
-        if len(values) >= minimum_constituents
-    }
+    aggregate = build_return_proxy_aggregate(
+        returns_by_code,
+        eligible_codes=eligible_codes,
+    )
+    return leave_one_out_from_aggregate(
+        aggregate,
+        code,
+        returns_by_code.get(code, {}),
+        minimum_constituents=minimum_constituents,
+    )
 
 
 def estimate_residual_model(
@@ -102,9 +160,7 @@ def estimate_residual_model(
             model = "market_plus_industry"
     coefficients = np.linalg.pinv(design) @ y
     residual = y - design @ coefficients
-    r_squared = (
-        1.0 - float(np.sum(residual**2)) / total if total > 0 else None
-    )
+    r_squared = 1.0 - float(np.sum(residual**2)) / total if total > 0 else None
     if design.shape[1] == 3:
         industry_beta = float(coefficients[2])
     return ResidualModelResult(

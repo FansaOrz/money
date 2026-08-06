@@ -79,9 +79,7 @@ def inspect_factor(
     # 正式沪深300+500股票池远高于此门槛。
     sufficiently_large = len(values) >= minimum_cross_section
     if sufficiently_large and coverage < minimum_coverage:
-        reasons.append(
-            f"覆盖率{coverage:.1%}低于门槛{minimum_coverage:.1%}"
-        )
+        reasons.append(f"覆盖率{coverage:.1%}低于门槛{minimum_coverage:.1%}")
     if sufficiently_large and valid and unique < minimum_unique_values:
         reasons.append(f"唯一值数{unique}低于门槛{minimum_unique_values}")
     if valid:
@@ -101,13 +99,8 @@ def inspect_factor(
         and abs(historical_median) > 1e-12
     ):
         scale_ratio = abs(center / historical_median)
-        if (
-            scale_ratio > maximum_scale_ratio
-            or scale_ratio < 1.0 / maximum_scale_ratio
-        ):
-            reasons.append(
-                f"中位数量级相对历史变化{scale_ratio:.6g}倍，疑似单位突变"
-            )
+        if scale_ratio > maximum_scale_ratio or scale_ratio < 1.0 / maximum_scale_ratio:
+            reasons.append(f"中位数量级相对历史变化{scale_ratio:.6g}倍，疑似单位突变")
         if check_historical_sign and center * historical_median < 0:
             reasons.append("中位数符号相对历史整体反转")
     return FactorHealth(
@@ -140,6 +133,7 @@ def persist_factor_health_reports(
     from sqlalchemy import delete, select
 
     from app.models import FactorHealthReport
+    from app.services.stock_factors import _FACTOR_FAMILY, _family_policy
 
     rows = list(results)
     previous_rows = db.scalars(  # type: ignore[attr-defined]
@@ -164,18 +158,51 @@ def persist_factor_health_reports(
         )
         historical = previous_statistics.get("median")
         try:
-            historical_median = (
-                float(historical) if historical is not None else None
-            )
+            historical_median = float(historical) if historical is not None else None
         except (TypeError, ValueError):
             historical_median = None
         contract = FACTOR_CONTRACTS.get(
             factor,
             {"unit": "dimensionless", "direction": direction, "sign_stable": False},
         )
+        family = _FACTOR_FAMILY.get(factor)
+        applicable_values: list[float | None] = []
+        required = family is None
+        structural_applicable_total = 0
+        model_ineligible_total = 0
+        model_ineligible_reasons: dict[str, int] = {}
+        for item in rows:
+            if family is None:
+                structural_applicable_total += 1
+                applicable_values.append(
+                    dict(getattr(item, "raw", {}) or {}).get(factor)
+                )
+                continue
+            fields, required_fields = _family_policy(item, family)
+            if factor not in fields:
+                continue
+            structural_applicable_total += 1
+            required = required or factor in required_fields
+            # 金融专用模型的必需监管字段缺失时，股票已由因子引擎显式
+            # 标记为 model_eligible=False，不会参与组合。健康门禁监控实际
+            # 获准评分的横截面；被排除的样本数量和原因仍单独持久化，
+            # 不能用它们的空值阻断整个非金融股票池。
+            if not bool(getattr(item, "model_eligible", True)):
+                model_ineligible_total += 1
+                structure = dict(getattr(item, "model_structure", {}) or {})
+                reason = str(structure.get("reason") or "模型必需字段缺失")
+                model_ineligible_reasons[reason] = (
+                    model_ineligible_reasons.get(reason, 0) + 1
+                )
+                continue
+            applicable_values.append(dict(getattr(item, "raw", {}) or {}).get(factor))
         report = inspect_factor(
             factor,
-            [dict(getattr(item, "raw", {}) or {}).get(factor) for item in rows],
+            applicable_values,
+            # 可选因子允许缺失，并按策略中预注册的固定惩罚参与复合；只有
+            # 必需因子才以适用股票池为分母执行最低覆盖率门禁。常数、单位
+            # 突变和符号反转检查仍对可选因子的有效横截面生效。
+            minimum_coverage=0.20 if required else 0.0,
             historical_median=historical_median,
             check_historical_sign=bool(contract.get("sign_stable")),
         )
@@ -197,6 +224,12 @@ def persist_factor_health_reports(
                 direction=int(contract.get("direction") or direction),
                 statistics={
                     "total": report.total,
+                    "applicable_total": report.total,
+                    "structural_applicable_total": structural_applicable_total,
+                    "model_ineligible_total": model_ineligible_total,
+                    "model_ineligible_reasons": model_ineligible_reasons,
+                    "universe_total": len(rows),
+                    "required": required,
                     "valid": report.valid,
                     "coverage": report.coverage,
                     "unique_values": report.unique_values,
