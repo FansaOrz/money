@@ -23,11 +23,14 @@ class SourceConflictError(RuntimeError):
 
 PLAUSIBLE_RANGES = {
     "close": (0.01, 100_000.0),
-    "roe": (-10.0, 10.0),
+    # Tushare/Sina 财务指标均以百分数表达，10.0 表示 10%，不是 0.10。
+    "roe": (-1000.0, 1000.0),
     "total_assets": (0.0, 1e16),
     "net_income": (-1e15, 1e15),
     "market_cap": (0.0, 1e17),
-    "pe_ttm": (-10_000.0, 10_000.0),
+    # 接近盈亏平衡时 PE 绝对值可以非常大；经济意义交给估值因子缩尾，
+    # 跨源层这里只拦截明显的解析/单位灾难。
+    "pe_ttm": (-1_000_000.0, 1_000_000.0),
     "pb": (-1000.0, 1000.0),
 }
 
@@ -57,14 +60,12 @@ def reconcile_field(
     candidates: Iterable[tuple[str, object]],
     threshold: float | None = None,
     safe_action: str = "halt_new_orders",
+    optional_if_all_missing: bool = False,
+    categorical_mismatch_status: str = "review_required",
     commit: bool = True,
 ) -> DataSourceReconciliation:
     """执行一次版本化选值；冲突不返回伪完整值。"""
-    valid = [
-        (source, value)
-        for source, value in candidates
-        if value not in (None, "")
-    ]
+    valid = [(source, value) for source, value in candidates if value not in (None, "")]
     valid.sort(
         key=lambda item: SOURCE_PRIORITY.get(item[0].split(":")[0], 0),
         reverse=True,
@@ -79,7 +80,10 @@ def reconcile_field(
     )
     status = "missing"
     rationale = "全部来源缺失"
-    if valid:
+    if not valid and optional_if_all_missing:
+        status = "optional_missing"
+        rationale = "字段按业务定义可为空，且所有来源均未提供可比值"
+    elif valid:
         primary_source, primary_value = valid[0]
         if not _plausible(field_name, primary_value):
             fallback = next(
@@ -119,9 +123,9 @@ def reconcile_field(
                     and other_number is not None
                     and primary_number != 0
                 ):
-                    relative_difference = abs(
-                        primary_number - other_number
-                    ) / abs(primary_number)
+                    relative_difference = abs(primary_number - other_number) / abs(
+                        primary_number
+                    )
                     if (
                         policy_threshold is not None
                         and relative_difference > policy_threshold
@@ -136,16 +140,18 @@ def reconcile_field(
                         )
                     else:
                         status = "matched"
-                        rationale = (
-                            f"主源优先且与 {other_source} 差异在阈值内"
-                        )
+                        rationale = f"主源优先且与 {other_source} 差异在阈值内"
                 elif str(primary_value) != str(other_value):
-                    status = "review_required"
-                    selected_source = None
-                    selected_value = None
-                    rationale = (
-                        f"{primary_source}/{other_source} 分类值不一致"
-                    )
+                    status = categorical_mismatch_status
+                    if status == "taxonomy_divergence":
+                        rationale = (
+                            f"{primary_source}/{other_source} 属于不同分类体系，"
+                            "保留主分类并记录口径分歧"
+                        )
+                    else:
+                        selected_source = None
+                        selected_value = None
+                        rationale = f"{primary_source}/{other_source} 分类值不一致"
                 else:
                     status = "matched"
                     rationale = "多来源值一致"
@@ -157,9 +163,7 @@ def reconcile_field(
         code=code,
         effective_date=effective_date,
         field_name=field_name,
-        candidates=[
-            {"source": source, "value": value} for source, value in valid
-        ],
+        candidates=[{"source": source, "value": value} for source, value in valid],
         relative_difference=relative_difference,
         threshold=policy_threshold,
         status=status,
@@ -175,7 +179,13 @@ def reconcile_field(
     )
     db.add(decision)
     db.flush()
-    if status in {"degraded", "blocked", "review_required", "missing"}:
+    if status in {
+        "degraded",
+        "taxonomy_divergence",
+        "blocked",
+        "review_required",
+        "missing",
+    }:
         record_quality_issue(
             db,
             dataset=dataset,
@@ -183,7 +193,9 @@ def reconcile_field(
             field_name=field_name,
             rule=f"cross_source_{status}",
             detail=rationale,
-            severity="error" if status != "degraded" else "warning",
+            severity=(
+                "warning" if status in {"degraded", "taxonomy_divergence"} else "error"
+            ),
             original_value=decision.candidates,
             source="source_reconciliation",
         )
@@ -213,16 +225,12 @@ def resolve_review(
     actor: str,
     rationale: str,
 ) -> DataSourceReconciliation:
-    allowed = {
-        str(item["source"]) for item in decision.candidates
-    }
+    allowed = {str(item["source"]) for item in decision.candidates}
     if selected_source not in allowed:
         raise ValueError("人工选源必须来自已记录候选来源")
     decision.status = "resolved"
     decision.selected_source = selected_source
-    decision.selected_value = json.dumps(
-        selected_value_override, ensure_ascii=False
-    )
+    decision.selected_value = json.dumps(selected_value_override, ensure_ascii=False)
     decision.rationale = rationale
     decision.resolved_by = actor
     decision.resolved_at = datetime.now(UTC)
@@ -254,7 +262,9 @@ def reconciliation_gate(
     ).all()
     blocking_statuses = {"blocked", "review_required", "missing"}
     blocking = [row for row in rows if row.status in blocking_statuses]
-    degraded = [row for row in rows if row.status == "degraded"]
+    degraded = [
+        row for row in rows if row.status in {"degraded", "taxonomy_divergence"}
+    ]
     by_code: dict[str, list[str]] = {}
     for row in blocking:
         by_code.setdefault(row.code, []).append(

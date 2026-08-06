@@ -58,3 +58,59 @@ def test_material_difference_blocks_until_reviewed(
     assert resolved.status == "resolved"
     assert selected_value(resolved) == 2.0
     assert db_session.query(DataSourceReconciliation).count() == 1
+
+
+def test_roe_uses_percentage_units_for_plausibility(db_session: Session) -> None:
+    matched = reconcile_field(
+        db_session,
+        dataset="financial",
+        code="600001",
+        effective_date=date(2026, 3, 31),
+        field_name="roe",
+        candidates=[("tushare", 45.29), ("sina", 45.29)],
+        threshold=0.02,
+    )
+
+    assert matched.status == "matched"
+    assert selected_value(matched) == 45.29
+
+
+def test_optional_pe_missing_does_not_block_reconciliation(
+    db_session: Session,
+) -> None:
+    decision = reconcile_field(
+        db_session,
+        dataset="valuation",
+        code="600001",
+        effective_date=date(2026, 8, 5),
+        field_name="pe_ttm",
+        candidates=[("tushare", None), ("tencent", None)],
+        optional_if_all_missing=True,
+    )
+
+    assert decision.status == "optional_missing"
+    assert decision.selected_source is None
+    assert db_session.query(DataQualityIssue).count() == 0
+
+
+def test_taxonomy_divergence_keeps_primary_and_only_warns(
+    db_session: Session,
+) -> None:
+    decision = reconcile_field(
+        db_session,
+        dataset="industry_classification",
+        code="600001",
+        effective_date=date(2026, 8, 5),
+        field_name="industry_name",
+        candidates=[
+            ("stocktoday_sw2021", "电子"),
+            ("cninfo:taxonomy_crosswalk:安防设备", "计算机"),
+        ],
+        categorical_mismatch_status="taxonomy_divergence",
+    )
+
+    assert decision.status == "taxonomy_divergence"
+    assert decision.selected_source == "stocktoday_sw2021"
+    assert selected_value(decision) == "电子"
+    issue = db_session.query(DataQualityIssue).one()
+    assert issue.severity == "warning"
