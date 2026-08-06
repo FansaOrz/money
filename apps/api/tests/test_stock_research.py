@@ -29,12 +29,19 @@ from app.models import (
     StockUniverseSnapshot,
     StockValuation,
 )
-from app.services.research import ak_fetch, parquet_store, stock_data, stock_fundamentals, stock_universe
+from app.services.research import (
+    ak_fetch,
+    parquet_store,
+    stock_data,
+    stock_fundamentals,
+    stock_universe,
+)
 
 
 # ---------------------------------------------------------------------------
 # mock 数据
 # ---------------------------------------------------------------------------
+
 
 def _master_frame() -> pd.DataFrame:
     return pd.DataFrame(
@@ -51,14 +58,26 @@ def _daily_frame() -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "date": "2024-01-02", "open": 10.0, "high": 10.5, "low": 9.8,
-                "close": 10.2, "volume": 1000, "amount": 10200.0,
-                "outstanding_share": 1e8, "turnover": 0.5,
+                "date": "2024-01-02",
+                "open": 10.0,
+                "high": 10.5,
+                "low": 9.8,
+                "close": 10.2,
+                "volume": 1000,
+                "amount": 10200.0,
+                "outstanding_share": 1e8,
+                "turnover": 0.5,
             },
             {
-                "date": "2024-01-03", "open": 10.2, "high": 10.6, "low": 10.1,
-                "close": 10.4, "volume": 2000, "amount": 20800.0,
-                "outstanding_share": 1e8, "turnover": 1.0,
+                "date": "2024-01-03",
+                "open": 10.2,
+                "high": 10.6,
+                "low": 10.1,
+                "close": 10.4,
+                "volume": 2000,
+                "amount": 20800.0,
+                "outstanding_share": 1e8,
+                "turnover": 1.0,
             },
         ]
     )
@@ -67,8 +86,16 @@ def _daily_frame() -> pd.DataFrame:
 def _cons_frame() -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"成分券代码": "600519", "成分券名称": "贵州茅台", "纳入日期": "2020-06-15"},
-            {"成分券代码": "000001", "成分券名称": "平安银行", "纳入日期": "2019-12-16"},
+            {
+                "成分券代码": "600519",
+                "成分券名称": "贵州茅台",
+                "纳入日期": "2020-06-15",
+            },
+            {
+                "成分券代码": "000001",
+                "成分券名称": "平安银行",
+                "纳入日期": "2019-12-16",
+            },
         ]
     )
 
@@ -85,15 +112,36 @@ def _financial_frame() -> pd.DataFrame:
 def _disclosure_frame(market: str) -> pd.DataFrame:
     """模拟当前 akshare 全市场披露快照：一次请求返回该市场分区全部股票。"""
     rows = [
-        {"股票代码": "600519", "股票简称": "贵州茅台", "首次预约": "2024-04-20",
-         "初次变更": None, "二次变更": None, "三次变更": None, "实际披露": "2024-04-26"},
-        {"股票代码": "000001", "股票简称": "平安银行", "首次预约": "2024-04-19",
-         "初次变更": None, "二次变更": None, "三次变更": None, "实际披露": "2024-04-20"},
+        {
+            "股票代码": "600519",
+            "股票简称": "贵州茅台",
+            "首次预约": "2024-04-20",
+            "初次变更": None,
+            "二次变更": None,
+            "三次变更": None,
+            "实际披露": "2024-04-26",
+        },
+        {
+            "股票代码": "000001",
+            "股票简称": "平安银行",
+            "首次预约": "2024-04-19",
+            "初次变更": None,
+            "二次变更": None,
+            "三次变更": None,
+            "实际披露": "2024-04-20",
+        },
     ]
     if market == "北交所":
         rows = [
-            {"股票代码": "920001", "股票简称": "北交测试", "首次预约": "2024-04-25",
-             "初次变更": None, "二次变更": None, "三次变更": None, "实际披露": "2024-04-28"},
+            {
+                "股票代码": "920001",
+                "股票简称": "北交测试",
+                "首次预约": "2024-04-25",
+                "初次变更": None,
+                "二次变更": None,
+                "三次变更": None,
+                "实际披露": "2024-04-28",
+            },
         ]
     elif market == "深市":
         rows = rows[1:]
@@ -154,18 +202,26 @@ def mock_ak(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ak_fetch, "fetch_financial_indicator_eastmoney", lambda symbol: None
     )
-    monkeypatch.setattr(ak_fetch, "fetch_financial_indicator", lambda symbol: _financial_frame())
     monkeypatch.setattr(
-        ak_fetch, "fetch_financial_indicator_ths", lambda symbol: None
+        ak_fetch, "fetch_financial_indicator", lambda symbol: _financial_frame()
+    )
+    monkeypatch.setattr(ak_fetch, "fetch_financial_indicator_ths", lambda symbol: None)
+    monkeypatch.setattr(
+        ak_fetch,
+        "fetch_report_disclosure",
+        lambda market, period: _disclosure_frame(market),
     )
     monkeypatch.setattr(
-        ak_fetch, "fetch_report_disclosure", lambda market, period: _disclosure_frame(market)
+        ak_fetch,
+        "fetch_valuation_baidu",
+        lambda symbol, indicator, period="近一年": _valuation_frame(),
     )
     monkeypatch.setattr(
-        ak_fetch, "fetch_valuation_baidu", lambda symbol, indicator, period="近一年": _valuation_frame()
+        ak_fetch, "fetch_name_change_hist", lambda symbol: _name_hist_frame()
     )
-    monkeypatch.setattr(ak_fetch, "fetch_name_change_hist", lambda symbol: _name_hist_frame())
-    monkeypatch.setattr(ak_fetch, "fetch_industry_boards", lambda: _industry_boards_frame())
+    monkeypatch.setattr(
+        ak_fetch, "fetch_industry_boards", lambda: _industry_boards_frame()
+    )
     monkeypatch.setattr(
         ak_fetch, "fetch_industry_cons", lambda symbol: _industry_cons_frame(symbol)
     )
@@ -190,6 +246,7 @@ def research_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # master
 # ---------------------------------------------------------------------------
 
+
 def test_sync_master(db_session: Session, mock_ak: None) -> None:
     result = stock_data.sync_stock_master(db_session)
     assert result["status"] == "success"
@@ -204,7 +261,10 @@ def test_sync_master(db_session: Session, mock_ak: None) -> None:
     # 幂等：再次同步不产生重复
     result2 = stock_data.sync_stock_master(db_session)
     assert result2["total"] == 4
-    assert db_session.scalar(select(StockMaster).where(StockMaster.code == "600519")) is not None
+    assert (
+        db_session.scalar(select(StockMaster).where(StockMaster.code == "600519"))
+        is not None
+    )
 
 
 def test_to_date_rejects_nat_and_nan() -> None:
@@ -213,7 +273,9 @@ def test_to_date_rejects_nat_and_nan() -> None:
     assert stock_data._to_date("NaT") is None
 
 
-def test_sync_master_network_failure(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sync_master_network_failure(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(ak_fetch, "fetch_stock_code_name", lambda: None)
     result = stock_data.sync_stock_master(db_session)
     assert result["status"] == "failed"
@@ -225,7 +287,10 @@ def test_sync_master_network_failure(db_session: Session, monkeypatch: pytest.Mo
 # 日线
 # ---------------------------------------------------------------------------
 
-def test_sync_daily_and_read_back(db_session: Session, mock_ak: None, research_root: Path) -> None:
+
+def test_sync_daily_and_read_back(
+    db_session: Session, mock_ak: None, research_root: Path
+) -> None:
     stock_data.sync_stock_master(db_session)
     result = stock_data.sync_stock_daily(db_session, ["600519"], fetch_qfq=True)
     assert result["status"] == "success"
@@ -242,29 +307,57 @@ def test_sync_daily_and_read_back(db_session: Session, mock_ak: None, research_r
     assert len(rows) == 2
     assert rows[0]["close"] == pytest.approx(10.2)
 
-    qfq_rows = stock_data.get_daily_bars(db_session, "600519", layer=parquet_store.DAILY_QFQ)
+    qfq_rows = stock_data.get_daily_bars(
+        db_session, "600519", layer=parquet_store.DAILY_QFQ
+    )
     assert len(qfq_rows) == 2
 
 
-def test_sync_daily_incremental_resume(db_session: Session, mock_ak: None, research_root: Path) -> None:
+def test_sync_daily_incremental_resume(
+    db_session: Session, mock_ak: None, research_root: Path
+) -> None:
     """断点续传：追加新日期后按 trade_date 去重合并。"""
     stock_data.sync_stock_master(db_session)
     stock_data.sync_stock_daily(db_session, ["600519"], fetch_qfq=False)
 
     appended = pd.DataFrame(
         [
-            {"date": "2024-01-03", "open": 10.2, "high": 10.6, "low": 10.1, "close": 99.0,
-             "volume": 1, "amount": 1.0, "outstanding_share": 1e8, "turnover": 0.1},
-            {"date": "2024-01-04", "open": 10.4, "high": 10.8, "low": 10.3, "close": 10.7,
-             "volume": 3000, "amount": 32100.0, "outstanding_share": 1e8, "turnover": 1.5},
+            {
+                "date": "2024-01-03",
+                "open": 10.2,
+                "high": 10.6,
+                "low": 10.1,
+                "close": 99.0,
+                "volume": 1,
+                "amount": 1.0,
+                "outstanding_share": 1e8,
+                "turnover": 0.1,
+            },
+            {
+                "date": "2024-01-04",
+                "open": 10.4,
+                "high": 10.8,
+                "low": 10.3,
+                "close": 10.7,
+                "volume": 3000,
+                "amount": 32100.0,
+                "outstanding_share": 1e8,
+                "turnover": 1.5,
+            },
         ]
     )
     # 直接调用内部写路径，模拟“新一批数据覆盖旧行 + 新增一行”
     stock_data.parquet_store.write_daily(
-        "600519", stock_data.parse_sina_daily_frame("600519", appended), incremental=True
+        "600519",
+        stock_data.parse_sina_daily_frame("600519", appended),
+        incremental=True,
     )
     rows = stock_data.get_daily_bars(db_session, "600519")
-    assert [r["trade_date"] for r in rows] == [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
+    assert [r["trade_date"] for r in rows] == [
+        date(2024, 1, 2),
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+    ]
     # 同日以新行（close=99.0）为准
     assert rows[1]["close"] == pytest.approx(99.0)
 
@@ -274,7 +367,9 @@ def test_sync_daily_network_failure(
 ) -> None:
     monkeypatch.setattr(ak_fetch, "fetch_stock_code_name", lambda: _master_frame())
     stock_data.sync_stock_master(db_session)
-    monkeypatch.setattr(ak_fetch, "fetch_stock_daily_sina", lambda symbol, adjust="": None)
+    monkeypatch.setattr(
+        ak_fetch, "fetch_stock_daily_sina", lambda symbol, adjust="": None
+    )
     monkeypatch.setattr(
         ak_fetch, "fetch_stock_daily_eastmoney", lambda symbol, **kwargs: None
     )
@@ -295,6 +390,7 @@ def test_sync_daily_network_failure(
 # ---------------------------------------------------------------------------
 # 日线断点续传 / partial
 # ---------------------------------------------------------------------------
+
 
 def test_sync_daily_auto_batch_never_synced_first(
     db_session: Session, mock_ak: None, research_root: Path
@@ -320,11 +416,14 @@ def test_sync_daily_error_retry_and_stale_order(
     """有错误的股票优先重试，其余按最久未更新排序。"""
     monkeypatch.setattr(ak_fetch, "fetch_stock_code_name", lambda: _master_frame())
     stock_data.sync_stock_master(db_session)
-    monkeypatch.setattr(ak_fetch, "fetch_stock_daily_sina", lambda symbol, adjust="": _daily_frame())
+    monkeypatch.setattr(
+        ak_fetch, "fetch_stock_daily_sina", lambda symbol, adjust="": _daily_frame()
+    )
     stock_data.sync_stock_daily(db_session, ["000001", "300750"], fetch_qfq=False)
 
     # 人为制造一只错误股票与陈旧断点
     from datetime import datetime as dt
+
     err_bar = StockDailyBar(code="600519", last_error="网络超时")
     stale_bar = StockDailyBar(
         code="920001", available_at=dt(2020, 1, 1), first_trade_date=date(2020, 1, 2)
@@ -361,7 +460,9 @@ def test_sync_daily_resume_after_failed_run(
     monkeypatch.setattr(
         ak_fetch, "fetch_stock_daily_tencent", lambda symbol, **kwargs: None
     )
-    result = stock_data.sync_stock_daily(db_session, ["000001", "300750"], fetch_qfq=False)
+    result = stock_data.sync_stock_daily(
+        db_session, ["000001", "300750"], fetch_qfq=False
+    )
     assert result["status"] == "partial"  # 有成功有失败绝不能是 success
     assert result["last_code"] == "300750"
     state = db_session.get(StockSyncState, "daily")
@@ -388,7 +489,9 @@ def test_sync_daily_progress_written_per_stock(
 ) -> None:
     """每只股票处理后进度落 stock_sync_state（total/updated/failed/last_code）。"""
     stock_data.sync_stock_master(db_session)
-    stock_data.sync_stock_daily(db_session, ["600519", "000001", "300750"], fetch_qfq=False)
+    stock_data.sync_stock_daily(
+        db_session, ["600519", "000001", "300750"], fetch_qfq=False
+    )
     state = db_session.get(StockSyncState, "daily")
     assert state.total == 3
     assert state.updated == 3
@@ -408,6 +511,7 @@ def test_final_status_rules() -> None:
 # universe
 # ---------------------------------------------------------------------------
 
+
 def test_sync_index_cons(db_session: Session, mock_ak: None) -> None:
     result = stock_universe.sync_index_cons(db_session, ["000300"])
     assert result["status"] == "success"
@@ -421,7 +525,9 @@ def test_sync_index_cons(db_session: Session, mock_ak: None) -> None:
     assert len(db_session.scalars(select(IndexConstituent)).all()) == 2
 
 
-def test_import_membership_events_and_replay(db_session: Session, mock_ak: None) -> None:
+def test_import_membership_events_and_replay(
+    db_session: Session, mock_ak: None
+) -> None:
     stock_universe.sync_index_cons(db_session, ["000300"])
     csv_text = (
         "index_code,stock_code,stock_name,event_type,effective_date\n"
@@ -437,10 +543,14 @@ def test_import_membership_events_and_replay(db_session: Session, mock_ak: None)
     assert result2["imported"] == 0 and result2["skipped"] == 4
 
     # 回放：2022 年末只有 600519 + 000001
-    members_2022 = stock_universe.replay_membership(db_session, "000300", date(2022, 12, 31))
+    members_2022 = stock_universe.replay_membership(
+        db_session, "000300", date(2022, 12, 31)
+    )
     assert set(members_2022) == {"600519", "000001"}
     # 回放：2023 年中调样后 000001 出、300750 进
-    members_2023 = stock_universe.replay_membership(db_session, "000300", date(2023, 6, 30))
+    members_2023 = stock_universe.replay_membership(
+        db_session, "000300", date(2023, 6, 30)
+    )
     assert set(members_2023) == {"600519", "300750"}
 
     # 物化快照 + get_universe 三种 basis
@@ -474,25 +584,25 @@ def test_import_stocktoday_index_weights(db_session: Session, tmp_path: Path) ->
                 "index_code": "000300.SH",
                 "con_code": "000001.SZ",
                 "trade_date": "20240131",
-                    "weight": 40.0,
+                "weight": 40.0,
             },
             {
                 "index_code": "000300.SH",
                 "con_code": "600519.SH",
                 "trade_date": "20240131",
-                    "weight": 60.0,
+                "weight": 60.0,
             },
             {
                 "index_code": "000300.SH",
                 "con_code": "600519.SH",
                 "trade_date": "20240229",
-                    "weight": 55.0,
+                "weight": 55.0,
             },
             {
                 "index_code": "000300.SH",
                 "con_code": "300750.SZ",
                 "trade_date": "20240229",
-                    "weight": 45.0,
+                "weight": 45.0,
             },
         ]
     ).to_parquet(partition / "2024.parquet", index=False)
@@ -509,30 +619,26 @@ def test_import_stocktoday_index_weights(db_session: Session, tmp_path: Path) ->
     assert len(events) == 4
     assert {event.source for event in events} == {"stocktoday:index_weight"}
 
-    january = stock_universe.get_universe(
-        db_session, "000300", date(2024, 1, 31)
-    )
+    january = stock_universe.get_universe(db_session, "000300", date(2024, 1, 31))
     assert january["basis"] == "snapshot"
     assert {row["stock_code"] for row in january["members"]} == {
         "000001",
         "600519",
     }
-    february = stock_universe.get_universe(
-        db_session, "000300", date(2024, 2, 29)
-    )
+    february = stock_universe.get_universe(db_session, "000300", date(2024, 2, 29))
     assert {row["stock_code"] for row in february["members"]} == {
         "300750",
         "600519",
     }
 
-    repeated = stock_universe.import_stocktoday_index_weights(
-        db_session, snapshot_root
-    )
+    repeated = stock_universe.import_stocktoday_index_weights(db_session, snapshot_root)
     assert repeated["snapshots_imported"] == 0
     assert repeated["events_imported"] == 0
 
 
-def test_sync_index_cons_network_failure(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sync_index_cons_network_failure(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(ak_fetch, "fetch_index_cons", lambda symbol: None)
     result = stock_universe.sync_index_cons(db_session, ["000300"])
     assert result["status"] == "failed"
@@ -542,6 +648,7 @@ def test_sync_index_cons_network_failure(db_session: Session, monkeypatch: pytes
 # ---------------------------------------------------------------------------
 # fundamentals
 # ---------------------------------------------------------------------------
+
 
 def test_sync_financial_and_available_at(db_session: Session, mock_ak: None) -> None:
     result = stock_fundamentals.sync_financial_indicators(db_session, ["600519"])
@@ -555,9 +662,7 @@ def test_sync_financial_and_available_at(db_session: Session, mock_ak: None) -> 
     assert "摊薄每股收益(元)" in rows[0].payload
 
 
-def test_import_stocktoday_valuations(
-    db_session: Session, tmp_path: Path
-) -> None:
+def test_import_stocktoday_valuations(db_session: Session, tmp_path: Path) -> None:
     snapshot_root = tmp_path / "tushare_snapshot"
     partition = snapshot_root / "stocks" / "daily_basic"
     partition.mkdir(parents=True)
@@ -578,9 +683,7 @@ def test_import_stocktoday_valuations(
         ]
     ).to_parquet(partition / "600519.SH.parquet", index=False)
 
-    result = stock_fundamentals.import_stocktoday_valuations(
-        db_session, snapshot_root
-    )
+    result = stock_fundamentals.import_stocktoday_valuations(db_session, snapshot_root)
     assert result["status"] == "success"
     assert result["codes"] == 1
     assert result["rows"] == 4
@@ -641,9 +744,7 @@ def test_import_stocktoday_financial_indicators(
     assert result["codes"] == 1
     assert result["rows"] == 2
     rows = db_session.scalars(
-        select(StockFinancialIndicator).order_by(
-            StockFinancialIndicator.report_date
-        )
+        select(StockFinancialIndicator).order_by(StockFinancialIndicator.report_date)
     ).all()
     assert len(rows) == 2
     assert float(rows[0].eps) == pytest.approx(2.1)
@@ -652,9 +753,7 @@ def test_import_stocktoday_financial_indicators(
     assert json.loads(rows[0].payload)["grossprofit_margin"] == 51.0
 
 
-def test_import_stocktoday_name_history(
-    db_session: Session, tmp_path: Path
-) -> None:
+def test_import_stocktoday_name_history(db_session: Session, tmp_path: Path) -> None:
     snapshot_root = tmp_path / "tushare_snapshot"
     partition = snapshot_root / "stocks" / "namechange"
     partition.mkdir(parents=True)
@@ -690,9 +789,7 @@ def test_import_stocktoday_name_history(
     assert {row.source for row in rows} == {"stocktoday"}
 
 
-def test_import_stocktoday_industries(
-    db_session: Session, tmp_path: Path
-) -> None:
+def test_import_stocktoday_industries(db_session: Session, tmp_path: Path) -> None:
     snapshot_root = tmp_path / "tushare_snapshot"
     partition = snapshot_root / "stocks" / "index_member_all"
     partition.mkdir(parents=True)
@@ -712,9 +809,7 @@ def test_import_stocktoday_industries(
         ]
     ).to_parquet(partition / "600519.SH.parquet", index=False)
 
-    result = stock_fundamentals.import_stocktoday_industries(
-        db_session, snapshot_root
-    )
+    result = stock_fundamentals.import_stocktoday_industries(db_session, snapshot_root)
     assert result["status"] == "success"
     assert result["rows"] == 1
     row = db_session.scalar(select(StockIndustry))
@@ -756,16 +851,12 @@ def test_sync_financial_uses_eastmoney_normalized_fields(
         lambda symbol: pytest.fail("东财成功时不应调用同花顺"),
     )
 
-    result = stock_fundamentals.sync_financial_indicators(
-        db_session, ["000683"]
-    )
+    result = stock_fundamentals.sync_financial_indicators(db_session, ["000683"])
 
     assert result["status"] == "success"
     assert result["sources"] == {"eastmoney": 1}
     row = db_session.scalar(
-        select(StockFinancialIndicator).where(
-            StockFinancialIndicator.code == "000683"
-        )
+        select(StockFinancialIndicator).where(StockFinancialIndicator.code == "000683")
     )
     assert row is not None
     assert row.source == "eastmoney"
@@ -776,7 +867,9 @@ def test_sync_financial_uses_eastmoney_normalized_fields(
 
 def test_sync_disclosure_available_at(db_session: Session, mock_ak: None) -> None:
     stock_data.sync_stock_master(db_session)
-    result = stock_fundamentals.sync_report_disclosure(db_session, ["600519"], ["20231231"])
+    result = stock_fundamentals.sync_report_disclosure(
+        db_session, ["600519"], ["20231231"]
+    )
     assert result["status"] == "success"
     row = db_session.scalar(
         select(StockReportDisclosure).where(StockReportDisclosure.code == "600519")
@@ -794,14 +887,13 @@ def test_disclosure_market_period_snapshot_fetch(
 ) -> None:
     """接口适配：每个 (market 分区, period) 只抓一次全市场快照，按 code 分配。"""
     calls: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        ak_fetch, "fetch_stock_code_name", lambda: _master_frame()
-    )
+    monkeypatch.setattr(ak_fetch, "fetch_stock_code_name", lambda: _master_frame())
     stock_data.sync_stock_master(db_session)
     monkeypatch.setattr(
         ak_fetch,
         "fetch_report_disclosure",
-        lambda market, period: calls.append((market, period)) or _disclosure_frame(market),
+        lambda market, period: calls.append((market, period))
+        or _disclosure_frame(market),
     )
     result = stock_fundamentals.sync_report_disclosure(db_session, None, ["20231231"])
     assert result["status"] == "success"
@@ -817,10 +909,22 @@ def test_disclosure_market_period_snapshot_fetch(
 
 
 def test_disclosure_period_normalization() -> None:
-    assert stock_fundamentals._normalize_period("20231231") == ("2023年报", date(2023, 12, 31))
-    assert stock_fundamentals._normalize_period("2024-03-31") == ("2024一季", date(2024, 3, 31))
-    assert stock_fundamentals._normalize_period("2024半年报") == ("2024半年报", date(2024, 6, 30))
-    assert stock_fundamentals._normalize_period("2024三季") == ("2024三季", date(2024, 9, 30))
+    assert stock_fundamentals._normalize_period("20231231") == (
+        "2023年报",
+        date(2023, 12, 31),
+    )
+    assert stock_fundamentals._normalize_period("2024-03-31") == (
+        "2024一季",
+        date(2024, 3, 31),
+    )
+    assert stock_fundamentals._normalize_period("2024半年报") == (
+        "2024半年报",
+        date(2024, 6, 30),
+    )
+    assert stock_fundamentals._normalize_period("2024三季") == (
+        "2024三季",
+        date(2024, 9, 30),
+    )
     assert stock_fundamentals._normalize_period("20240101") is None  # 非法定报告期
     assert stock_fundamentals._normalize_period("胡说") is None
 
@@ -829,9 +933,7 @@ def test_disclosure_partial_when_one_market_fails(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """单分区抓取失败 -> partial，失败摘要落 stock_sync_state.detail。"""
-    monkeypatch.setattr(
-        ak_fetch, "fetch_stock_code_name", lambda: _master_frame()
-    )
+    monkeypatch.setattr(ak_fetch, "fetch_stock_code_name", lambda: _master_frame())
     stock_data.sync_stock_master(db_session)
 
     def flaky(market: str, period: str) -> pd.DataFrame | None:
@@ -864,13 +966,17 @@ def test_disclosure_without_master_falls_back_to_whole_market(
 
 
 def test_sync_valuation(db_session: Session, mock_ak: None) -> None:
-    result = stock_fundamentals.sync_valuations(db_session, ["600519"], indicators=["市盈率(TTM)"])
+    result = stock_fundamentals.sync_valuations(
+        db_session, ["600519"], indicators=["市盈率(TTM)"]
+    )
     assert result["status"] == "success"
     assert result["rows"] == 2
     rows = db_session.scalars(select(StockValuation)).all()
     assert {r.indicator for r in rows} == {"pe_ttm"}
     # 幂等：重复同步不产生重复行
-    stock_fundamentals.sync_valuations(db_session, ["600519"], indicators=["市盈率(TTM)"])
+    stock_fundamentals.sync_valuations(
+        db_session, ["600519"], indicators=["市盈率(TTM)"]
+    )
     assert len(db_session.scalars(select(StockValuation)).all()) == 2
 
 
@@ -882,7 +988,11 @@ def test_industry_cninfo_current_columns(
     frame = pd.DataFrame(
         [
             {"行业中类": "银行", "行业大类": "银行", "变更日期": date(2021, 1, 1)},
-            {"行业中类": None, "行业大类": "货币金融服务", "变更日期": date(2024, 1, 1)},
+            {
+                "行业中类": None,
+                "行业大类": "货币金融服务",
+                "变更日期": date(2024, 1, 1),
+            },
         ]
     )
     monkeypatch.setattr(ak_fetch, "fetch_industry_change_cninfo", lambda code: frame)
@@ -933,14 +1043,10 @@ def test_sync_market_valuations_builds_pb_from_financial_bps(
     monkeypatch.setattr(
         ak_fetch,
         "fetch_stock_spot_tencent",
-        lambda: pd.DataFrame(
-            [{"code": "sh600519", "zxj": "25", "pe_ttm": "12.5"}]
-        ),
+        lambda: pd.DataFrame([{"code": "sh600519", "zxj": "25", "pe_ttm": "12.5"}]),
     )
 
-    result = stock_fundamentals.sync_market_valuations(
-        db_session, date(2024, 4, 30)
-    )
+    result = stock_fundamentals.sync_market_valuations(db_session, date(2024, 4, 30))
 
     assert result["status"] == "success"
     rows = db_session.scalars(select(StockValuation)).all()
@@ -972,12 +1078,24 @@ def test_sync_name_history_st_flag(db_session: Session, mock_ak: None) -> None:
     assert len(db_session.scalars(select(StockNameHistory)).all()) == 3
 
 
-def test_name_history_explicit_dates_upsert(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_name_history_explicit_dates_upsert(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """带显式日期的数据（旧接口格式）按 (code, start_date, name) 幂等。"""
     frame = pd.DataFrame(
         [
-            {"名称": "旧名", "开始日期": "2020-01-01", "结束日期": "2021-05-01", "变更原因": None},
-            {"名称": "ST新名", "开始日期": "2021-05-02", "结束日期": None, "变更原因": "实施风险警示"},
+            {
+                "名称": "旧名",
+                "开始日期": "2020-01-01",
+                "结束日期": "2021-05-01",
+                "变更原因": None,
+            },
+            {
+                "名称": "ST新名",
+                "开始日期": "2021-05-02",
+                "结束日期": None,
+                "变更原因": "实施风险警示",
+            },
         ]
     )
     monkeypatch.setattr(ak_fetch, "fetch_name_change_hist", lambda symbol: frame)
@@ -999,14 +1117,14 @@ def test_extract_name_segments() -> None:
     assert stock_fundamentals._extract_name_segments("") == []
 
 
-def test_fundamentals_network_failure(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fundamentals_network_failure(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(
         ak_fetch, "fetch_financial_indicator_eastmoney", lambda symbol: None
     )
     monkeypatch.setattr(ak_fetch, "fetch_financial_indicator", lambda symbol: None)
-    monkeypatch.setattr(
-        ak_fetch, "fetch_financial_indicator_ths", lambda symbol: None
-    )
+    monkeypatch.setattr(ak_fetch, "fetch_financial_indicator_ths", lambda symbol: None)
     result = stock_fundamentals.sync_financial_indicators(db_session, ["600519"])
     assert result["status"] == "failed"
     assert result["errors"]
@@ -1015,6 +1133,7 @@ def test_fundamentals_network_failure(db_session: Session, monkeypatch: pytest.M
 # ---------------------------------------------------------------------------
 # 行业归属
 # ---------------------------------------------------------------------------
+
 
 def test_sync_industries_primary_source(db_session: Session, mock_ak: None) -> None:
     result = stock_fundamentals.sync_industries(db_session)
@@ -1035,7 +1154,9 @@ def test_sync_industries_fallback_when_boards_unavailable(
     monkeypatch.setattr(
         ak_fetch,
         "fetch_industry_change_cninfo",
-        lambda symbol: pd.DataFrame([{"行业名称": "白酒"}]) if symbol == "600519" else None,
+        lambda symbol: pd.DataFrame([{"行业名称": "白酒"}])
+        if symbol == "600519"
+        else None,
     )
     monkeypatch.setattr(ak_fetch, "fetch_stock_profile_cninfo", lambda symbol: None)
     result = stock_fundamentals.sync_industries(db_session, ["600519", "000001"])
@@ -1076,7 +1197,9 @@ def test_repository_valuation_as_of_filter(db_session: Session) -> None:
     # 两个估值点：2024-03-01（as_of 内）与 2024-09-01（as_of 外）
     for day, value in ((date(2024, 3, 1), 20.0), (date(2024, 9, 1), 5.0)):
         db_session.add(
-            StockValuation(code="600519", trade_date=day, indicator="pe_ttm", value=value)
+            StockValuation(
+                code="600519", trade_date=day, indicator="pe_ttm", value=value
+            )
         )
     db_session.commit()
 
@@ -1128,13 +1251,7 @@ def test_repository_uses_official_delist_date(db_session, tmp_path) -> None:
 
     from app.services.stock_repository import SqlStockRepository
 
-    path = (
-        tmp_path
-        / "tushare_snapshot"
-        / "global"
-        / "stock_basic_full"
-        / "D.parquet"
-    )
+    path = tmp_path / "tushare_snapshot" / "global" / "stock_basic_full" / "D.parquet"
     path.parent.mkdir(parents=True)
     pq.write_table(
         pa.Table.from_pylist(
@@ -1171,13 +1288,7 @@ def test_repository_uses_tushare_raw_daily_as_execution_fallback(
 
     from app.services.stock_repository import SqlStockRepository
 
-    path = (
-        tmp_path
-        / "tushare_snapshot"
-        / "stocks"
-        / "daily"
-        / "600001.SH.parquet"
-    )
+    path = tmp_path / "tushare_snapshot" / "stocks" / "daily" / "600001.SH.parquet"
     path.parent.mkdir(parents=True)
     pq.write_table(
         pa.Table.from_pylist(
@@ -1209,11 +1320,7 @@ def test_repository_uses_tushare_raw_daily_as_execution_fallback(
         path,
     )
     factor_path = (
-        tmp_path
-        / "tushare_snapshot"
-        / "stocks"
-        / "adj_factor"
-        / "600001.SH.parquet"
+        tmp_path / "tushare_snapshot" / "stocks" / "adj_factor" / "600001.SH.parquet"
     )
     factor_path.parent.mkdir(parents=True)
     pq.write_table(
@@ -1234,18 +1341,61 @@ def test_repository_uses_tushare_raw_daily_as_execution_fallback(
         factor_path,
     )
     repository = SqlStockRepository(db_session, data_root=tmp_path)
-    rows = repository.daily_bars(
-        ["600001"], date(2024, 1, 1), date(2024, 1, 31)
-    )
+    rows = repository.daily_bars(["600001"], date(2024, 1, 1), date(2024, 1, 31))
     assert len(rows) == 2
     assert rows[0].close == pytest.approx(10.2)
     assert rows[0].raw_return == pytest.approx(0.02)
-    panel = repository.market_bars(
-        ["600001"], date(2024, 1, 1), date(2024, 1, 31)
-    )["600001"]
+    panel = repository.market_bars(["600001"], date(2024, 1, 1), date(2024, 1, 31))[
+        "600001"
+    ]
     assert panel.exec_bars[0].close == pytest.approx(10.2)
     assert panel.research_bars[0].close == pytest.approx(5.1)
     assert panel.research_bars[1].close == pytest.approx(5.1)
+
+
+def test_repository_merges_derived_limit_sidecar_but_raw_wins(
+    db_session, tmp_path
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from app.services.stock_repository import SqlStockRepository
+
+    root = tmp_path / "tushare_snapshot" / "stocks"
+    raw_path = root / "stk_limit" / "600001.SH.parquet"
+    derived_path = root / "stk_limit_derived" / "600001.SH.parquet"
+    raw_path.parent.mkdir(parents=True)
+    derived_path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "trade_date": ["20240102", "20240103"],
+                "up_limit": [11.0, 12.0],
+                "down_limit": [9.0, 8.0],
+            }
+        ),
+        raw_path,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "trade_date": ["20240103", "20240104"],
+                "up_limit": [99.0, 13.0],
+                "down_limit": [1.0, 7.0],
+            }
+        ),
+        derived_path,
+    )
+
+    limits, _suspended = SqlStockRepository(
+        db_session, data_root=tmp_path
+    )._execution_overrides("600001", date(2024, 1, 1), date(2024, 1, 31))
+
+    assert limits == {
+        date(2024, 1, 2): (11.0, 9.0),
+        date(2024, 1, 3): (12.0, 8.0),
+        date(2024, 1, 4): (13.0, 7.0),
+    }
 
 
 def test_repository_recovers_historical_master_from_code_change(
@@ -1253,9 +1403,7 @@ def test_repository_recovers_historical_master_from_code_change(
 ) -> None:
     from app.services.stock_repository import SqlStockRepository
 
-    db_session.add(
-        StockMaster(code="302132", name="中航成飞", exchange="sz")
-    )
+    db_session.add(StockMaster(code="302132", name="中航成飞", exchange="sz"))
     db_session.add(
         QuantDataRecord(
             dataset="corporate_action",
@@ -1314,12 +1462,8 @@ def test_repository_historical_universe_uses_latest_snapshot_not_after_as_of(
     result = SqlStockRepository(db_session).universe_members_as_of(
         ["000300", "000905"], [date(2024, 2, 15), date(2024, 3, 15)]
     )
-    assert result[date(2024, 2, 15)].members == frozenset(
-        {"600001", "000001"}
-    )
-    assert result[date(2024, 3, 15)].members == frozenset(
-        {"600002", "000001"}
-    )
+    assert result[date(2024, 2, 15)].members == frozenset({"600001", "000001"})
+    assert result[date(2024, 3, 15)].members == frozenset({"600002", "000001"})
     assert result[date(2024, 2, 15)].snapshot_dates == {
         "000300": date(2024, 1, 31),
         "000905": date(2024, 1, 31),
@@ -1358,13 +1502,19 @@ def test_repository_disclosure_statutory_fallback(
     """披露日/入库时间皆缺失：available_at 按法定最晚披露日保守估计并 warning。"""
     import logging
 
-    from app.services.stock_repository import SqlStockRepository, statutory_disclosure_deadline
+    from app.services.stock_repository import (
+        SqlStockRepository,
+        statutory_disclosure_deadline,
+    )
 
     _seed_master(db_session, ["600519"])
     db_session.add(
         StockFinancialIndicator(
-            code="600519", report_date=date(2023, 12, 31), roe=25.0,
-            payload="{}", available_at=None,
+            code="600519",
+            report_date=date(2023, 12, 31),
+            roe=25.0,
+            payload="{}",
+            available_at=None,
         )
     )
     db_session.commit()
@@ -1389,14 +1539,22 @@ def test_repository_name_histories_as_of(db_session: Session) -> None:
     _seed_master(db_session, ["600519"])
     db_session.add(
         StockNameHistory(
-            code="600519", name="ST茅台", start_date=date(2021, 1, 1),
-            end_date=date(2021, 12, 31), is_st=True, sort_order=0,
+            code="600519",
+            name="ST茅台",
+            start_date=date(2021, 1, 1),
+            end_date=date(2021, 12, 31),
+            is_st=True,
+            sort_order=0,
         )
     )
     db_session.add(
         StockNameHistory(
-            code="600519", name="无日期区间", start_date=None,
-            end_date=None, is_st=True, sort_order=1,
+            code="600519",
+            name="无日期区间",
+            start_date=None,
+            end_date=None,
+            is_st=True,
+            sort_order=1,
         )
     )
     db_session.commit()
@@ -1437,7 +1595,10 @@ def test_repository_industry_from_stock_industry(db_session: Session) -> None:
 # status
 # ---------------------------------------------------------------------------
 
-def test_get_data_status(db_session: Session, mock_ak: None, research_root: Path) -> None:
+
+def test_get_data_status(
+    db_session: Session, mock_ak: None, research_root: Path
+) -> None:
     stock_data.sync_stock_master(db_session)
     stock_data.sync_stock_daily(db_session, ["600519"], fetch_qfq=False)
     stock_universe.sync_index_cons(db_session, ["000300"])

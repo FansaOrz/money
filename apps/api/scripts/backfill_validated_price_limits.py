@@ -41,6 +41,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--name-workers", type=int, default=4)
     parser.add_argument("--name-timeout-seconds", type=int, default=90)
+    parser.add_argument(
+        "--derive-missing-only",
+        action="store_true",
+        help=(
+            "只为原始 stk_limit 中缺失的交易日生成 "
+            "stk_limit_derived 侧车分区，不改写原始文件"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -162,6 +170,37 @@ def complete_leading_name_period(
     return completed, predecessor
 
 
+def public_names_confirm(
+    dated_names: set[str],
+    public_names: set[str],
+) -> bool:
+    """确认两源名称；只兼容 AkShare 的“A 股名称（B 股名称）”展示格式。"""
+    return all(
+        any(
+            public_name == dated_name
+            or public_name.startswith(f"{dated_name}(")
+            or public_name.startswith(f"{dated_name}（")
+            for public_name in public_names
+        )
+        for dated_name in dated_names
+    )
+
+
+def unique_stock_basic_record(
+    snapshot: Path,
+    ts_code: str,
+) -> tuple[pd.Series, Path] | None:
+    matches: list[tuple[pd.Series, Path]] = []
+    for status in ("L", "D"):
+        path = snapshot / "global" / "stock_basic" / f"{status}.parquet"
+        if not path.is_file():
+            continue
+        frame = pd.read_parquet(path)
+        for _index, row in frame[frame["ts_code"].astype(str) == ts_code].iterrows():
+            matches.append((row, path))
+    return matches[0] if len(matches) == 1 else None
+
+
 def dated_name_periods(
     snapshot: Path,
     ts_code: str,
@@ -187,46 +226,45 @@ def dated_name_periods(
             periods.append((start, end, name))
         if not periods:
             raise RuntimeError(f"{ts_code} 带日期名称证据为空")
-        basic_path = snapshot / "global" / "stock_basic" / "L.parquet"
-        if len(periods) == 1 and periods[0][1] is None and basic_path.is_file():
-            basic = pd.read_parquet(basic_path)
-            matched = basic[basic["ts_code"].astype(str) == ts_code]
-            if len(matched) == 1:
-                current_name = str(matched.iloc[0]["name"] or "").strip()
-                list_text = str(matched.iloc[0]["list_date"] or "")
-                list_date = (
-                    date.fromisoformat(
-                        f"{list_text[:4]}-{list_text[4:6]}-{list_text[6:8]}"
-                    )
-                    if len(list_text) >= 8
-                    else None
+        basic_record = unique_stock_basic_record(snapshot, ts_code)
+        unique_names = {name for _start, _end, name in periods}
+        if (
+            len(unique_names) == 1
+            and all(period_end is None for _start, period_end, _name in periods)
+            and basic_record is not None
+        ):
+            basic_row, basic_path = basic_record
+            current_name = str(basic_row["name"] or "").strip()
+            list_text = str(basic_row["list_date"] or "")
+            list_date = (
+                date.fromisoformat(f"{list_text[:4]}-{list_text[4:6]}-{list_text[6:8]}")
+                if len(list_text) >= 8
+                else None
+            )
+            first_name_date = min(period_start for period_start, _end, _name in periods)
+            only_name = next(iter(unique_names))
+            if first_name_date == list_date and only_name == current_name:
+                return (
+                    periods,
+                    (path, basic_path),
+                    "tushare.namechange.dated_single_from_listing+stock_basic.current",
                 )
-                if periods[0][0] == list_date and periods[0][2] == current_name:
-                    return (
-                        periods,
-                        (path, basic_path),
-                        "tushare.namechange.dated_single_from_listing"
-                        "+stock_basic.current",
-                    )
         return periods, (path,), "tushare.namechange.dated"
 
     # “没有改名记录”与“接口失败”不可混为一谈。只有保存的成功空响应、
     # 查询区间覆盖正式验证期，并且 Tushare 主表当前名称非 ST/退市时，
     # 才能证明该区间名称未变化并构造单一有效期。
     empty_path = snapshot / "stocks" / "namechange" / f"{ts_code}.empty.json"
-    basic_path = snapshot / "global" / "stock_basic" / "L.parquet"
-    if not empty_path.is_file() or not basic_path.is_file():
+    basic_record = unique_stock_basic_record(snapshot, ts_code)
+    if not empty_path.is_file() or basic_record is None:
         raise RuntimeError(f"{ts_code} 缺少可验证的 namechange 空响应/证券主表")
     marker = json.loads(empty_path.read_text(encoding="utf-8"))
     params = dict(marker.get("params") or {})
     start_text = str(params.get("start_date") or "")
     if marker.get("status") != "empty" or len(start_text) < 8:
         raise RuntimeError(f"{ts_code} namechange 空响应证据无效")
-    basic = pd.read_parquet(basic_path)
-    matched = basic[basic["ts_code"].astype(str) == ts_code]
-    if len(matched) != 1:
-        raise RuntimeError(f"{ts_code} Tushare 当前证券主表记录不唯一")
-    current_name = str(matched.iloc[0]["name"] or "").strip()
+    basic_row, basic_path = basic_record
+    current_name = str(basic_row["name"] or "").strip()
     if not names_prove_non_st([current_name]):
         raise RuntimeError(f"{ts_code} 当前名称含 ST/退市标识")
     covered_from = date.fromisoformat(
@@ -301,18 +339,7 @@ def main() -> None:
             names,
             start,
         )
-        dated_names = {
-            name
-            for period_start, period_end, name in periods
-            if period_start <= end and (period_end is None or period_end >= start)
-        }
         public_names = {name for name in names if name}
-        if dated_name_mode == "tushare.namechange.dated" and not dated_names.issubset(
-            public_names
-        ):
-            raise RuntimeError(
-                f"{code} Tushare 带日期名称未被 AkShare 名称序列完整交叉确认"
-            )
         if public_names and not names_prove_non_st(list(public_names)):
             # 带日期证据可以安全处理历史 ST；成功空响应模式却不能有另一源
             # 声称区间内存在 ST 名称。
@@ -324,19 +351,74 @@ def main() -> None:
             else dated_name_mode
         )
         daily_path = snapshot / "stocks" / "daily" / f"{ts_code}.parquet"
-        target = snapshot / "stocks" / "stk_limit" / f"{ts_code}.parquet"
+        primary_target = snapshot / "stocks" / "stk_limit" / f"{ts_code}.parquet"
+        target = (
+            snapshot / "stocks" / "stk_limit_derived" / f"{ts_code}.parquet"
+            if args.derive_missing_only
+            else primary_target
+        )
         if target.exists():
-            raise FileExistsError(f"{target} 已存在，拒绝覆盖原始限价分区")
+            raise FileExistsError(f"{target} 已存在，拒绝覆盖限价分区")
+        primary_dates: set[str] = set()
+        primary_source: dict[str, object] | None = None
+        if args.derive_missing_only and primary_target.is_file():
+            primary = pd.read_parquet(
+                primary_target,
+                columns=["trade_date", "up_limit", "down_limit"],
+            )
+            primary_dates = {
+                str(row.trade_date)[:8]
+                for row in primary.itertuples()
+                if pd.notna(row.up_limit) and pd.notna(row.down_limit)
+            }
+            primary_source = {
+                "path": str(primary_target),
+                "rows": len(primary),
+                "sha256": hashlib.sha256(primary_target.read_bytes()).hexdigest(),
+            }
         daily = pd.read_parquet(
             daily_path,
             columns=["trade_date", "pre_close"],
         )
-        rows: list[dict[str, object]] = []
-        for raw in daily.to_dict("records"):
+        daily_records = [
+            raw
+            for raw in daily.to_dict("records")
+            if start
+            <= date.fromisoformat(
+                f"{str(raw['trade_date'])[:4]}-"
+                f"{str(raw['trade_date'])[4:6]}-"
+                f"{str(raw['trade_date'])[6:8]}"
+            )
+            <= end
+            and str(raw["trade_date"])[:8] not in primary_dates
+        ]
+        dated_names: set[str] = set()
+        for raw in daily_records:
             text = str(raw["trade_date"])
             day = date.fromisoformat(f"{text[:4]}-{text[4:6]}-{text[6:8]}")
-            if not start <= day <= end:
-                continue
+            active_name = dated_name_as_of(periods, day)
+            if active_name is None:
+                raise RuntimeError(f"{code} {day} 缺少唯一有效的带日期名称证据")
+            dated_names.add(active_name)
+        if dated_name_mode == "tushare.namechange.dated" and not public_names_confirm(
+            dated_names,
+            public_names,
+        ):
+            missing_names = "、".join(
+                sorted(
+                    dated_name
+                    for dated_name in dated_names
+                    if not public_names_confirm({dated_name}, public_names)
+                )
+            )
+            raise RuntimeError(
+                f"{code} 待派生日期的 Tushare 名称未被 AkShare 完整交叉确认："
+                f"{missing_names}"
+            )
+        rows: list[dict[str, object]] = []
+        for raw in daily_records:
+            text = str(raw["trade_date"])
+            day = date.fromisoformat(f"{text[:4]}-{text[4:6]}-{text[6:8]}")
             pre_close = float(raw["pre_close"])
             active_name = dated_name_as_of(periods, day)
             if active_name is None:
@@ -405,6 +487,7 @@ def main() -> None:
                     if dated_name_mode == "tushare.namechange.dated"
                     else None
                 ),
+                "primary_limit_source": primary_source,
                 "output": str(target),
             }
         )

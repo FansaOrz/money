@@ -1000,8 +1000,15 @@ class SqlStockRepository:
             import pyarrow.parquet as pq
 
             limits: dict[date, tuple[float | None, float | None]] = {}
-            limit_path = self._stocktoday_file("stk_limit", code)
-            if limit_path is not None:
+            # 派生侧车先载入，Tushare 原始分区后载入并覆盖同日值：
+            # 既保全原始快照不可变性，又允许用可审计规则补齐空洞。
+            limit_paths = (
+                self._stocktoday_file("stk_limit_derived", code),
+                self._stocktoday_file("stk_limit", code),
+            )
+            for limit_path in limit_paths:
+                if limit_path is None:
+                    continue
                 table = pq.read_table(
                     limit_path,
                     columns=["trade_date", "up_limit", "down_limit"],
