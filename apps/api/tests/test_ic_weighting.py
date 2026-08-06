@@ -43,8 +43,8 @@ def test_future_label_is_excluded_and_weights_are_capped() -> None:
     with_future = estimate_ic_weights([known, future_bad], as_of=as_of)
     without_future = estimate_ic_weights([known], as_of=as_of)
     assert with_future.weights == without_future.weights
-    assert max(with_future.weights.values()) <= 0.30 + 1e-12
-    assert min(with_future.weights.values()) >= 0.08 - 1e-12
+    assert max(with_future.weights.values()) <= 0.50 + 1e-12
+    assert min(with_future.weights.values()) >= 0.0
     assert abs(sum(with_future.weights.values()) - 1.0) < 1e-12
     assert with_future.status == "robust_prior_fallback"
     assert with_future.weights == {
@@ -114,3 +114,22 @@ def test_previous_weight_blend_penalizes_weight_turnover() -> None:
     assert abs(blended.weights["lowvol"] - 0.30) < abs(
         unblended.weights["lowvol"] - 0.30
     )
+
+
+def test_mature_negative_evidence_can_remove_family_weight() -> None:
+    observations = [
+        _observation(1, 2, reverse_quality=True),
+        _observation(2, 3, reverse_quality=True),
+        _observation(3, 4, reverse_quality=True),
+    ]
+
+    estimate = estimate_ic_weights(
+        observations,
+        as_of=date(2025, 5, 1),
+        minimum_periods=3,
+        previous_weight_blend=0.0,
+    )
+
+    assert estimate.raw_ic["quality"] == -1.0
+    assert estimate.shrunk_ic["quality"] < 0.0
+    assert estimate.weights["quality"] == 0.0

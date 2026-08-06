@@ -320,6 +320,30 @@ def minimum_history_days(window_scale: float = 1.0) -> int:
     return _scaled_window(MOMENTUM_WINDOW, window_scale) + 1
 
 
+def residual_momentum_from_returns(
+    residual_values: list[float],
+    *,
+    window_scale: float = 1.0,
+) -> float | None:
+    """从收益残差计算 12-1 动量。
+
+    253 个价格点只会产生 252 个收益点，因此成熟条件必须按收益窗口
+    判断，不能错误复用价格历史深度 253。
+    """
+    return_window = _scaled_window(MOMENTUM_WINDOW, window_scale)
+    skip_window = _scaled_window(MOMENTUM_SKIP, window_scale)
+    minimum_compound_window = _scaled_window(126, window_scale)
+    if len(residual_values) < return_window:
+        return None
+    momentum_residuals = residual_values[-return_window:-skip_window]
+    if len(momentum_residuals) < minimum_compound_window:
+        return None
+    compounded = 1.0
+    for value in momentum_residuals:
+        compounded *= 1.0 + value
+    return compounded - 1.0
+
+
 def momentum_12_1(
     closes: list[float],
     *,
@@ -547,9 +571,7 @@ def raw_factors(
         ),
         "volatility_60": low_volatility(closes, volatility_short),
         "volatility_120": low_volatility(closes, volatility_long),
-        "max_drawdown_120": maximum_drawdown_factor(
-            closes, drawdown_window
-        ),
+        "max_drawdown_120": maximum_drawdown_factor(closes, drawdown_window),
         "residual_volatility": None,
     }
     result.update({field: None for field in sector_fields})
@@ -896,9 +918,7 @@ def compute_cross_section(
             value for _day, value in sorted(residual_model.residuals.items())
         ]
         residual_volatility = None
-        recent_residuals = residual_values[
-            -_scaled_window(120, window_scale) :
-        ]
+        recent_residuals = residual_values[-_scaled_window(120, window_scale) :]
         if len(recent_residuals) >= 20:
             residual_mean = fmean(recent_residuals)
             residual_volatility = -math.sqrt(
@@ -906,20 +926,10 @@ def compute_cross_section(
                 / (len(recent_residuals) - 1)
             )
         # 12-1 残差动量直接复合已保存的模型残差，跳过最近21个交易日。
-        momentum_residuals = (
-            residual_values[
-                -_scaled_window(252, window_scale) :
-                -_scaled_window(21, window_scale)
-            ]
-            if len(residual_values) >= minimum_history_days(window_scale)
-            else []
+        residual_momentum = residual_momentum_from_returns(
+            residual_values,
+            window_scale=window_scale,
         )
-        residual_momentum = None
-        if len(momentum_residuals) >= _scaled_window(126, window_scale):
-            compounded = 1.0
-            for value in momentum_residuals:
-                compounded *= 1.0 + value
-            residual_momentum = compounded - 1.0
         recent_amounts = [
             bar.amount
             for bar in context.bars[-20:]

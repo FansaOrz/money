@@ -9,13 +9,9 @@ from math import exp, log
 from app.services.quant_stats import rank_ic
 
 FAMILIES = ("quality", "value", "momentum", "trend", "lowvol")
-ROBUST_PRIOR_IC = {
-    "quality": 0.020,
-    "value": 0.015,
-    "momentum": 0.015,
-    "trend": 0.005,
-    "lowvol": 0.010,
-}
+# 未经本地样本证明的因子不预设正 Alpha。训练成熟前仍使用结构先验权重；
+# 成熟后只把观测 IC 向零收缩，负证据可以把因子目标权重降为零。
+NEUTRAL_PRIOR_IC = {family: 0.0 for family in FAMILIES}
 PRIOR_FAMILY_WEIGHTS = {
     "quality": 0.30,
     "value": 0.25,
@@ -65,17 +61,23 @@ def _bounded_weights(
     ):
         raise ValueError("infeasible family weight bounds")
     positive = {
-        family: max(float(signals.get(family, 0.0)), 0.0)
-        for family in FAMILIES
+        family: max(float(signals.get(family, 0.0)), 0.0) for family in FAMILIES
     }
     if sum(positive.values()) <= 0:
         positive = dict(PRIOR_FAMILY_WEIGHTS)
+    elif sum(value > 0 for value in positive.values()) * maximum_weight < 1.0 - 1e-12:
+        # 正信号过少时强行满足上限没有可行解；继续用分散结构先验，
+        # 等待更多因子获得成熟正证据。
+        positive = dict(PRIOR_FAMILY_WEIGHTS)
     low = 0.0
     high = 1.0
-    while sum(
-        min(max(high * positive[name], minimum_weight), maximum_weight)
-        for name in FAMILIES
-    ) < 1.0:
+    while (
+        sum(
+            min(max(high * positive[name], minimum_weight), maximum_weight)
+            for name in FAMILIES
+        )
+        < 1.0
+    ):
         high *= 2.0
     for _ in range(100):
         middle = (low + high) / 2.0
@@ -106,12 +108,12 @@ def estimate_ic_weights(
     *,
     as_of: date,
     half_life_periods: float = 12.0,
-    prior_strength: float = 24.0,
-    maximum_weight: float = 0.30,
-    minimum_weight: float = 0.08,
+    prior_strength: float = 12.0,
+    maximum_weight: float = 0.50,
+    minimum_weight: float = 0.0,
     minimum_periods: int = 12,
     previous_weights: dict[str, float] | None = None,
-    previous_weight_blend: float = 0.75,
+    previous_weight_blend: float = 0.50,
 ) -> IcWeightEstimate:
     """未来标签未成熟（label_available_at > as_of）的观察绝不参与。"""
     usable = sorted(
@@ -152,9 +154,7 @@ def estimate_ic_weights(
             sample_weights = [exp(-decay * age) for age, _value in samples]
             weighted_mean = sum(
                 weight * value
-                for weight, (_age, value) in zip(
-                    sample_weights, samples, strict=True
-                )
+                for weight, (_age, value) in zip(sample_weights, samples, strict=True)
             ) / sum(sample_weights)
             raw_ic[family] = weighted_mean
             effective_n = sum(sample_weights)
@@ -163,8 +163,7 @@ def estimate_ic_weights(
             weighted_mean = 0.0
             effective_n = 0.0
         shrunk[family] = (
-            effective_n * weighted_mean
-            + prior_strength * ROBUST_PRIOR_IC[family]
+            effective_n * weighted_mean + prior_strength * NEUTRAL_PRIOR_IC[family]
         ) / (effective_n + prior_strength)
     enough = all(count >= minimum_periods for count in counts.values())
     if not enough:
@@ -184,10 +183,7 @@ def estimate_ic_weights(
                 maximum_weight=maximum_weight,
             )
             weights = {
-                family: (
-                    blend * previous[family]
-                    + (1.0 - blend) * target[family]
-                )
+                family: (blend * previous[family] + (1.0 - blend) * target[family])
                 for family in FAMILIES
             }
             status = "trained_shrunk_turnover_penalized"

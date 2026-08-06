@@ -8,6 +8,7 @@ from app.services.factor_residual_model import (
     estimate_residual_model,
     leave_one_out_proxy,
 )
+from app.services.stock_factors import residual_momentum_from_returns
 
 
 def test_leave_one_out_proxy_is_unchanged_when_own_stock_changes() -> None:
@@ -30,10 +31,7 @@ def test_market_and_industry_model_saves_window_and_diagnostics() -> None:
         day: value * 0.5 + ((index % 5) - 2) / 2000
         for index, (day, value) in enumerate(market.items())
     }
-    stock = {
-        day: 0.0001 + 1.2 * market[day] + 0.8 * industry[day]
-        for day in market
-    }
+    stock = {day: 0.0001 + 1.2 * market[day] + 0.8 * industry[day] for day in market}
     result = estimate_residual_model(
         stock,
         market,
@@ -46,3 +44,12 @@ def test_market_and_industry_model_saves_window_and_diagnostics() -> None:
     assert result.r_squared == pytest.approx(1.0)
     assert result.window == 252
     assert result.observations == 100
+
+
+def test_residual_momentum_matures_from_252_returns_not_253_prices() -> None:
+    residuals = [0.001] * 252
+
+    value = residual_momentum_from_returns(residuals)
+
+    assert value == pytest.approx((1.001**231) - 1.0)
+    assert residual_momentum_from_returns(residuals[:-1]) is None
