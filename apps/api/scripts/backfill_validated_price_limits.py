@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
 import sys
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -33,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--evidence-output", type=Path, required=True)
+    parser.add_argument("--name-workers", type=int, default=4)
+    parser.add_argument("--name-timeout-seconds", type=int, default=90)
     return parser.parse_args()
 
 
@@ -42,17 +45,48 @@ def qualified_code(code: str) -> str:
     return f"{normalized}.{exchange}"
 
 
-def historical_names(code: str) -> list[str]:
-    import akshare as ak
+def historical_names(code: str, *, timeout_seconds: int) -> list[str]:
+    from app.services.execution_reference_sync import _akshare_calls
 
-    frame = ak.stock_info_change_name(symbol=code)
-    if frame.empty:
-        return []
-    if "name" not in frame:
-        raise RuntimeError(f"{code} 公开名称接口缺少 name 字段")
+    rows = _akshare_calls(
+        [("stock_info_change_name", {"symbol": code})],
+        timeout_seconds=timeout_seconds,
+    )
     return [
-        str(value).strip() for value in frame["name"].tolist() if str(value).strip()
+        str(row.get("name") or "").strip()
+        for row in rows
+        if str(row.get("name") or "").strip()
     ]
+
+
+def complete_leading_name_period(
+    periods: list[tuple[date, date | None, str]],
+    public_names: list[str],
+    required_start: date,
+) -> tuple[list[tuple[date, date | None, str]], str | None]:
+    """用公开名称有序序列补齐首个 Tushare 变更记录之前的名称。"""
+    if not periods or dated_name_as_of(periods, required_start) is not None:
+        return periods, None
+    earliest = min(periods, key=lambda item: item[0])
+    if required_start >= earliest[0]:
+        return periods, None
+    matching_indices = [
+        index
+        for index, name in enumerate(public_names)
+        if name == earliest[2]
+    ]
+    if not matching_indices or matching_indices[0] == 0:
+        return periods, None
+    predecessor = public_names[matching_indices[0] - 1]
+    completed = [
+        (
+            required_start,
+            earliest[0] - timedelta(days=1),
+            predecessor,
+        ),
+        *periods,
+    ]
+    return completed, predecessor
 
 
 def dated_name_periods(
@@ -128,15 +162,38 @@ def main() -> None:
         "partitions": [],
     }
     pending_outputs: list[tuple[Path, Path]] = []
-    for raw_code in args.codes.split(","):
-        code = raw_code.strip().split(".")[0].zfill(6)
-        if not code:
-            continue
+    codes = [
+        raw_code.strip().split(".")[0].zfill(6)
+        for raw_code in args.codes.split(",")
+        if raw_code.strip()
+    ]
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(args.name_workers, len(codes)))
+    ) as executor:
+        fetched_names = dict(
+            zip(
+                codes,
+                executor.map(
+                    lambda code: historical_names(
+                        code,
+                        timeout_seconds=args.name_timeout_seconds,
+                    ),
+                    codes,
+                ),
+                strict=True,
+            )
+        )
+    for code in codes:
         if not code.startswith(("00", "001", "002", "003", "6")):
             raise RuntimeError(f"{code} 不是本脚本允许的沪深主板证券")
-        names = historical_names(code)
+        names = fetched_names[code]
         ts_code = qualified_code(code)
         periods, name_sources, dated_name_mode = dated_name_periods(snapshot, ts_code)
+        periods, inferred_predecessor = complete_leading_name_period(
+            periods,
+            names,
+            start,
+        )
         dated_names = {name for _start, _end, name in periods}
         public_names = {name for name in names if name}
         if dated_name_mode == "tushare.namechange.dated" and not dated_names.issubset(
@@ -218,6 +275,7 @@ def main() -> None:
                     for period_start, period_end, name in periods
                 ],
                 "dated_name_mode": dated_name_mode,
+                "inferred_public_predecessor": inferred_predecessor,
                 "dated_name_sources": [
                     {
                         "path": str(source_path),
