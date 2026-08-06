@@ -25,15 +25,11 @@ def estimate_trade_cost_rates(
     """把佣金、税、价差、sqrt(订单/ADV) 冲击和最低佣金转为逐股成本率。"""
     linear: list[float] = []
     impact: list[float] = []
-    for price, adv, value in zip(
-        prices, adv_amounts, target_trade_values, strict=True
-    ):
+    for price, adv, value in zip(prices, adv_amounts, target_trade_values, strict=True):
         amount = abs(float(value))
         minimum_rate = minimum_commission / amount if amount > 0 else 0.0
         linear.append(
-            max(commission_rate, minimum_rate)
-            + stamp_tax_rate / 2.0
-            + half_spread_rate
+            max(commission_rate, minimum_rate) + stamp_tax_rate / 2.0 + half_spread_rate
         )
         participation = amount / max(float(adv), float(price), 1.0)
         impact.append(impact_coefficient * math.sqrt(max(participation, 0.0)))
@@ -103,7 +99,7 @@ def optimize_portfolio(
     cvar_confidence: float = 0.95,
     max_stock_weight: float = 0.05,
     max_industry_active_weight: float = 0.03,
-    max_style_active_exposure: float = 0.20,
+    max_style_active_exposure: float | Sequence[float] = 0.20,
     max_tracking_error: float = 0.12,
     max_annual_volatility: float = 0.20,
     max_turnover: float = 0.50,
@@ -117,8 +113,7 @@ def optimize_portfolio(
     """求解 long-only QP/SOCP，并保存目标分解、余量、状态和输入哈希。"""
     count = len(codes)
     if any(
-        len(values) != count
-        for values in (alpha, current_weights, benchmark_weights)
+        len(values) != count for values in (alpha, current_weights, benchmark_weights)
     ):
         raise ValueError("优化输入证券维度不一致")
     covariance = np.asarray(covariance, dtype=float)
@@ -131,14 +126,11 @@ def optimize_portfolio(
     covariance += np.eye(count) * max(1e-12, -minimum_eigenvalue)
     raw_alpha = np.asarray(alpha, dtype=float)
     uncertainty = np.asarray(
-        alpha_standard_errors
-        if alpha_standard_errors is not None
-        else np.zeros(count),
+        alpha_standard_errors if alpha_standard_errors is not None else np.zeros(count),
         dtype=float,
     )
     robust_alpha = 0.5 * (
-        raw_alpha
-        - alpha_uncertainty_penalty * np.maximum(uncertainty, 0.0)
+        raw_alpha - alpha_uncertainty_penalty * np.maximum(uncertainty, 0.0)
     )
     current = np.asarray(current_weights, dtype=float)
     benchmark = np.asarray(benchmark_weights, dtype=float)
@@ -200,8 +192,7 @@ def optimize_portfolio(
             [
                 excess_loss >= losses - threshold,
                 threshold
-                + cp.sum(excess_loss)
-                / ((1.0 - cvar_confidence) * scenarios.shape[0])
+                + cp.sum(excess_loss) / ((1.0 - cvar_confidence) * scenarios.shape[0])
                 <= max_cvar_loss,
             ]
         )
@@ -210,17 +201,14 @@ def optimize_portfolio(
         industry = np.asarray(industry_exposures, dtype=float)
         target = np.asarray(benchmark_industry_exposures, dtype=float)
         constraints.append(
-            cp.abs(industry.T @ weights - target)
-            <= max_industry_active_weight
+            cp.abs(industry.T @ weights - target) <= max_industry_active_weight
         )
         constraint_names.append("industry_active_weight")
     if style_exposures is not None:
         style = np.asarray(style_exposures, dtype=float)
         target = np.asarray(benchmark_style_exposures, dtype=float)
-        constraints.append(
-            cp.abs(style.T @ weights - target)
-            <= max_style_active_exposure
-        )
+        style_limit = np.asarray(max_style_active_exposure, dtype=float)
+        constraints.append(cp.abs(style.T @ weights - target) <= style_limit)
         constraint_names.append("style_active_exposure")
     problem = cp.Problem(objective, constraints)
     try:
@@ -269,9 +257,7 @@ def optimize_portfolio(
     solved_trades = solved - current
     components = {
         "robust_expected_return": float(robust_alpha @ solved),
-        "covariance_risk_penalty": float(
-            risk_aversion * solved @ covariance @ solved
-        ),
+        "covariance_risk_penalty": float(risk_aversion * solved @ covariance @ solved),
         "linear_cost": float(linear @ np.abs(solved_trades)),
         "impact_cost": float(impact @ np.square(solved_trades)),
         "turnover_penalty": float(turnover_penalty * np.abs(solved_trades).sum()),
@@ -290,9 +276,7 @@ def optimize_portfolio(
         "objective_components": components,
         "constraint_slacks": {
             name: np.asarray(constraint.violation()).tolist()
-            for name, constraint in zip(
-                constraint_names, constraints, strict=True
-            )
+            for name, constraint in zip(constraint_names, constraints, strict=True)
         },
         "dual_values": {
             name: (
@@ -300,9 +284,7 @@ def optimize_portfolio(
                 if constraint.dual_value is not None
                 else None
             )
-            for name, constraint in zip(
-                constraint_names, constraints, strict=True
-            )
+            for name, constraint in zip(constraint_names, constraints, strict=True)
         },
         "robust_alpha": dict(zip(codes, robust_alpha.tolist(), strict=True)),
         "alpha_uncertainty": dict(zip(codes, uncertainty.tolist(), strict=True)),

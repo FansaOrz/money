@@ -53,6 +53,7 @@ def _metrics(outcome: BacktestOutcome) -> dict[str, object]:
         if outcome.equity and outcome.equity[0] > 0
         else None
     )
+
     def sample_std(values: list[float]) -> float | None:
         if len(values) < 2:
             return None
@@ -65,24 +66,18 @@ def _metrics(outcome: BacktestOutcome) -> dict[str, object]:
         if len(curve) != len(outcome.calendar):
             raise BacktestError("比较基准曲线与策略交易日历未严格对齐")
         benchmark_return = (
-            curve[-1] / curve[0] - 1.0
-            if len(curve) >= 2 and curve[0] > 0
-            else None
+            curve[-1] / curve[0] - 1.0 if len(curve) >= 2 and curve[0] > 0 else None
         )
         benchmark_daily = [
             curve[index] / curve[index - 1] - 1.0
             for index in range(1, len(curve))
             if curve[index - 1] > 0
         ]
-        aligned = list(
-            zip(outcome.daily_returns, benchmark_daily, strict=False)
-        )
+        aligned = list(zip(outcome.daily_returns, benchmark_daily, strict=False))
         active = [strategy - benchmark for strategy, benchmark in aligned]
         active_std = sample_std(active)
         tracking_error = (
-            active_std * math.sqrt(252.0)
-            if active_std is not None
-            else None
+            active_std * math.sqrt(252.0) if active_std is not None else None
         )
         information_ratio = (
             fmean(active) / active_std * math.sqrt(252.0)
@@ -97,11 +92,13 @@ def _metrics(outcome: BacktestOutcome) -> dict[str, object]:
                 (item[1] - benchmark_mean) ** 2 for item in aligned
             )
             if benchmark_variance > 0:
-                beta = sum(
-                    (strategy - strategy_mean)
-                    * (benchmark - benchmark_mean)
-                    for strategy, benchmark in aligned
-                ) / benchmark_variance
+                beta = (
+                    sum(
+                        (strategy - strategy_mean) * (benchmark - benchmark_mean)
+                        for strategy, benchmark in aligned
+                    )
+                    / benchmark_variance
+                )
                 alpha = (strategy_mean - beta * benchmark_mean) * 252.0
 
         def capture(positive: bool) -> float | None:
@@ -112,12 +109,8 @@ def _metrics(outcome: BacktestOutcome) -> dict[str, object]:
             ]
             if not selected:
                 return None
-            strategy_period = (
-                math.prod(1.0 + item[0] for item in selected) - 1.0
-            )
-            benchmark_period = (
-                math.prod(1.0 + item[1] for item in selected) - 1.0
-            )
+            strategy_period = math.prod(1.0 + item[0] for item in selected) - 1.0
+            benchmark_period = math.prod(1.0 + item[1] for item in selected) - 1.0
             return (
                 strategy_period / benchmark_period
                 if abs(benchmark_period) > 1e-12
@@ -181,9 +174,7 @@ def _metrics(outcome: BacktestOutcome) -> dict[str, object]:
             outcome.calendar[-1].isoformat() if outcome.calendar else None
         ),
         "benchmark_curve_points": len(outcome.benchmark),
-        "strategy_curve_sha256": _curve_sha256(
-            outcome.calendar, outcome.equity
-        ),
+        "strategy_curve_sha256": _curve_sha256(outcome.calendar, outcome.equity),
         "sharpe": quant_stats.sharpe_ratio(outcome.daily_returns),
         "active_sharpe": primary["active_sharpe"],
         "information_ratio": primary["information_ratio"],
@@ -195,9 +186,7 @@ def _metrics(outcome: BacktestOutcome) -> dict[str, object]:
         "comparator_metrics": comparator_metrics,
         "max_drawdown": quant_stats.max_drawdown(outcome.equity),
         "turnover": outcome.avg_turnover,
-        "trade_count": sum(
-            len(rebalance.fills) for rebalance in outcome.rebalances
-        ),
+        "trade_count": sum(len(rebalance.fills) for rebalance in outcome.rebalances),
         "non_empty_target_count": sum(
             bool(rebalance.target) for rebalance in outcome.rebalances
         ),
@@ -211,17 +200,45 @@ def _metrics(outcome: BacktestOutcome) -> dict[str, object]:
         "trading_days": len(outcome.calendar),
         "rebalance_count": len(outcome.rebalances),
         "minimum_data_coverage": outcome.minimum_historical_coverage,
-        "execution_limit_data_coverage": (
-            outcome.execution_limit_data_coverage
-        ),
+        "execution_limit_data_coverage": (outcome.execution_limit_data_coverage),
     }
+
+
+def _assert_strategy_activity(
+    outcome: BacktestOutcome,
+    *,
+    stage: str,
+) -> None:
+    """正式验证不得把现金利息曲线误当作有效策略结果。"""
+    non_empty_targets = [
+        rebalance for rebalance in outcome.rebalances if rebalance.target
+    ]
+    trade_count = sum(len(rebalance.fills) for rebalance in outcome.rebalances)
+    if non_empty_targets and trade_count > 0 and outcome.avg_turnover > 0:
+        return
+    diagnostic = next(
+        (
+            {
+                "signal_date": rebalance.signal_date.isoformat(),
+                "selection_funnel": rebalance.diagnostics.get("selection_funnel"),
+                "warnings": rebalance.warnings[:5],
+            }
+            for rebalance in outcome.rebalances
+            if not rebalance.target or rebalance.warnings
+        ),
+        None,
+    )
+    raise BacktestError(
+        f"{stage}未产生可验证的真实策略活动："
+        f"非空目标期数={len(non_empty_targets)}、成交数={trade_count}、"
+        f"平均换手={outcome.avg_turnover:.6f}；"
+        f"首个诊断={json.dumps(diagnostic, ensure_ascii=False, default=str)}"
+    )
 
 
 def _stability(outcome: BacktestOutcome) -> dict[str, object]:
     annual: dict[str, list[float]] = {}
-    for day, value in zip(
-        outcome.calendar[1:], outcome.daily_returns, strict=False
-    ):
+    for day, value in zip(outcome.calendar[1:], outcome.daily_returns, strict=False):
         annual.setdefault(str(day.year), []).append(value)
     annual_metrics = {
         year: {
@@ -309,9 +326,7 @@ def planned_holdout_interval(
     end: date,
 ) -> tuple[date, date]:
     days = [
-        day
-        for day in repository.trade_calendar(start, end).days
-        if start <= day <= end
+        day for day in repository.trade_calendar(start, end).days if start <= day <= end
     ]
     _, _, holdout = _split_days(days)
     return holdout[0], holdout[-1]
@@ -376,6 +391,12 @@ def run_stock_walk_forward(
                     ),
                     repository=repository,
                 )
+                _assert_strategy_activity(
+                    outcome,
+                    stage=(
+                        f"训练走步折 {fold_start.isoformat()}~{fold_end.isoformat()}"
+                    ),
+                )
                 fold_metrics.append(_metrics(outcome))
             sharpes = [
                 float(item["sharpe"])
@@ -387,9 +408,8 @@ def run_stock_walk_forward(
                 for item in fold_metrics
                 if item["total_return"] is not None
             ]
-            score = (
-                (sum(sharpes) / len(sharpes) if sharpes else -10.0)
-                + (sum(returns) / len(returns) if returns else -10.0)
+            score = (sum(sharpes) / len(sharpes) if sharpes else -10.0) + (
+                sum(returns) / len(returns) if returns else -10.0
             )
             trials.append(
                 {
@@ -425,11 +445,13 @@ def run_stock_walk_forward(
         config=replace(selected, start=validation[0], end=validation[-1]),
         repository=repository,
     )
+    _assert_strategy_activity(validation_outcome, stage="验证集")
     # 留出集在参数冻结后只调用一次。
     holdout_outcome = run_backtest(
         config=replace(selected, start=holdout[0], end=holdout[-1]),
         repository=repository,
     )
+    _assert_strategy_activity(holdout_outcome, stage="留出集")
     validation_metrics = _metrics(validation_outcome)
     holdout_metrics = _metrics(holdout_outcome)
     from app.services.experiment_registry import (
@@ -438,8 +460,7 @@ def run_stock_walk_forward(
 
     trial_score_series = [
         [
-            float(fold.get("sharpe") or 0.0)
-            + float(fold.get("total_return") or 0.0)
+            float(fold.get("sharpe") or 0.0) + float(fold.get("total_return") or 0.0)
             for fold in trial["folds"]  # type: ignore[union-attr]
         ]
         for trial in trials
@@ -455,16 +476,12 @@ def run_stock_walk_forward(
             "effective_trial_count": effective_trials,
             "return_skewness": psr.skew if psr else None,
             "return_excess_kurtosis": psr.kurtosis if psr else None,
-            "probabilistic_sharpe_probability": (
-                psr.probability if psr else None
-            ),
+            "probabilistic_sharpe_probability": (psr.probability if psr else None),
             "minimum_track_record_length": (
                 psr.minimum_track_record_length if psr else None
             ),
             "deflated_sharpe_probability": dsr.dsr if dsr else None,
-            "expected_max_sharpe_under_trials": (
-                dsr.expected_max_sr if dsr else None
-            ),
+            "expected_max_sharpe_under_trials": (dsr.expected_max_sr if dsr else None),
         }
     )
     from app.services.quintile_evidence import quintile_evidence
@@ -475,9 +492,7 @@ def run_stock_walk_forward(
     )
     holdout_metrics.update(
         {
-            "quintile_monotonicity": quintile.get(
-                "quintile_monotonicity"
-            ),
+            "quintile_monotonicity": quintile.get("quintile_monotonicity"),
             "top_bottom_spread": quintile.get("top_bottom_spread"),
             "top_bottom_ci_lower": (
                 quintile["top_bottom_bootstrap_95_ci"][0]
@@ -491,9 +506,7 @@ def run_stock_walk_forward(
     from app.services.active_alpha_evidence import active_alpha_evidence
 
     holdout_benchmark_returns = [
-        holdout_outcome.benchmark[index]
-        / holdout_outcome.benchmark[index - 1]
-        - 1.0
+        holdout_outcome.benchmark[index] / holdout_outcome.benchmark[index - 1] - 1.0
         for index in range(1, len(holdout_outcome.benchmark))
         if holdout_outcome.benchmark[index - 1] > 0
     ]
@@ -502,14 +515,10 @@ def run_stock_walk_forward(
         holdout_benchmark_returns,
     )
     active_ci = active_alpha.get("active_block_bootstrap_95_ci")
-    regression_ci = active_alpha.get(
-        "regression_alpha_block_bootstrap_95_ci"
-    )
+    regression_ci = active_alpha.get("regression_alpha_block_bootstrap_95_ci")
     holdout_metrics.update(
         {
-            "active_return_newey_west_t": active_alpha.get(
-                "active_newey_west_t"
-            ),
+            "active_return_newey_west_t": active_alpha.get("active_newey_west_t"),
             "active_return_ci_lower": active_ci[0] if active_ci else None,
             "regression_alpha_ci_lower": (
                 regression_ci[0] * 252.0 if regression_ci else None
@@ -529,9 +538,7 @@ def run_stock_walk_forward(
     )
     holdout_metrics.update(
         {
-            "worst_year_excess_return": hard_stability.get(
-                "worst_year_excess_return"
-            ),
+            "worst_year_excess_return": hard_stability.get("worst_year_excess_return"),
             "worst_regime_excess_return": hard_stability.get(
                 "worst_regime_excess_return"
             ),
@@ -553,24 +560,18 @@ def run_stock_walk_forward(
             continue
         mean = fmean(series)
         std = math.sqrt(
-            sum((value - mean) ** 2 for value in series)
-            / (len(series) - 1)
+            sum((value - mean) ** 2 for value in series) / (len(series) - 1)
         )
-        statistic = (
-            mean / (std / math.sqrt(len(series))) if std > 0 else 0.0
-        )
+        statistic = mean / (std / math.sqrt(len(series))) if std > 0 else 0.0
         trial_pvalues[f"trial-{index}"] = 2.0 * (
-            1.0
-            - 0.5 * (1.0 + math.erf(abs(statistic) / math.sqrt(2.0)))
+            1.0 - 0.5 * (1.0 + math.erf(abs(statistic) / math.sqrt(2.0)))
         )
     ic_evidence = factor_ic_significance(
         holdout_outcome.factor_values_by_date,
         holdout_outcome.forward_returns,
         extra_attempt_pvalues=trial_pvalues,
     )
-    composite_ic = dict(
-        dict(ic_evidence.get("factors") or {}).get("composite") or {}
-    )
+    composite_ic = dict(dict(ic_evidence.get("factors") or {}).get("composite") or {})
     ci = composite_ic.get("block_bootstrap_95_ci")
     holdout_metrics.update(
         {
@@ -600,9 +601,7 @@ def run_stock_walk_forward(
             {
                 "dimension": "cost_1x",
                 "case": "formal_holdout_baseline",
-                "net_excess_return": holdout_metrics.get(
-                    "net_excess_return"
-                ),
+                "net_excess_return": holdout_metrics.get("net_excess_return"),
                 "source": "run_backtest",
             },
             *(robustness_scenario_results or []),
@@ -611,9 +610,7 @@ def run_stock_walk_forward(
     holdout_metrics.update(
         {
             "robustness_passed": robustness.get("passed"),
-            "robustness_neighbor_pass_rate": robustness.get(
-                "neighbor_pass_rate"
-            ),
+            "robustness_neighbor_pass_rate": robustness.get("neighbor_pass_rate"),
             "cost_2x_excess_return": next(
                 (
                     row.get("net_excess_return")
@@ -665,9 +662,7 @@ def run_stock_walk_forward(
         ],
         "trials": trials,
         "cscv_pbo": pbo,
-        "probability_backtest_overfitting": pbo.get(
-            "probability_backtest_overfitting"
-        ),
+        "probability_backtest_overfitting": pbo.get("probability_backtest_overfitting"),
         "best_params": best_params,
         "validation": validation_metrics,
         "holdout": holdout_metrics,
@@ -687,9 +682,7 @@ def run_stock_walk_forward(
                 validation_outcome.forward_returns,
             )
         ),
-        "adaptive_factor_weight_history": (
-            validation_outcome.factor_weight_history
-        ),
+        "adaptive_factor_weight_history": (validation_outcome.factor_weight_history),
         "frozen_adaptive_factor_weights": (
             dict(validation_outcome.factor_weight_history[-1]["weights"])
             if validation_outcome.factor_weight_history

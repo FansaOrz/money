@@ -561,6 +561,10 @@ def test_price_limit_blocks_and_defers() -> None:
     )
     detail = outcome.rebalances[0]
     assert detail.target  # 首期确有目标持仓
+    assert detail.diagnostics["selection_funnel"]["target_count"] == 1
+    assert detail.diagnostics["selection_funnel"]["executable_target_count"] == 1
+    assert detail.diagnostics["risk_covariance_shape"] == [1, 1]
+    assert "risk_covariance" not in detail.diagnostics
     # 首笔买入不在涨停的 T+1（顺延），且不晚于区间末日
     first_buy = next(fill for fill in detail.fills if fill.action == "buy")
     assert first_buy.fill_date > bars[301].trade_date
@@ -1737,6 +1741,60 @@ def test_historical_coverage_treats_suspension_as_known_not_missing() -> None:
     assert minimum == 1.0
     assert "近10日成交1" in summaries[0]
     assert "近10日估值1" in summaries[0]
+
+
+def test_unusable_primary_fundamental_does_not_hide_fallback(
+    monkeypatch,
+    db_session,
+) -> None:
+    """三表主源不完整时，同期可用回退 ROE 必须继续进入 PIT 因子上下文。"""
+    from app.models import StockFinancialIndicator
+    from app.services.stock_repository import SqlStockRepository
+
+    report_date = date(2024, 12, 31)
+    db_session.add(
+        StockFinancialIndicator(
+            code="600001",
+            report_date=report_date,
+            roe=12.0,
+            payload="{}",
+            source="eastmoney",
+            available_at=date(2025, 3, 31),
+        )
+    )
+    db_session.commit()
+    unusable_primary = Fundamentals(
+        code="600001",
+        available_at=date(2025, 3, 31),
+        period=report_date,
+        roe=0.15,
+        formal_factor_usable=False,
+        financial_quality_reasons=("资产负债表关键勾稽字段缺失",),
+    )
+    repository = SqlStockRepository(db_session)
+    monkeypatch.setattr(
+        repository,
+        "_fundamentals_from_tushare",
+        lambda _codes, _as_of: [unusable_primary],
+    )
+    monkeypatch.setattr(
+        repository,
+        "_financial_sector_metrics",
+        lambda _codes, _as_of: {},
+    )
+
+    snapshots = repository.fundamentals(["600001"], as_of=date(2025, 4, 1))
+    fallback = next(
+        item
+        for item in snapshots
+        if item.period == report_date and item.formal_factor_usable
+    )
+
+    assert fallback.roe == pytest.approx(0.12)
+    assert any(
+        "保留同期回退财务指标" in item for item in fallback.financial_quality_reasons
+    )
+    assert unusable_primary in snapshots
 
 
 def test_run_backtest_no_repository() -> None:

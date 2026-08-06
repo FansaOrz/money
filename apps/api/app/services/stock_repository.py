@@ -580,9 +580,7 @@ def coerce_fundamentals(obj: object) -> Fundamentals | None:
             if _attr(obj, "company_type", "comp_type") is not None
             else None
         ),
-        bank_net_interest_margin=_to_float(
-            _attr(obj, "bank_net_interest_margin")
-        ),
+        bank_net_interest_margin=_to_float(_attr(obj, "bank_net_interest_margin")),
         bank_npl_ratio=_to_float(_attr(obj, "bank_npl_ratio")),
         bank_provision_coverage_ratio=_to_float(
             _attr(obj, "bank_provision_coverage_ratio")
@@ -590,22 +588,14 @@ def coerce_fundamentals(obj: object) -> Fundamentals | None:
         bank_capital_adequacy_ratio=_to_float(
             _attr(obj, "bank_capital_adequacy_ratio")
         ),
-        bank_loan_deposit_ratio=_to_float(
-            _attr(obj, "bank_loan_deposit_ratio")
-        ),
+        bank_loan_deposit_ratio=_to_float(_attr(obj, "bank_loan_deposit_ratio")),
         broker_proprietary_risk_ratio=_to_float(
             _attr(obj, "broker_proprietary_risk_ratio")
         ),
         broker_leverage_ratio=_to_float(_attr(obj, "broker_leverage_ratio")),
-        broker_net_capital_ratio=_to_float(
-            _attr(obj, "broker_net_capital_ratio")
-        ),
-        insurance_solvency_ratio=_to_float(
-            _attr(obj, "insurance_solvency_ratio")
-        ),
-        insurance_combined_ratio=_to_float(
-            _attr(obj, "insurance_combined_ratio")
-        ),
+        broker_net_capital_ratio=_to_float(_attr(obj, "broker_net_capital_ratio")),
+        insurance_solvency_ratio=_to_float(_attr(obj, "insurance_solvency_ratio")),
+        insurance_combined_ratio=_to_float(_attr(obj, "insurance_combined_ratio")),
         insurance_reserve_coverage_ratio=_to_float(
             _attr(obj, "insurance_reserve_coverage_ratio")
         ),
@@ -2136,8 +2126,7 @@ class SqlStockRepository:
             day: {} for day in requested_dates
         }
         dividend_coverage = {
-            code: self._stocktoday_file("dividend", code) is not None
-            for code in codes
+            code: self._stocktoday_file("dividend", code) is not None for code in codes
         }
         from app.services.dividend_yield import (
             calculate_trailing_dividend_yield,
@@ -2169,9 +2158,7 @@ class SqlStockRepository:
                 self._db,  # type: ignore[arg-type]
                 codes=codes,
                 as_of=requested_dates[-1],
-                lookback_days=(
-                    365 + (requested_dates[-1] - requested_dates[0]).days
-                ),
+                lookback_days=(365 + (requested_dates[-1] - requested_dates[0]).days),
             )
         except Exception:  # noqa: BLE001
             logger.warning("读取规范化分红主数据失败", exc_info=True)
@@ -2218,9 +2205,7 @@ class SqlStockRepository:
                     else None
                 )
                 float_market_cap = (
-                    market_cap_to_cny(raw["circ_mv"])
-                    if "circ_mv" in raw
-                    else None
+                    market_cap_to_cny(raw["circ_mv"]) if "circ_mv" in raw else None
                 )
                 sales_yield = (
                     1.0 / raw["ps_ttm"]
@@ -2236,10 +2221,7 @@ class SqlStockRepository:
                 )
                 dividend_yield = dividend_result.value
                 # 规范化事件不可用时保留供应商直接计算值，但明确标记回退。
-                if (
-                    dividend_yield is None
-                    and raw.get("dv_ttm") is not None
-                ):
+                if dividend_yield is None and raw.get("dv_ttm") is not None:
                     dividend_yield = raw["dv_ttm"] / 100.0
                     dividend_status = "provider_fallback"
                     dividend_reason = "规范化事件或价格缺失，回退 daily_basic.dv_ttm"
@@ -2375,10 +2357,15 @@ class SqlStockRepository:
             )
             for snapshot in primary
         ]
-        primary_periods = {
+        usable_primary_periods = {
             (snapshot.code, snapshot.period)
             for snapshot in primary
-            if snapshot.period is not None
+            if snapshot.period is not None and snapshot.formal_factor_usable
+        }
+        unusable_primary_periods = {
+            (snapshot.code, snapshot.period)
+            for snapshot in primary
+            if snapshot.period is not None and not snapshot.formal_factor_usable
         }
         fallback_by_period = {
             (snapshot.code, snapshot.period): snapshot
@@ -2404,9 +2391,19 @@ class SqlStockRepository:
                 mismatch_counts,
             )
         result = [
-            snapshot
+            (
+                replace(
+                    snapshot,
+                    financial_quality_reasons=(
+                        snapshot.financial_quality_reasons
+                        + ("Tushare主源质量门禁未通过，保留同期回退财务指标",)
+                    ),
+                )
+                if (snapshot.code, snapshot.period) in unusable_primary_periods
+                else snapshot
+            )
             for snapshot in result
-            if (snapshot.code, snapshot.period) not in primary_periods
+            if (snapshot.code, snapshot.period) not in usable_primary_periods
         ]
         result.extend(primary)
         result.sort(key=lambda snapshot: (snapshot.code, snapshot.available_at))
@@ -2440,9 +2437,7 @@ class SqlStockRepository:
             QuantDataRecord.code.in_(codes),
         )
         rows = self._db.scalars(statement).all()  # type: ignore[attr-defined]
-        latest: dict[
-            tuple[str, date], tuple[datetime, int, dict[str, object]]
-        ] = {}
+        latest: dict[tuple[str, date], tuple[datetime, int, dict[str, object]]] = {}
         for row in rows:
             available = row.available_at
             available_day = (
@@ -2568,9 +2563,7 @@ class SqlStockRepository:
                         latest[period] = (available, row)
                 for period, (available, row) in latest.items():
                     combined = by_period.setdefault(period, {})
-                    statement_rows = combined.setdefault(
-                        "_statement_rows", {}
-                    )
+                    statement_rows = combined.setdefault("_statement_rows", {})
                     statement_rows[dataset] = dict(row)  # type: ignore[index]
                     combined.update(row)
                     available_by_period.setdefault(period, []).append(available)

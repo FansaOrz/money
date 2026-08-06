@@ -997,10 +997,18 @@ def test_stock_walk_forward_has_embargo_and_holdout_once(monkeypatch) -> None:
             daily_returns=returns,
             benchmark=[1.0] * len(curve_days),
             benchmark_kind="equal_weight",
-            rebalances=[],
+            rebalances=[
+                stock_backtest.RebalanceDetail(
+                    signal_date=curve_days[0],
+                    target={"600001": 1.0},
+                    fills=[object()],
+                    turnover=0.5,
+                    cash_weight=0.0,
+                )
+            ],
             final_value=equity[-1],
             total_fees=0.0,
-            avg_turnover=0.0,
+            avg_turnover=0.5,
             forward_returns=[],
             scores_by_date=[],
             benchmarks={
@@ -1062,3 +1070,58 @@ def test_stock_walk_forward_has_embargo_and_holdout_once(monkeypatch) -> None:
         == 1
     )
     assert not any(initial for _start, _end, initial in calls)
+
+
+def test_stock_walk_forward_rejects_cash_only_fold(monkeypatch) -> None:
+    start = datetime(2020, 1, 1, tzinfo=UTC).date()
+    days = tuple(start + timedelta(days=index) for index in range(1000))
+
+    class Repository:
+        def trade_calendar(self, _start, _end):
+            return TradeCalendar(days)
+
+    def fake_cash_only(*, config, repository):
+        del repository
+        curve_days = [day for day in days if config.start <= day <= config.end]
+        return BacktestOutcome(
+            calendar=curve_days,
+            equity=[1_000_000.0] * len(curve_days),
+            daily_returns=[0.0] * max(len(curve_days) - 1, 0),
+            benchmark=[1.0] * len(curve_days),
+            benchmark_kind="equal_weight",
+            rebalances=[
+                stock_backtest.RebalanceDetail(
+                    signal_date=curve_days[0],
+                    target={},
+                    warnings=["因子覆盖不足，本期持有现金"],
+                    diagnostics={
+                        "selection_funnel": {
+                            "factor_eligible_count": 0,
+                            "target_count": 0,
+                        }
+                    },
+                )
+            ],
+            final_value=1_000_000.0,
+            total_fees=0.0,
+            avg_turnover=0.0,
+            forward_returns=[],
+            scores_by_date=[],
+        )
+
+    monkeypatch.setattr(stock_validation, "run_backtest", fake_cash_only)
+    with pytest.raises(
+        stock_backtest.BacktestError,
+        match="未产生可验证的真实策略活动",
+    ):
+        stock_validation.run_stock_walk_forward(
+            Repository(),
+            BacktestConfig(
+                start=days[0],
+                end=days[-1],
+                candidate_codes=("600001",),
+            ),
+            [30],
+            [0.05],
+            embargo_days=21,
+        )

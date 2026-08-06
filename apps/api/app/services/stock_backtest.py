@@ -32,6 +32,7 @@ import logging
 import math
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -244,9 +245,9 @@ class BacktestOutcome:
     total_cash_interest: float = 0.0
     cash_ledgers: list[dict[str, object]] = field(default_factory=list)
     total_dividend_tax: float = 0.0
-    factor_values_by_date: list[
-        tuple[date, dict[str, dict[str, float | None]]]
-    ] = field(default_factory=list)
+    factor_values_by_date: list[tuple[date, dict[str, dict[str, float | None]]]] = (
+        field(default_factory=list)
+    )
     factor_weight_history: list[dict[str, object]] = field(default_factory=list)
 
 
@@ -814,14 +815,10 @@ def run_backtest_panel(
     cash_ledgers: list[dict[str, object]] = []
     forward_returns: list[tuple[date, dict[str, float]]] = []
     scores_by_date: list[tuple[date, dict[str, float]]] = []
-    factor_values_by_date: list[
-        tuple[date, dict[str, dict[str, float | None]]]
-    ] = []
+    factor_values_by_date: list[tuple[date, dict[str, dict[str, float | None]]]] = []
     factor_weight_history: list[dict[str, object]] = []
     ic_training_observations: list[object] = []
-    last_family_signal: tuple[
-        date, dict[str, dict[str, float | None]]
-    ] | None = None
+    last_family_signal: tuple[date, dict[str, dict[str, float | None]]] | None = None
     groups_by_date: list[tuple[date, dict[str, tuple[str, str]]]] = []
     warnings: list[str] = list(panel.data_warnings)
     last_signal_info: tuple[date, dict[str, float], dict[str, float]] | None = None
@@ -1326,9 +1323,8 @@ def run_backtest_panel(
                     )
                 )
             effective_factor_weights = config.factor_weights
-            if (
-                effective_factor_weights is None
-                and (config.adaptive_ic_weights or config.benchmark_required)
+            if effective_factor_weights is None and (
+                config.adaptive_ic_weights or config.benchmark_required
             ):
                 weight_estimate = estimate_ic_weights(
                     ic_training_observations,  # type: ignore[arg-type]
@@ -1341,9 +1337,7 @@ def run_backtest_panel(
                         "weights": dict(weight_estimate.weights),
                         "raw_ic": dict(weight_estimate.raw_ic),
                         "shrunk_ic": dict(weight_estimate.shrunk_ic),
-                        "observation_counts": dict(
-                            weight_estimate.observation_counts
-                        ),
+                        "observation_counts": dict(weight_estimate.observation_counts),
                         "training_start": (
                             weight_estimate.training_start.isoformat()
                             if weight_estimate.training_start
@@ -1435,9 +1429,7 @@ def run_backtest_panel(
                     prices=decision_prices,
                     portfolio_value=signal_value,
                     lot_sizes={
-                        code: trading_rules.quantity_rule(
-                            code, day
-                        ).buy_increment
+                        code: trading_rules.quantity_rule(code, day).buy_increment
                         for code in plan.target_weights
                     },
                     max_stock_weight=config.max_stock_weight,
@@ -1446,10 +1438,36 @@ def run_backtest_panel(
                 if discrete["passed"] is True:
                     executable_target = dict(discrete["actual_weights"])
                 else:
-                    plan.warnings.append(
-                        "整手离散后违反硬约束，本期拒绝生成下单目标"
-                    )
+                    plan.warnings.append("整手离散后违反硬约束，本期拒绝生成下单目标")
                     executable_target = {}
+            plan.diagnostics["selection_funnel"] = {
+                "signal_stock_count": len(signal_infos),
+                "universe_passed_count": len(universe),
+                "universe_excluded_count": len(signal_infos) - len(universe),
+                "history_eligible_count": len(contexts),
+                "scored_count": len(scored),
+                "factor_eligible_count": sum(item.eligible for item in scored),
+                "target_count": len(plan.target_weights),
+                "executable_target_count": len(executable_target),
+            }
+            plan.diagnostics["universe_exclusion_reasons"] = dict(
+                Counter(
+                    reason
+                    for item in filters
+                    if not item.passed
+                    for reason in item.reasons
+                ).most_common()
+            )
+            plan.diagnostics["factor_family_available_counts"] = {
+                family: sum(getattr(item, family) is not None for item in scored)
+                for family in (
+                    "quality",
+                    "value",
+                    "momentum",
+                    "trend",
+                    "lowvol",
+                )
+            }
             detail = RebalanceDetail(
                 signal_date=day,
                 target=dict(plan.target_weights),
@@ -1517,17 +1535,14 @@ def run_backtest_panel(
             last_family_signal = (
                 day,
                 {
-                    family: {
-                        item.code: getattr(item, family)
-                        for item in scored
-                    }
+                    family: {item.code: getattr(item, family) for item in scored}
                     for family in (
                         "quality",
                         "value",
                         "momentum",
                         "trend",
-                                    "lowvol",
-                                    "composite",
+                        "lowvol",
+                        "composite",
                     )
                 },
             )
@@ -2464,25 +2479,19 @@ def _return_attribution(
             max(1.0 - sum(detail.target.values()), 0.0) * universe_return
         )
         actual_period_return = sum(
-            weight * returns.get(code, 0.0)
-            for code, weight in detail.target.items()
+            weight * returns.get(code, 0.0) for code, weight in detail.target.items()
         )
-        row["residual_unexplained"] = actual_period_return - sum(
-            row.values()
-        )
+        row["residual_unexplained"] = actual_period_return - sum(row.values())
         period_rows.append(row)
     if period_rows and initial_capital > 0:
         for row in period_rows:
             row["fees"] = -total_fees / initial_capital / len(period_rows)
-            row["slippage"] = (
-                -total_slippage_cost / initial_capital / len(period_rows)
-            )
+            row["slippage"] = -total_slippage_cost / initial_capital / len(period_rows)
     from app.services.performance_attribution import geometric_link
 
     linked = geometric_link(period_rows)
     return {
-        key: float(value)
-        for key, value in dict(linked["linked_contributions"]).items()
+        key: float(value) for key, value in dict(linked["linked_contributions"]).items()
     }
 
 
@@ -2979,9 +2988,7 @@ def load_fundamentals_by_code(
                     monthrange(history_year, history_month)[1],
                 )
             )
-        snapshots.extend(
-            valuation_fn(list(codes or []), tuple(sorted(history_days)))
-        )
+        snapshots.extend(valuation_fn(list(codes or []), tuple(sorted(history_days))))
     grouped: dict[str, list[Fundamentals]] = {}
     for snapshot in snapshots:
         grouped.setdefault(snapshot.code, []).append(snapshot)
@@ -3102,9 +3109,7 @@ def persist_historical_readiness(
                 code: snapshot.isoformat()
                 for code, snapshot in sorted(
                     (
-                        memberships[day].snapshot_dates
-                        if day in memberships
-                        else {}
+                        memberships[day].snapshot_dates if day in memberships else {}
                     ).items()
                 )
             }
@@ -3134,9 +3139,7 @@ def persist_historical_readiness(
                 for bar in panel.bars_by_code.get(code, [])
                 if recent_cutoff <= bar.trade_date <= day
             ]
-            latest_bar = max(
-                recent_bars, key=lambda bar: bar.trade_date, default=None
-            )
+            latest_bar = max(recent_bars, key=lambda bar: bar.trade_date, default=None)
             snapshots = [
                 item
                 for item in fundamentals_by_code.get(code, [])
@@ -3145,16 +3148,13 @@ def persist_historical_readiness(
             latest_fundamental = max(
                 snapshots, key=lambda item: item.available_at, default=None
             )
-            financial_ready = (
-                latest_fundamental is not None
-                and any(
-                    value is not None
-                    for value in (
-                        latest_fundamental.roe,
-                        latest_fundamental.gross_margin,
-                        latest_fundamental.ocf_to_profit,
-                        latest_fundamental.debt_ratio,
-                    )
+            financial_ready = latest_fundamental is not None and any(
+                value is not None
+                for value in (
+                    latest_fundamental.roe,
+                    latest_fundamental.gross_margin,
+                    latest_fundamental.ocf_to_profit,
+                    latest_fundamental.debt_ratio,
                 )
             )
             valuation_ready = (
@@ -3171,11 +3171,7 @@ def persist_historical_readiness(
             industry = (
                 industry_map.get(code)
                 if panel.industry_by_date
-                else (
-                    info_by_code[code].industry
-                    if code in info_by_code
-                    else None
-                )
+                else (info_by_code[code].industry if code in info_by_code else None)
             )
             gates = {
                 "daily_same_period": latest_bar is not None,
@@ -3183,11 +3179,7 @@ def persist_historical_readiness(
                 "financial_pit": financial_ready,
                 "valuation_pit": valuation_ready,
             }
-            blocked = [
-                label
-                for label, passed in gates.items()
-                if not passed
-            ]
+            blocked = [label for label, passed in gates.items() if not passed]
             rows[code] = {
                 **gates,
                 "source_status": {
@@ -3236,9 +3228,7 @@ def persist_historical_readiness(
                             and latest_bar.down_limit is not None
                         ),
                         "suspended": (
-                            latest_bar.suspended
-                            if latest_bar is not None
-                            else None
+                            latest_bar.suspended if latest_bar is not None else None
                         ),
                     },
                     "degraded": False,
