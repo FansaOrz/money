@@ -108,6 +108,11 @@ MINIMUM_HOLDINGS = 20
 MAX_ANNUAL_VOLATILITY = 0.25
 MAX_TRACKING_ERROR = 0.15
 REQUIRE_PREVALIDATION = True
+FROZEN_RUNTIME_PATHS = (
+    "apps/api/app",
+    "apps/api/pyproject.toml",
+    "apps/api/requirements.lock",
+)
 ORDER_POLICY = order_lifecycle.OrderLifecyclePolicy()
 COST = stock_backtest.CostModel(
     commission_rate=0.00025,
@@ -510,6 +515,49 @@ def _ready_candidate_codes(db: Session, latest: date) -> list[str]:
     return sorted(set(universe) & daily & industries)
 
 
+def _assert_frozen_runtime_source(version: StrategyVersion) -> None:
+    """每次推进旧账户前确认运行源码仍等于版本冻结提交。"""
+    frozen_sha = str(dict(version.params or {}).get("git_sha") or "")
+    if len(frozen_sha) not in {40, 64} or any(
+        character not in "0123456789abcdef" for character in frozen_sha.lower()
+    ):
+        raise StockPaperError("活动策略版本缺少有效的冻结代码提交，拒绝运行")
+    repository_root = Path(__file__).resolve().parents[4]
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--quiet", frozen_sha, "--", *FROZEN_RUNTIME_PATHS],
+            cwd=repository_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        status = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                *FROZEN_RUNTIME_PATHS,
+            ],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise StockPaperError("无法验证活动版本冻结源码，拒绝运行") from exc
+    if diff.returncode not in {0, 1}:
+        raise StockPaperError("冻结提交不可读取或源码比较失败，拒绝运行")
+    if diff.returncode == 1 or status.stdout.strip():
+        raise StockPaperError(
+            f"当前运行源码与策略版本 {version.id} 冻结提交 {frozen_sha[:12]} "
+            "不一致；必须退役旧版本并创建全新运行影子"
+        )
+
+
 def ensure_research_strategy_version(db: Session) -> StrategyVersion:
     """创建不依赖当前行情 readiness 的版本11研究记录。"""
     version = db.scalar(
@@ -614,6 +662,7 @@ def _ensure_account(
                 raise StockPaperError(
                     f"策略版本状态为 {version.status}，不是可运行的前向模拟状态"
                 )
+            _assert_frozen_runtime_source(version)
             return account, version
 
     readiness = get_readiness(db)

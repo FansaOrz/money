@@ -1,7 +1,10 @@
 """A股规则策略前向模拟：就绪门槛、T+1、幂等和账本闭环。"""
 
+import subprocess
 from datetime import UTC, date, datetime, time, timedelta
+from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -241,6 +244,33 @@ def test_operational_shadow_is_preferred_as_active_forward_version(
     assert stock_paper._active_forward_version(db_session).id == shadow.id
 
 
+def test_frozen_runtime_source_gate_accepts_clean_and_blocks_changes(
+    monkeypatch,
+) -> None:
+    version = SimpleNamespace(id=15, params={"git_sha": "a" * 40})
+    calls: list[list[str]] = []
+
+    def clean_run(command, **_kwargs):  # noqa: ANN001
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(stock_paper.subprocess, "run", clean_run)
+    stock_paper._assert_frozen_runtime_source(version)
+    assert calls[0][-3:] == list(stock_paper.FROZEN_RUNTIME_PATHS)
+
+    def changed_run(command, **_kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(
+            command,
+            1 if command[1] == "diff" else 0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(stock_paper.subprocess, "run", changed_run)
+    with pytest.raises(stock_paper.StockPaperError, match="冻结提交"):
+        stock_paper._assert_frozen_runtime_source(version)
+
+
 def _seed_trial(db: Session) -> tuple[ForwardRepository, date]:
     first_day = date(2025, 1, 1)
     signal_day = first_day + timedelta(days=299)
@@ -356,6 +386,7 @@ def test_forward_cycle_generates_then_executes_t_plus_one(
     repository, signal_day = _seed_trial(db_session)
     monkeypatch.setattr(stock_paper, "EXPECTED_UNIVERSE_COUNT", 50)
     monkeypatch.setattr(stock_paper, "REQUIRE_PREVALIDATION", False)
+    monkeypatch.setattr(stock_paper, "_assert_frozen_runtime_source", lambda _v: None)
     monkeypatch.setattr(stock_paper, "load_repository", lambda _db: repository)
     monkeypatch.setattr(
         stock_paper,
