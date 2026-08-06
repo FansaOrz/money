@@ -131,6 +131,7 @@ def _final_status(updated: int, failed: int, processed: int | None = None) -> st
 # 同步状态记录
 # ---------------------------------------------------------------------------
 
+
 def _begin_task(db: Session, task: str) -> StockSyncState:
     state = db.get(StockSyncState, task)
     if state is None:
@@ -200,12 +201,15 @@ def _progress_task(
 # master
 # ---------------------------------------------------------------------------
 
+
 def sync_stock_master(db: Session) -> dict[str, Any]:
     """同步 A 股代码/名称主表（全量 upsert）。网络失败时返回 errors，不抛异常。"""
     state = _begin_task(db, "master")
     frame = ak_fetch.fetch_stock_code_name()
     if frame is None:
-        _finish_task(db, state, status="failed", detail="数据源不可用（网络或接口异常）")
+        _finish_task(
+            db, state, status="failed", detail="数据源不可用（网络或接口异常）"
+        )
         return {
             "task": "master",
             "status": "failed",
@@ -232,12 +236,19 @@ def sync_stock_master(db: Session) -> dict[str, Any]:
             updated += 1
     db.commit()
     _finish_task(db, state, total=len(seen), updated=updated)
-    return {"task": "master", "status": "success", "total": len(seen), "updated": updated, "errors": []}
+    return {
+        "task": "master",
+        "status": "success",
+        "total": len(seen),
+        "updated": updated,
+        "errors": [],
+    }
 
 
 # ---------------------------------------------------------------------------
 # 日线
 # ---------------------------------------------------------------------------
+
 
 def parse_sina_daily_frame(code: str, frame: pd.DataFrame) -> pd.DataFrame:
     """把新浪日线 DataFrame 归一化为标准列。
@@ -268,8 +279,16 @@ def parse_sina_daily_frame(code: str, frame: pd.DataFrame) -> pd.DataFrame:
     if not records:
         return pd.DataFrame(
             columns=[
-                "code", "trade_date", "open", "high", "low", "close",
-                "volume", "amount", "outstanding_share", "turnover",
+                "code",
+                "trade_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                "outstanding_share",
+                "turnover",
             ]
         )
     return pd.DataFrame.from_records(records)
@@ -303,12 +322,16 @@ def parse_eastmoney_daily_frame(code: str, frame: pd.DataFrame) -> pd.DataFrame:
             {
                 "code": code,
                 "trade_date": trade_date,
-                "open": open_price if open_price is not None else _to_float(row.get("open")),
+                "open": open_price
+                if open_price is not None
+                else _to_float(row.get("open")),
                 "high": high if high is not None else _to_float(row.get("high")),
                 "low": low if low is not None else _to_float(row.get("low")),
                 "close": close,
                 "volume": int(volume_lots * 100) if volume_lots is not None else None,
-                "amount": amount if amount is not None else _to_float(row.get("amount")),
+                "amount": amount
+                if amount is not None
+                else _to_float(row.get("amount")),
                 "outstanding_share": None,
                 "turnover": turnover
                 if turnover is not None
@@ -441,7 +464,11 @@ def _sync_one_daily(
             if not qfq_frame.empty:
                 # 前复权价会随除权整体变化，整表覆盖
                 parquet_store.write_daily(
-                    code, qfq_frame, layer=parquet_store.DAILY_QFQ, root=root, incremental=False
+                    code,
+                    qfq_frame,
+                    layer=parquet_store.DAILY_QFQ,
+                    root=root,
+                    incremental=False,
                 )
 
     bar = db.get(StockDailyBar, code)
@@ -481,10 +508,9 @@ def _select_daily_batch(
     resume_after 为上次中断的代码（严格大于它的才入选），此时只处理游标
     之后且“无断点或有错误”的股票，已干净同步的不重复抓。
     """
-    stmt = (
-        select(StockMaster.code, StockDailyBar.available_at, StockDailyBar.last_error)
-        .outerjoin(StockDailyBar, StockDailyBar.code == StockMaster.code)
-    )
+    stmt = select(
+        StockMaster.code, StockDailyBar.available_at, StockDailyBar.last_error
+    ).outerjoin(StockDailyBar, StockDailyBar.code == StockMaster.code)
     rows = db.execute(stmt).all()
     excluded = exclude or set()
 
@@ -545,7 +571,11 @@ def sync_stock_daily(
     previous_status = previous.status if previous is not None else None
     state = _begin_task(db, "daily")
     if codes is None:
-        batch_size = limit if limit is not None and limit > 0 else get_settings().research_sync_batch_size
+        batch_size = (
+            limit
+            if limit is not None and limit > 0
+            else get_settings().research_sync_batch_size
+        )
         resume_after = (
             previous_last_code
             if resume
@@ -574,7 +604,12 @@ def sync_stock_daily(
         last_code = code
         try:
             ok, error = _sync_one_daily(
-                db, code, root=root, start_date=start_date, fetch_raw=True, fetch_qfq=fetch_qfq
+                db,
+                code,
+                root=root,
+                start_date=start_date,
+                fetch_raw=True,
+                fetch_qfq=fetch_qfq,
             )
         except Exception as exc:  # 防御：单只异常不影响其余
             logger.exception("同步 %s 日线异常", code)
@@ -591,16 +626,26 @@ def sync_stock_daily(
             errors.append(f"{code}: {error}")
         db.commit()
         _progress_task(
-            db, state, processed=idx, total=total_batch,
-            updated=updated, failed=failed, last_code=code,
+            db,
+            state,
+            processed=idx,
+            total=total_batch,
+            updated=updated,
+            failed=failed,
+            last_code=code,
         )
 
     status = _final_status(updated, failed, processed=total_batch)
     _finish_task(
-        db, state, total=total_batch, updated=updated, failed=failed,
+        db,
+        state,
+        total=total_batch,
+        updated=updated,
+        failed=failed,
         last_code=None if wrapped else last_code,
         clear_last_code=wrapped,
-        detail="; ".join(errors[:20]) or None, status=status,
+        detail="; ".join(errors[:20]) or None,
+        status=status,
     )
     return {
         "task": "daily",
@@ -671,28 +716,6 @@ def sync_stock_market_close(
         # 显式日期只用于研究重放和测试，调用方对日期负责。
         day = trade_date
 
-    frame = ak_fetch.fetch_stock_spot_eastmoney()
-    spot_source = "eastmoney_spot"
-    volume_multiplier = 100
-    if frame is None:
-        frame = ak_fetch.fetch_stock_spot_sina()
-        spot_source = "sina_spot"
-        volume_multiplier = 1
-    if frame is None:
-        _finish_task(
-            db,
-            state,
-            status="failed",
-            detail="东方财富与新浪全市场收盘快照均不可用",
-        )
-        return {
-            "task": "market_close",
-            "status": "failed",
-            "total": 0,
-            "updated": 0,
-            "failed": 1,
-            "errors": ["stock_zh_a_spot_em 与 stock_zh_a_spot 均不可用"],
-        }
     # 前向平台默认只需沪深300+中证500；若尚未同步指数成分才退回全市场。
     tracked_codes = set(
         db.scalars(
@@ -702,6 +725,35 @@ def sync_stock_market_close(
         ).all()
     )
     master_codes = tracked_codes or set(db.scalars(select(StockMaster.code)).all())
+
+    frame = ak_fetch.fetch_stock_spot_eastmoney()
+    spot_source = "eastmoney_spot"
+    volume_multiplier = 100
+    if frame is None:
+        frame = ak_fetch.fetch_stock_spot_sina()
+        spot_source = "sina_spot"
+        volume_multiplier = 1
+    if frame is None:
+        frame = ak_fetch.fetch_stock_spot_tencent_quotes(
+            [sina_symbol(code) for code in sorted(master_codes)]
+        )
+        spot_source = "tencent_quote"
+        volume_multiplier = 100
+    if frame is None:
+        _finish_task(
+            db,
+            state,
+            status="failed",
+            detail="东方财富、新浪与腾讯收盘快照均不可用",
+        )
+        return {
+            "task": "market_close",
+            "status": "failed",
+            "total": 0,
+            "updated": 0,
+            "failed": 1,
+            "errors": ["stock_zh_a_spot_em、stock_zh_a_spot 与腾讯批量报价均不可用"],
+        }
     updated = 0
     failed = 0
     errors: list[str] = []
@@ -712,10 +764,37 @@ def sync_stock_market_close(
         code = digits[-6:] if len(digits) >= 6 else digits.zfill(6)
         if code not in master_codes:
             continue
+        observed_at = record.get("行情时间")
+        if (
+            spot_source == "tencent_quote"
+            and isinstance(observed_at, datetime)
+            and observed_at.date() != day
+        ):
+            failed += 1
+            errors.append(
+                f"{code}: 腾讯报价日期 {observed_at.date().isoformat()} "
+                f"不是目标交易日 {day.isoformat()}"
+            )
+            continue
         close = _to_float(record.get("最新价"))
         if close is None or close <= 0:
             continue
         volume_lots = _to_float(record.get("成交量"))
+        amount = _to_float(record.get("成交额"))
+        record_volume_multiplier = volume_multiplier
+        if (
+            spot_source == "tencent_quote"
+            and volume_lots is not None
+            and volume_lots > 0
+            and amount is not None
+            and amount > 0
+        ):
+            # 腾讯不同板块的成交量单位并不统一。用成交额/成交价的隐含股数
+            # 在“股”和“手”两个候选中择近，避免对科创板错误放大 100 倍。
+            record_volume_multiplier = min(
+                (1, 100),
+                key=lambda scale: abs(amount - volume_lots * scale * close) / amount,
+            )
         pct_change = _to_float(record.get("涨跌幅"))
         row = pd.DataFrame.from_records(
             [
@@ -726,10 +805,10 @@ def sync_stock_market_close(
                     "high": _to_float(record.get("最高")),
                     "low": _to_float(record.get("最低")),
                     "close": close,
-                    "volume": int(volume_lots * volume_multiplier)
+                    "volume": int(volume_lots * record_volume_multiplier)
                     if volume_lots is not None
                     else None,
-                    "amount": _to_float(record.get("成交额")),
+                    "amount": amount,
                     "outstanding_share": None,
                     "turnover": _to_float(record.get("换手率")),
                     "pct_change": pct_change / 100.0
@@ -803,6 +882,7 @@ def sync_stock_market_close(
 # 状态 / coverage
 # ---------------------------------------------------------------------------
 
+
 def _task_state(db: Session, task: str) -> dict[str, Any]:
     state = db.get(StockSyncState, task)
     if state is None:
@@ -834,32 +914,42 @@ def get_data_status(db: Session, root: Path | None = None) -> dict[str, Any]:
     daily_files = len(parquet_store.list_synced_codes(root=root))
 
     constituent_rows = db.execute(
-        select(IndexConstituent.index_code, func.count())
-        .group_by(IndexConstituent.index_code)
+        select(IndexConstituent.index_code, func.count()).group_by(
+            IndexConstituent.index_code
+        )
     ).all()
 
     fin_stats = db.execute(
-        select(func.count(), func.count(func.distinct(StockFinancialIndicator.code)))
-        .select_from(StockFinancialIndicator)
+        select(
+            func.count(), func.count(func.distinct(StockFinancialIndicator.code))
+        ).select_from(StockFinancialIndicator)
     ).one()
     disclosure_stats = db.execute(
-        select(func.count(), func.count(func.distinct(StockReportDisclosure.code)))
-        .select_from(StockReportDisclosure)
+        select(
+            func.count(), func.count(func.distinct(StockReportDisclosure.code))
+        ).select_from(StockReportDisclosure)
     ).one()
     valuation_stats = db.execute(
-        select(func.count(), func.count(func.distinct(StockValuation.code)))
-        .select_from(StockValuation)
+        select(
+            func.count(), func.count(func.distinct(StockValuation.code))
+        ).select_from(StockValuation)
     ).one()
     name_stats = db.execute(
-        select(func.count(), func.count(func.distinct(StockNameHistory.code)))
-        .select_from(StockNameHistory)
+        select(
+            func.count(), func.count(func.distinct(StockNameHistory.code))
+        ).select_from(StockNameHistory)
     ).one()
     industry_rows = db.execute(
-        select(StockIndustry.source, func.count(), func.count(func.distinct(StockIndustry.code)))
-        .group_by(StockIndustry.source)
+        select(
+            StockIndustry.source,
+            func.count(),
+            func.count(func.distinct(StockIndustry.code)),
+        ).group_by(StockIndustry.source)
     ).all()
     event_count = db.scalar(select(func.count()).select_from(IndexMembershipEvent)) or 0
-    snapshot_count = db.scalar(select(func.count()).select_from(StockUniverseSnapshot)) or 0
+    snapshot_count = (
+        db.scalar(select(func.count()).select_from(StockUniverseSnapshot)) or 0
+    )
 
     return {
         "generated_at": datetime.now(UTC),
@@ -898,7 +988,9 @@ def get_data_status(db: Session, root: Path | None = None) -> dict[str, Any]:
         },
         "industry": {
             "stocks": sum(row[2] for row in industry_rows),
-            "sources": {row[0]: {"rows": row[1], "stocks": row[2]} for row in industry_rows},
+            "sources": {
+                row[0]: {"rows": row[1], "stocks": row[2]} for row in industry_rows
+            },
             "sync": _task_state(db, "industry"),
         },
     }

@@ -56,21 +56,81 @@ def test_refresh_persists_all_required_events_with_sla(
         primary_fetchers=_fetchers(),
         fallback_fetchers={},
     )
-    assert all(
-        item["status"] == "success"
-        for item in result["datasets"].values()
-    )
+    assert all(item["status"] == "success" for item in result["datasets"].values())
     assert db_session.query(QuantDataRecord).count() == 4
     assert db_session.query(DataSourceSLAState).count() == 4
     health = service.sla_health(db_session)
     assert all(item["ready"] for item in health.values())
     dividend = db_session.scalar(
-        select(QuantDataRecord).where(
-            QuantDataRecord.dataset == "dividend"
-        )
+        select(QuantDataRecord).where(QuantDataRecord.dataset == "dividend")
     )
     assert dividend is not None
     assert dividend.payload["cash_div"] == 0.1
+
+
+def test_refresh_can_target_selected_datasets_without_touching_others(
+    db_session: Session,
+) -> None:
+    result = service.refresh_execution_references(
+        db_session,
+        as_of=date(2026, 8, 5),
+        datasets=["suspend_d"],
+        primary_fetchers={"suspend_d": _fetchers()["suspend_d"]},
+        fallback_fetchers={},
+    )
+
+    assert set(result["datasets"]) == {"suspend_d"}
+    assert db_session.get(DataSourceSLAState, "suspend_d") is not None
+    assert db_session.get(DataSourceSLAState, "stk_limit") is None
+
+
+def test_refresh_rejects_unknown_selected_dataset(db_session: Session) -> None:
+    try:
+        service.refresh_execution_references(
+            db_session,
+            datasets=["not_a_dataset"],
+        )
+    except ValueError as exc:
+        assert "not_a_dataset" in str(exc)
+    else:
+        raise AssertionError("未知数据集必须被拒绝")
+
+
+def test_empty_event_day_does_not_invent_schema_or_block_next_event(
+    db_session: Session,
+) -> None:
+    empty = service.refresh_execution_references(
+        db_session,
+        as_of=date(2026, 8, 4),
+        datasets=["suspend_d"],
+        primary_fetchers={"suspend_d": lambda _db, _day: []},
+        fallback_fetchers={},
+    )
+    assert empty["datasets"]["suspend_d"]["status"] == "success"
+    state = db_session.get(DataSourceSLAState, "suspend_d")
+    assert state is not None and state.schema_hash is None
+
+    event = service.refresh_execution_references(
+        db_session,
+        as_of=date(2026, 8, 5),
+        datasets=["suspend_d"],
+        primary_fetchers={
+            "suspend_d": lambda _db, day: [
+                {
+                    "ts_code": "600001",
+                    "trade_date": day.isoformat(),
+                    "suspend_type": "S",
+                    "reason": "重大事项",
+                    "resume_date": None,
+                }
+            ]
+        },
+        fallback_fetchers={},
+    )
+
+    assert event["datasets"]["suspend_d"]["status"] == "success"
+    assert state.schema_hash is not None
+    assert state.row_count == 1
 
 
 def test_primary_failure_uses_fallback_and_marks_degraded(

@@ -55,6 +55,41 @@ def test_tencent_daily_parser_corrects_volume_scale() -> None:
     assert row["trade_date"] == date(2026, 8, 3)
 
 
+def test_tencent_quote_parser_converts_amount_and_timestamp() -> None:
+    fields = [""] * 39
+    fields[1] = "浦发银行"
+    fields[2] = "600000"
+    fields[3] = "10.20"
+    fields[4] = "10.00"
+    fields[5] = "10.05"
+    fields[6] = "1234"
+    fields[30] = "20260806161436"
+    fields[32] = "2.00"
+    fields[33] = "10.30"
+    fields[34] = "9.90"
+    fields[37] = "123.4"
+    fields[38] = "1.50"
+
+    rows = ak_fetch._parse_tencent_quote_text(f'v_sh600000="{"~".join(fields)}";')
+
+    assert rows == [
+        {
+            "代码": "600000",
+            "名称": "浦发银行",
+            "最新价": "10.20",
+            "昨收": "10.00",
+            "今开": "10.05",
+            "成交量": "1234",
+            "最高": "10.30",
+            "最低": "9.90",
+            "成交额": 1_234_000.0,
+            "涨跌幅": "2.00",
+            "换手率": 0.015,
+            "行情时间": datetime(2026, 8, 6, 16, 14, 36),
+        }
+    ]
+
+
 def test_market_close_snapshot_updates_tracked_universe(
     db_session: Session, tmp_path: Path, monkeypatch
 ) -> None:
@@ -173,3 +208,71 @@ def test_market_close_snapshot_falls_back_to_sina(
     stored = parquet_store.read_daily("600000", root=tmp_path)
     assert stored is not None
     assert stored.iloc[-1]["volume"] == 123_456
+
+
+def test_market_close_snapshot_falls_back_to_current_tencent_quote(
+    db_session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    db_session.add_all(
+        [
+            StockMaster(code="600000", name="浦发银行", exchange="sh"),
+            StockMaster(code="688981", name="中芯国际", exchange="sh"),
+            IndexConstituent(
+                index_code="000300", stock_code="600000", stock_name="浦发银行"
+            ),
+            IndexConstituent(
+                index_code="000300", stock_code="688981", stock_name="中芯国际"
+            ),
+        ]
+    )
+    db_session.commit()
+    monkeypatch.setattr(ak_fetch, "fetch_stock_spot_eastmoney", lambda: None)
+    monkeypatch.setattr(ak_fetch, "fetch_stock_spot_sina", lambda: None)
+    monkeypatch.setattr(
+        ak_fetch,
+        "fetch_stock_spot_tencent_quotes",
+        lambda symbols: pd.DataFrame(
+            [
+                {
+                    "代码": "600000",
+                    "最新价": 10.2,
+                    "今开": 10.0,
+                    "最高": 10.3,
+                    "最低": 9.9,
+                    "成交量": 1234,
+                    "成交额": 1_234_000,
+                    "涨跌幅": 2.0,
+                    "换手率": 0.015,
+                    "行情时间": datetime(2026, 8, 6, 16, 14, 36),
+                },
+                {
+                    "代码": "688981",
+                    "最新价": 124.15,
+                    "今开": 122.0,
+                    "最高": 126.99,
+                    "最低": 121.88,
+                    "成交量": 51_888_149,
+                    "成交额": 6_429_440_000,
+                    "涨跌幅": -1.04,
+                    "换手率": 0.0259,
+                    "行情时间": datetime(2026, 8, 6, 16, 14, 36),
+                },
+            ]
+        ),
+    )
+
+    result = stock_data.sync_stock_market_close(
+        db_session, trade_date=date(2026, 8, 6), root=tmp_path
+    )
+
+    assert result["status"] == "success"
+    meta = db_session.get(StockDailyBar, "600000")
+    assert meta is not None and meta.source == "tencent_quote"
+    stored = parquet_store.read_daily("600000", root=tmp_path)
+    assert stored is not None
+    assert stored.iloc[-1]["volume"] == 123_400
+    assert stored.iloc[-1]["amount"] == 1_234_000
+    star = parquet_store.read_daily("688981", root=tmp_path)
+    assert star is not None
+    assert star.iloc[-1]["volume"] == 51_888_149
+    assert star.iloc[-1]["turnover"] == 0.0259

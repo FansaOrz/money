@@ -11,7 +11,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Callable
+from typing import Callable, Iterable
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -139,8 +139,7 @@ def _json_value(value: object) -> object:
 def _records(frame: object) -> list[dict[str, object]]:
     rows = getattr(frame, "to_dict")("records")
     return [
-        {str(key): _json_value(value) for key, value in row.items()}
-        for row in rows
+        {str(key): _json_value(value) for key, value in row.items()} for row in rows
     ]
 
 
@@ -152,8 +151,7 @@ def _akshare_calls(
     """在隔离进程运行不可信 SDK，崩溃、退出和超时都转成普通失败。"""
     request = {
         "calls": [
-            {"function": function, "kwargs": kwargs}
-            for function, kwargs in calls
+            {"function": function, "kwargs": kwargs} for function, kwargs in calls
         ]
     }
     try:
@@ -166,9 +164,7 @@ def _akshare_calls(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"AkShare 子进程超过 {timeout_seconds} 秒"
-        ) from exc
+        raise RuntimeError(f"AkShare 子进程超过 {timeout_seconds} 秒") from exc
     marker = "__AKSHARE_RESULT__"
     payload = next(
         (
@@ -180,9 +176,7 @@ def _akshare_calls(
     )
     if completed.returncode != 0 or payload is None:
         detail = (completed.stderr or completed.stdout).strip()[-1000:]
-        raise RuntimeError(
-            f"AkShare 子进程异常退出({completed.returncode})：{detail}"
-        )
+        raise RuntimeError(f"AkShare 子进程异常退出({completed.returncode})：{detail}")
     rows = json.loads(payload)
     if not isinstance(rows, list):
         raise RuntimeError("AkShare 子进程返回类型不是 list")
@@ -250,13 +244,8 @@ def _fetch_dividend_baidu(_db: Session, as_of: date) -> list[dict[str, object]]:
     return result
 
 
-def _fetch_current_names(
-    db: Session, as_of: date
-) -> list[dict[str, object]]:
-    existing = {
-        row.code: row.name
-        for row in db.scalars(select(StockMaster)).all()
-    }
+def _fetch_current_names(db: Session, as_of: date) -> list[dict[str, object]]:
+    existing = {row.code: row.name for row in db.scalars(select(StockMaster)).all()}
     rows = _akshare_calls(
         [
             ("stock_info_sh_name_code", {"symbol": "主板A股"}),
@@ -266,12 +255,8 @@ def _fetch_current_names(
     )
     result: list[dict[str, object]] = []
     for row in rows:
-        code = str(
-            row.get("证券代码") or row.get("A股代码") or ""
-        ).zfill(6)
-        name = str(
-            row.get("证券简称") or row.get("A股简称") or ""
-        ).strip()
+        code = str(row.get("证券代码") or row.get("A股代码") or "").zfill(6)
+        name = str(row.get("证券简称") or row.get("A股简称") or "").strip()
         old_name = existing.get(code)
         if code and name and old_name and old_name != name:
             result.append(
@@ -346,9 +331,7 @@ def _limits_from_quote_rows(
     return result
 
 
-def _fetch_limits_eastmoney(
-    db: Session, as_of: date
-) -> list[dict[str, object]]:
+def _fetch_limits_eastmoney(db: Session, as_of: date) -> list[dict[str, object]]:
     return _limits_from_quote_rows(
         db,
         as_of,
@@ -356,14 +339,10 @@ def _fetch_limits_eastmoney(
     )
 
 
-def _fetch_limits_derived(
-    db: Session, as_of: date
-) -> list[dict[str, object]]:
+def _fetch_limits_derived(db: Session, as_of: date) -> list[dict[str, object]]:
     from app.services.stock_repository import load_repository
 
-    codes = list(
-        db.scalars(select(IndexConstituent.stock_code).distinct()).all()
-    )
+    codes = list(db.scalars(select(IndexConstituent.stock_code).distinct()).all())
     repository = load_repository(db)
     if repository is None or not codes:
         raise RuntimeError("没有可用于推导涨跌停价的行情仓储或指数股票池")
@@ -410,12 +389,8 @@ def _tracked_codes(db: Session) -> list[str]:
     return sorted(set(held))
 
 
-def _fetch_suspend_quote_absence(
-    db: Session, as_of: date
-) -> list[dict[str, object]]:
-    tracked = set(
-        db.scalars(select(IndexConstituent.stock_code).distinct()).all()
-    )
+def _fetch_suspend_quote_absence(db: Session, as_of: date) -> list[dict[str, object]]:
+    tracked = set(db.scalars(select(IndexConstituent.stock_code).distinct()).all())
     quoted = {
         str(row.get("代码") or "").zfill(6)
         for row in _akshare_calls([("stock_zh_a_spot_em", {})])
@@ -433,14 +408,10 @@ def _fetch_suspend_quote_absence(
     ]
 
 
-def _fetch_dividend_cninfo(
-    db: Session, as_of: date
-) -> list[dict[str, object]]:
+def _fetch_dividend_cninfo(db: Session, as_of: date) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     for code in _tracked_codes(db):
-        for row in _akshare_calls(
-            [("stock_dividend_cninfo", {"symbol": code})]
-        ):
+        for row in _akshare_calls([("stock_dividend_cninfo", {"symbol": code})]):
             ann_date = str(row.get("实施方案公告日期") or "")
             if ann_date[:10] != as_of.isoformat():
                 continue
@@ -461,9 +432,7 @@ def _fetch_dividend_cninfo(
     return result
 
 
-def _fetch_name_history_sina(
-    db: Session, as_of: date
-) -> list[dict[str, object]]:
+def _fetch_name_history_sina(db: Session, as_of: date) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     current_names = {
         row.code: row.name
@@ -474,9 +443,7 @@ def _fetch_name_history_sina(
     if not current_names:
         raise RuntimeError("备用源仅保护持仓证券，当前没有持仓可核对")
     for code, current in current_names.items():
-        rows = _akshare_calls(
-            [("stock_info_change_name", {"symbol": code})]
-        )
+        rows = _akshare_calls([("stock_info_change_name", {"symbol": code})])
         if not rows:
             continue
         newest = str(rows[-1].get("name") or "").strip()
@@ -577,9 +544,7 @@ def _persist_rows(
         payload = {key: _json_value(value) for key, value in raw.items()}
         missing = REQUIRED_FIELDS[dataset] - set(payload)
         if missing:
-            raise ValueError(
-                f"{dataset} schema 缺少字段：{','.join(sorted(missing))}"
-            )
+            raise ValueError(f"{dataset} schema 缺少字段：{','.join(sorted(missing))}")
         canonical = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -636,9 +601,7 @@ def _persist_rows(
 
 def _schema_hash(rows: list[dict[str, object]]) -> str:
     fields = sorted({field for row in rows for field in row})
-    return hashlib.sha256(
-        json.dumps(fields, ensure_ascii=False).encode()
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode()).hexdigest()
 
 
 def provider_catalog(db: Session) -> dict[str, object]:
@@ -677,16 +640,22 @@ def refresh_execution_references(
     db: Session,
     *,
     as_of: date | None = None,
+    datasets: Iterable[str] | None = None,
     primary_fetchers: dict[str, Fetcher] | None = None,
     fallback_fetchers: dict[str, Fetcher] | None = None,
 ) -> dict[str, object]:
     """刷新四个必需数据集；单数据集失败不会掩盖其他数据集结果。"""
     target = as_of or datetime.now(UTC).date()
+    selected = tuple(dict.fromkeys(datasets or POLICIES))
+    unknown = sorted(set(selected) - set(POLICIES))
+    if unknown:
+        raise ValueError("未知执行参考数据集：" + ",".join(unknown))
     primary = primary_fetchers or PRIMARY_FETCHERS
     fallback = fallback_fetchers or FALLBACK_FETCHERS
     now = datetime.now(UTC)
     results: dict[str, object] = {}
-    for dataset, policy in POLICIES.items():
+    for dataset in selected:
+        policy = POLICIES[dataset]
         state = _state(db, policy)
         state.last_attempted_at = now
         errors: list[str] = []
@@ -714,9 +683,7 @@ def refresh_execution_references(
             state.consecutive_failures = int(state.consecutive_failures or 0) + 1
             state.degraded = False
             state.escalation_level = (
-                "critical"
-                if state.consecutive_failures >= 3
-                else "warning"
+                "critical" if state.consecutive_failures >= 3 else "warning"
             )
             state.error = "；".join(errors)
             state.detail = {"errors": errors, "safe_action": policy.failure_mode}
@@ -728,20 +695,14 @@ def refresh_execution_references(
             db.commit()
             continue
         if dataset == "stk_limit":
-            expected = int(
-                db.scalar(select(func.count(IndexConstituent.id))) or 0
-            )
+            expected = int(db.scalar(select(func.count(IndexConstituent.id))) or 0)
             if expected and len(rows) < int(expected * 0.95):
-                errors.append(
-                    f"批量缺失：stk_limit {len(rows)}/{expected} 低于95%"
-                )
+                errors.append(f"批量缺失：stk_limit {len(rows)}/{expected} 低于95%")
                 rows = None
         if rows is None:
             state.status = "failed"
             state.active_source = None
-            state.consecutive_failures = int(
-                state.consecutive_failures or 0
-            ) + 1
+            state.consecutive_failures = int(state.consecutive_failures or 0) + 1
             state.degraded = False
             state.escalation_level = "critical"
             state.error = "；".join(errors)
@@ -756,23 +717,18 @@ def refresh_execution_references(
             }
             db.commit()
             continue
-        new_schema_hash = (
-            _schema_hash(rows)
-            if rows
-            else state.schema_hash
-            or hashlib.sha256(
-                json.dumps(sorted(REQUIRED_FIELDS[dataset])).encode()
-            ).hexdigest()
-        )
+        # 空结果只能证明“当天没有事件”，无法证明上游完整字段集合。
+        # 因此首次空结果不建立 schema 指纹；从空结果转为非空时允许采纳
+        # 第一个真实 schema，避免把合法的可选字段误报为接口漂移。
+        new_schema_hash = _schema_hash(rows) if rows else state.schema_hash
         if (
             state.schema_hash
             and rows
+            and int(state.row_count or 0) > 0
             and state.schema_hash != new_schema_hash
         ):
             state.status = "failed"
-            state.consecutive_failures = int(
-                state.consecutive_failures or 0
-            ) + 1
+            state.consecutive_failures = int(state.consecutive_failures or 0) + 1
             state.escalation_level = "critical"
             state.error = "接口 schema 与上次成功版本不一致"
             state.detail = {
@@ -856,9 +812,8 @@ def sla_health(
         last_success = state.last_success_at if state is not None else None
         if last_success is not None and last_success.tzinfo is None:
             last_success = last_success.replace(tzinfo=UTC)
-        overdue = (
-            last_success is None
-            or current - last_success > timedelta(minutes=policy.max_latency_minutes)
+        overdue = last_success is None or current - last_success > timedelta(
+            minutes=policy.max_latency_minutes
         )
         status = state.status if state is not None else "never_run"
         ready = status in {"success", "degraded"} and not overdue

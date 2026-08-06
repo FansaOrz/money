@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import re
 from typing import Any
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,84 @@ def fetch_stock_spot_sina() -> pd.DataFrame | None:
 def fetch_stock_spot_tencent() -> pd.DataFrame | None:
     """腾讯全市场 A 股实时快照；提供 PE(TTM)、市值等估值字段。"""
     return _call("stock_zh_a_spot_tx")
+
+
+def _parse_tencent_quote_text(text: str) -> list[dict[str, object]]:
+    """解析腾讯批量报价；金额统一为元，成交量保留为手交给调用方换算。"""
+    result: list[dict[str, object]] = []
+    for line in text.splitlines():
+        match = re.search(r'="(.*)"', line)
+        if match is None:
+            continue
+        fields = match.group(1).split("~")
+        if len(fields) <= 38:
+            continue
+        timestamp = fields[30].strip()
+        try:
+            observed_at = datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+        result.append(
+            {
+                "代码": fields[2].strip(),
+                "名称": fields[1].strip(),
+                "最新价": fields[3],
+                "昨收": fields[4],
+                "今开": fields[5],
+                "成交量": fields[6],
+                "最高": fields[33],
+                "最低": fields[34],
+                "成交额": (float(fields[37]) * 10_000 if fields[37].strip() else None),
+                "涨跌幅": fields[32],
+                "换手率": (float(fields[38]) / 100 if fields[38].strip() else None),
+                "行情时间": observed_at,
+            }
+        )
+    return result
+
+
+def fetch_stock_spot_tencent_quotes(
+    symbols: list[str],
+    *,
+    batch_size: int = 80,
+    max_workers: int = 8,
+) -> pd.DataFrame | None:
+    """腾讯批量报价回退源；只请求给定股票池，避免抓取无关全市场分页。"""
+    normalized = sorted({str(symbol).strip() for symbol in symbols if symbol})
+    batches = [
+        normalized[offset : offset + batch_size]
+        for offset in range(0, len(normalized), batch_size)
+    ]
+    if not batches:
+        return None
+
+    def fetch(batch: list[str]) -> list[dict[str, object]]:
+        response = requests.get(
+            "https://qt.gtimg.cn/q=" + ",".join(batch),
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://gu.qq.com/",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        return _parse_tencent_quote_text(
+            response.content.decode("gbk", errors="replace")
+        )
+
+    rows: list[dict[str, object]] = []
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
+        futures = [executor.submit(fetch, batch) for batch in batches]
+        for future in as_completed(futures):
+            try:
+                rows.extend(future.result())
+            except Exception as exc:
+                logger.warning("腾讯批量报价分片抓取失败：%s", exc)
+    if not rows:
+        return None
+    return pd.DataFrame.from_records(rows).drop_duplicates(
+        subset=["代码"], keep="last", ignore_index=True
+    )
 
 
 def fetch_trade_calendar_sina() -> pd.DataFrame | None:
@@ -157,7 +239,9 @@ def fetch_report_disclosure(market: str, period: str) -> pd.DataFrame | None:
     return _call("stock_report_disclosure", market=market, period=period)
 
 
-def fetch_valuation_baidu(symbol: str, indicator: str, period: str = "近一年") -> pd.DataFrame | None:
+def fetch_valuation_baidu(
+    symbol: str, indicator: str, period: str = "近一年"
+) -> pd.DataFrame | None:
     """百度股市通估值。
 
     indicator: 总市值/市盈率(TTM)/市净率/市销率(TTM)/股息率
@@ -196,9 +280,7 @@ def fetch_valuation_baidu(symbol: str, indicator: str, period: str = "近一年"
         frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
         return frame if not frame.empty else None
     except Exception as exc:
-        logger.warning(
-            "baidu 估值调用失败（%s/%s）：%s", symbol, indicator, exc
-        )
+        logger.warning("baidu 估值调用失败（%s/%s）：%s", symbol, indicator, exc)
         return None
 
 
@@ -279,11 +361,31 @@ def fetch_stock_profile_cninfo(symbol: str) -> pd.DataFrame | None:
             return None
         values = list(records[0].values())
         columns = [
-            "公司名称", "英文名称", "曾用简称", "A股代码", "A股简称",
-            "B股代码", "B股简称", "H股代码", "H股简称", "入选指数",
-            "所属市场", "所属行业", "法人代表", "注册资金", "成立日期",
-            "上市日期", "官方网站", "电子邮箱", "联系电话", "传真",
-            "注册地址", "办公地址", "邮政编码", "主营业务", "经营范围",
+            "公司名称",
+            "英文名称",
+            "曾用简称",
+            "A股代码",
+            "A股简称",
+            "B股代码",
+            "B股简称",
+            "H股代码",
+            "H股简称",
+            "入选指数",
+            "所属市场",
+            "所属行业",
+            "法人代表",
+            "注册资金",
+            "成立日期",
+            "上市日期",
+            "官方网站",
+            "电子邮箱",
+            "联系电话",
+            "传真",
+            "注册地址",
+            "办公地址",
+            "邮政编码",
+            "主营业务",
+            "经营范围",
             "机构简介",
         ]
         # 巨潮尾部附带四个接口内部字段，AKShare 同样会将它们剔除。
