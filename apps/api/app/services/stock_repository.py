@@ -747,6 +747,11 @@ class SqlStockRepository:
     def accessed_file_records(self) -> list[dict[str, object]]:
         return list(self._accessed_files.values())
 
+    @property
+    def governance_db(self) -> object:
+        """返回文件访问审计与历史 readiness 使用的同一数据库会话。"""
+        return self._db
+
     def _database_matches_config(self) -> bool:
         """只让配置主库自动挂载配置的数据湖，避免临时库串入生产快照。"""
         try:

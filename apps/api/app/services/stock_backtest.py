@@ -3253,6 +3253,13 @@ def persist_historical_readiness(
     }
 
 
+def _resolve_governance_db(db: object, repository: StockRepository) -> object:
+    """显式入口会话优先，否则使用仓储公开的治理会话。"""
+    if db is not None:
+        return db
+    return getattr(repository, "governance_db", None)
+
+
 def run_backtest(
     db: object = None,
     config: BacktestConfig | None = None,
@@ -3267,6 +3274,7 @@ def run_backtest(
             "股票数据仓储不可用：请注入 repository，或等待 stock data 模块落地"
             "（app.services.stock_repository.get_repository / ORM 模型探测）"
         )
+    governance_db = _resolve_governance_db(db, repo)
     calendar = repo.trade_calendar(config.start, None)
     valuation_dates = signal_dates(
         calendar.days, config.start, config.end, config.initial_signal
@@ -3394,6 +3402,8 @@ def run_backtest(
             raise BacktestError("正式实验缺少冻结文件清单 SHA-256")
         if not callable(access_fn):
             raise BacktestError("正式实验仓储不支持实际文件访问审计")
+        if governance_db is None:
+            raise BacktestError("正式实验仓储没有可用的文件治理数据库会话")
         from app.config import get_settings
         from app.services.file_access_manifest import (
             FileManifestMismatch,
@@ -3402,7 +3412,7 @@ def run_backtest(
 
         try:
             verify_accesses(
-                db,
+                governance_db,
                 root=Path(get_settings().research_data_dir),
                 snapshot_sha256=config.file_manifest_snapshot_sha256,
                 observations=list(access_fn()),
@@ -3411,7 +3421,7 @@ def run_backtest(
         except FileManifestMismatch as exc:
             raise BacktestError(f"实际读取文件与冻结清单不一致：{exc}") from exc
     persist_historical_readiness(
-        db,
+        governance_db,
         config=config,
         signal_days=list(valuation_dates),
         memberships=memberships,

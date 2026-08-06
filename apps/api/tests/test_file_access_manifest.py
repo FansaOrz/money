@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.models import DataFileAccessLog
+from app.services import stock_backtest
 from app.services.file_access_manifest import (
     FileManifestMismatch,
     discover_research_files,
@@ -50,9 +51,7 @@ def test_replaced_or_unregistered_file_cannot_silently_rerun(
             snapshot_sha256=snapshot,
             observations=[file_observation(second, tmp_path)],
         )
-    statuses = {
-        row.status for row in db_session.query(DataFileAccessLog).all()
-    }
+    statuses = {row.status for row in db_session.query(DataFileAccessLog).all()}
     assert statuses == {"verified", "hash_mismatch", "unregistered"}
 
 
@@ -75,3 +74,15 @@ def test_discovery_includes_global_index_industry_and_benchmark_files(
     discovered = discover_research_files(tmp_path, ["600001"])
 
     assert set(discovered) == set(expected)
+
+
+def test_formal_backtest_uses_repository_governance_session_when_db_omitted() -> None:
+    marker = object()
+
+    class GovernedRepository:
+        governance_db = marker
+
+    repository = GovernedRepository()
+    assert stock_backtest._resolve_governance_db(None, repository) is marker
+    explicit = object()
+    assert stock_backtest._resolve_governance_db(explicit, repository) is explicit
