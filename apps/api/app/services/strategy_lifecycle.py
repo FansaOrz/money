@@ -474,6 +474,7 @@ def transition(
                     "scripts.run_strategy_v13_operational_shadow.run_development_replay",
                     "scripts.run_strategy_v14_operational_shadow.run_development_replay",
                     "scripts.run_strategy_v15_operational_shadow.run_development_replay",
+                    "scripts.run_strategy_v16_operational_shadow.run_development_replay",
                 }
             )
         if evidence.get("generated_by") not in trusted_generators:

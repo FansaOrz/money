@@ -1,4 +1,4 @@
-"""创建版本15运行影子；只用开发数据验证链路，不读取正式留出集。"""
+"""创建版本16运行影子；只用开发数据验证链路，不读取正式留出集。"""
 
 from __future__ import annotations
 
@@ -36,8 +36,8 @@ REPLAY_FOLDS = (
 )
 VALIDATION_START = date(2022, 1, 4)
 VALIDATION_END = date(2022, 12, 29)
-PREVIOUS_SHADOW_NAME = "A股多因子规则V7-版本14运行影子镜像"
-GENERATOR = "scripts.run_strategy_v15_operational_shadow.run_development_replay"
+PREVIOUS_SHADOW_NAME = "A股多因子规则V7-版本15运行影子镜像"
+GENERATOR = "scripts.run_strategy_v16_operational_shadow.run_development_replay"
 
 
 def _config(
@@ -189,16 +189,16 @@ def run() -> dict[str, object]:
                 previous.id,
                 "retired",
                 evidence={
-                    "execution_semantics_defect": True,
+                    "runtime_source_gate_missing": True,
                     "recorded_git_sha": dict(previous.params or {}).get("git_sha"),
                     "replacement_git_sha": git_sha,
                     "contaminated_run_ids": contaminated_runs,
                     "formal_validation_or_holdout_accessed": False,
                 },
-                actor="system:strategy-v15-operational-shadow",
+                actor="system:strategy-v16-operational-shadow",
                 reason=(
-                    "版本14首日运行发现连续优化权重未按A股整手离散后再进入"
-                    "前向信号；保留记录作事故审计但禁止纳入两个月观察"
+                    "版本15缺少每次推进账户前的运行时源码冻结校验；首日记录"
+                    "保留作工程证据，但长期观察迁移到带失败关闭门禁的新版本"
                 ),
             )
             previous_accounts = db.scalars(
@@ -207,10 +207,10 @@ def run() -> dict[str, object]:
                 )
             ).all()
             for account in previous_accounts:
-                account.status = "invalidated_execution_semantics"
+                account.status = "superseded_missing_runtime_source_gate"
             db.add(
                 AuditLog(
-                    actor="system:strategy-v15-operational-shadow",
+                    actor="system:strategy-v16-operational-shadow",
                     action="operational_shadow_invalidated",
                     resource_type="strategy_version",
                     resource_id=str(previous.id),
@@ -236,7 +236,7 @@ def run() -> dict[str, object]:
             if result is not None:
                 return result
             raise RuntimeError(
-                f"版本15已有未完成记录 id={existing.id} status={existing.status}"
+                f"版本16已有未完成记录 id={existing.id} status={existing.status}"
             )
 
         source = db.get(StrategyVersion, SOURCE_VERSION_ID)
@@ -338,7 +338,7 @@ def run() -> dict[str, object]:
                 repository=repository,
             )
             stock_validation._assert_strategy_activity(
-                outcome, stage=f"版本15运行回放折{index}"
+                outcome, stage=f"版本16运行回放折{index}"
             )
             folds.append(stock_validation._metrics(outcome))
         validation_outcome = stock_backtest.run_backtest(
@@ -351,10 +351,10 @@ def run() -> dict[str, object]:
             repository=repository,
         )
         stock_validation._assert_strategy_activity(
-            validation_outcome, stage="版本15运行回放验证段"
+            validation_outcome, stage="版本16运行回放验证段"
         )
         validation = {
-            "kind": "strategy_v15_operational_development_replay",
+            "kind": "strategy_v16_operational_development_replay",
             "folds": folds,
             "validation": stock_validation._metrics(validation_outcome),
             "holdout_evaluations": 0,
@@ -375,7 +375,7 @@ def run() -> dict[str, object]:
             version.id,
             "operational_validated",
             evidence=evidence,
-            actor="system:strategy-v15-operational-shadow",
+            actor="system:strategy-v16-operational-shadow",
             reason=("三个开发折与一个开发验证段的运行链路回放通过；未访问正式留出集"),
         )
         version = strategy_lifecycle.transition(
@@ -386,13 +386,13 @@ def run() -> dict[str, object]:
                 "experiment_snapshot_complete": True,
                 "validation_sha256": validation_sha256,
             },
-            actor="system:strategy-v15-operational-shadow",
+            actor="system:strategy-v16-operational-shadow",
             reason=("代码、候选池、冻结权重与运行回放证据已冻结，启动两个月运行影子"),
         )
         account, _ = stock_paper._ensure_account(db, data_date)
         db.add(
             AuditLog(
-                actor="system:strategy-v15-operational-shadow",
+                actor="system:strategy-v16-operational-shadow",
                 action="operational_shadow_started",
                 resource_type="strategy_version",
                 resource_id=str(version.id),
