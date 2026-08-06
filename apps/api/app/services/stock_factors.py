@@ -28,7 +28,7 @@ available_at ≤ T 的最新一条 PIT 快照（最新财报的估值分位历�
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from statistics import fmean
 
@@ -201,7 +201,9 @@ def zscore(values: dict[str, float | None]) -> dict[str, float | None]:
     std = math.sqrt(variance)
     if std == 0:
         return {key: (0.0 if v is not None else None) for key, v in values.items()}
-    return {key: ((v - mean) / std if v is not None else None) for key, v in values.items()}
+    return {
+        key: ((v - mean) / std if v is not None else None) for key, v in values.items()
+    }
 
 
 MIN_VALUATION_HISTORY_OBSERVATIONS = 24
@@ -249,6 +251,45 @@ def _latest_with_values(
     return result
 
 
+def _latest_sector_snapshot(
+    fundamentals: tuple[Fundamentals, ...],
+    as_of: date,
+    fields: tuple[str, ...],
+) -> Fundamentals | None:
+    """按字段取得截至 T 的最新金融专用指标，形成可审计的 as-of 快照。
+
+    银行监管指标的披露频率并不一致：不良率、净息差常按季披露，而资本
+    充足率可能只在半年报/年报出现。若直接取“包含任一字段的最新报告”，
+    新一季报会把上一期仍然有效的资本充足率覆盖成空值，进而把整个银行
+    行业错误剔除。这里对每个字段分别做 last-observation-carried-forward，
+    但只允许使用 ``available_at <= as_of`` 的正式可用记录，不跨越信号日。
+    """
+    latest: Fundamentals | None = None
+    values: dict[str, object] = {}
+    sources: set[str] = set()
+    for snapshot in fundamentals:
+        if snapshot.available_at > as_of:
+            break
+        if not snapshot.formal_factor_usable:
+            continue
+        observed = False
+        for field_name in fields:
+            value = getattr(snapshot, field_name)
+            if value is not None:
+                values[field_name] = value
+                observed = True
+        if observed:
+            latest = snapshot
+            sources.update(snapshot.sector_metric_sources)
+    if latest is None:
+        return None
+    return replace(
+        latest,
+        **values,
+        sector_metric_sources=tuple(sorted(sources)),
+    )
+
+
 def _fundamental_value_series(
     fundamentals: tuple[Fundamentals, ...], as_of: date
 ) -> list[float]:
@@ -262,9 +303,9 @@ def _fundamental_value_series(
             break
         values = [v for v in (snapshot.ep, snapshot.bp) if v is not None]
         if values:
-            observations[
-                snapshot.valuation_date or snapshot.available_at
-            ] = fmean(values)
+            observations[snapshot.valuation_date or snapshot.available_at] = fmean(
+                values
+            )
     return [observations[day] for day in sorted(observations)]
 
 
@@ -315,9 +356,7 @@ def low_volatility(closes: list[float], window: int = LOWVOL_WINDOW) -> float | 
     return -math.sqrt(variance)
 
 
-def period_return(
-    closes: list[float], window: int, skip: int = 0
-) -> float | None:
+def period_return(closes: list[float], window: int, skip: int = 0) -> float | None:
     """固定交易日窗口收益，可选跳过尾部交易日。"""
     if len(closes) < window + 1:
         return None
@@ -341,9 +380,7 @@ def maximum_drawdown_factor(closes: list[float], window: int = 120) -> float | N
     return worst
 
 
-def _stability(
-    snapshots: tuple[Fundamentals, ...], field_name: str
-) -> float | None:
+def _stability(snapshots: tuple[Fundamentals, ...], field_name: str) -> float | None:
     values = [
         float(value)
         for snapshot in snapshots[-8:]
@@ -371,12 +408,8 @@ def _financial_policy_assessments(
         as_of,
         ("net_income", "operating_cash_flow", "total_assets"),
     )
-    latest_value = _latest_with_values(
-        context.fundamentals, as_of, ("market_cap",)
-    )
-    latest_fcf = _latest_with_values(
-        context.fundamentals, as_of, ("free_cash_flow",)
-    )
+    latest_value = _latest_with_values(context.fundamentals, as_of, ("market_cap",))
+    latest_fcf = _latest_with_values(context.fundamentals, as_of, ("free_cash_flow",))
     finance = any(
         marker in context.info.industry
         for marker in ("银行", "证券", "保险", "多元金融")
@@ -389,9 +422,7 @@ def _financial_policy_assessments(
         total_assets=latest_quality.total_assets if latest_quality else None,
     )
     fcf = assess_fcf_yield(
-        free_cash_flow=(
-            latest_fcf.free_cash_flow if latest_fcf is not None else None
-        ),
+        free_cash_flow=(latest_fcf.free_cash_flow if latest_fcf is not None else None),
         flow_basis=latest_fcf.flow_basis if latest_fcf is not None else None,
         market_cap=latest_value.market_cap if latest_value is not None else None,
         market_cap_date=(
@@ -432,11 +463,9 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
         ("ep", "bp", "market_cap", "sales_yield", "dividend_yield"),
     )
     sector_fields = tuple(
-        name
-        for name in _financial_directions()
-        if not name.endswith(("_ep", "_bp"))
+        name for name in _financial_directions() if not name.endswith(("_ep", "_bp"))
     )
-    latest_sector = _latest_with_values(
+    latest_sector = _latest_sector_snapshot(
         context.fundamentals,
         as_of,
         sector_fields + ("company_type",),
@@ -481,9 +510,7 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
 
     for name in ("roe", "roa", "gross_margin", "net_margin", "debt_ratio"):
         result[name] = getattr(latest_quality, name) if latest_quality else None
-    cash_assessment, fcf_assessment = _financial_policy_assessments(
-        context, as_of
-    )
+    cash_assessment, fcf_assessment = _financial_policy_assessments(context, as_of)
     result["ocf_to_profit"] = cash_assessment.ocf_to_profit
     result["cash_conversion_assets"] = cash_assessment.cash_conversion_assets
     result["accruals"] = (
@@ -497,9 +524,7 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
         for snapshot in context.fundamentals[-5:]
         if snapshot.net_margin is not None
     ]
-    result["margin_change"] = (
-        margins[-1] - margins[-2] if len(margins) >= 2 else None
-    )
+    result["margin_change"] = margins[-1] - margins[-2] if len(margins) >= 2 else None
     # 金融公司不用工业企业毛利率、现金流质量与负债率模型。
     result["financial_roe"] = result["roe"] if finance else None
     result["financial_roa"] = result["roa"] if finance else None
@@ -537,16 +562,12 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
     result["dividend_yield"] = (
         latest_value.dividend_yield if latest_value is not None else None
     )
-    result["market_cap"] = (
-        latest_value.market_cap if latest_value is not None else None
-    )
+    result["market_cap"] = latest_value.market_cap if latest_value is not None else None
     result["float_market_cap"] = (
         latest_value.float_market_cap if latest_value is not None else None
     )
     result["fcf_yield"] = fcf_assessment.value
-    latest_profit = _latest_with_values(
-        context.fundamentals, as_of, ("net_income",)
-    )
+    latest_profit = _latest_with_values(context.fundamentals, as_of, ("net_income",))
     result["loss_profitability"] = (
         -1.0
         if latest_profit is not None
@@ -557,9 +578,7 @@ def raw_factors(context: StockContext, as_of: date) -> dict[str, float | None]:
         else None
     )
 
-    current_values = [
-        v for v in (result["ep"], result["bp"]) if v is not None
-    ]
+    current_values = [v for v in (result["ep"], result["bp"]) if v is not None]
     if current_values:
         current = fmean(current_values)
         history = _fundamental_value_series(context.fundamentals, as_of)
@@ -608,7 +627,14 @@ MISSING_OPTIONAL_PENALTY = -0.25
 def _family_policy(result: FactorResult, family: str) -> tuple[list[str], set[str]]:
     """返回固定字段集合与必需项；集合不随单只股票的实际缺失而变化。"""
     sector = str(result.model_structure.get("sector") or "")
-    if sector in {"bank", "broker", "insurance"}:
+    # 金融专用契约只替换财务质量/价值族；动量、趋势和低波仍然来自所有
+    # 股票共有的价格序列。此前这里对五个因子族无条件返回专用字段，
+    # 导致后三个族拿到空字段集，完整银行模型也只有 55% 权重覆盖，
+    # 从而整个银行业被 75% 覆盖门禁错误剔除。
+    if sector in {"bank", "broker", "insurance"} and family in {
+        "quality",
+        "value",
+    }:
         from app.services.financial_sector_model import FEATURE_DICTIONARIES
 
         features = [
@@ -622,8 +648,7 @@ def _family_policy(result: FactorResult, family: str) -> tuple[list[str], set[st
         )
     if family == "quality":
         if any(
-            marker in result.industry
-            for marker in ("银行", "证券", "保险", "多元金融")
+            marker in result.industry for marker in ("银行", "证券", "保险", "多元金融")
         ):
             return (
                 [
@@ -693,9 +718,7 @@ def _combine_family(
     missing_required = sorted(
         name for name in required if result.zscores.get(name) is None
     )
-    available = sorted(
-        name for name in names if result.zscores.get(name) is not None
-    )
+    available = sorted(name for name in names if result.zscores.get(name) is not None)
     missing_optional = sorted(
         name
         for name in names
@@ -767,12 +790,10 @@ def compute_cross_section(
     results: list[FactorResult] = []
     for context in contexts:
         raw = raw_factors(context, as_of)
-        cash_assessment, fcf_assessment = _financial_policy_assessments(
-            context, as_of
-        )
+        cash_assessment, fcf_assessment = _financial_policy_assessments(context, as_of)
         from app.services.financial_sector_model import assess_financial_sector
 
-        latest_sector = _latest_with_values(
+        latest_sector = _latest_sector_snapshot(
             context.fundamentals,
             as_of,
             tuple(
@@ -795,15 +816,14 @@ def compute_cross_section(
             else None
         )
         own_returns = returns_by_code[context.info.code]
-        if official_market_returns and len(
-            set(own_returns) & set(official_market_returns)
-        ) >= 60:
+        if (
+            official_market_returns
+            and len(set(own_returns) & set(official_market_returns)) >= 60
+        ):
             market_proxy = official_market_returns
             market_source = "official_total_return_index"
         else:
-            market_proxy = leave_one_out_proxy(
-                returns_by_code, context.info.code
-            )
+            market_proxy = leave_one_out_proxy(returns_by_code, context.info.code)
             market_source = "leave_one_out_investable_universe"
         same_industry_codes = {
             item.info.code
@@ -850,9 +870,7 @@ def compute_cross_section(
         ]
         cap = raw.get("float_market_cap") or raw.get("market_cap")
         size = math.log(cap) if cap is not None and cap > 0 else None
-        liquidity = (
-            math.log(fmean(recent_amounts)) if recent_amounts else None
-        )
+        liquidity = math.log(fmean(recent_amounts)) if recent_amounts else None
         average_daily_amount = fmean(recent_amounts) if recent_amounts else None
         raw["beta"] = beta
         raw["residual_volatility"] = residual_volatility
@@ -908,9 +926,7 @@ def compute_cross_section(
                         "sector": sector_assessment.sector,
                         "eligible": sector_assessment.eligible,
                         "used_features": list(sector_assessment.used_features),
-                        "missing_required": list(
-                            sector_assessment.missing_required
-                        ),
+                        "missing_required": list(sector_assessment.missing_required),
                         "reason": sector_assessment.reason,
                     }
                     if sector_assessment is not None
@@ -958,9 +974,9 @@ def compute_cross_section(
         if factor_name in blocked_factors:
             for item in results:
                 item.zscores[factor_name] = None
-                item.factor_metadata.setdefault(factor_name, {})[
-                    "health_block"
-                ] = list(blocked_factors[factor_name])
+                item.factor_metadata.setdefault(factor_name, {})["health_block"] = list(
+                    blocked_factors[factor_name]
+                )
             continue
         oriented = {
             item.code: (
@@ -998,14 +1014,12 @@ def compute_cross_section(
             standardized = zscore(winsorize(neutralization.residuals))
             for item in results:
                 item.zscores[factor_name] = standardized[item.code]
-                item.factor_metadata.setdefault(factor_name, {})[
-                    "neutralization"
-                ] = diagnostics
+                item.factor_metadata.setdefault(factor_name, {})["neutralization"] = (
+                    diagnostics
+                )
         else:
             for members in by_industry.values():
-                column = {
-                    member.code: oriented[member.code] for member in members
-                }
+                column = {member.code: oriented[member.code] for member in members}
                 zscores = zscore(winsorize(column))
                 for member in members:
                     member.zscores[factor_name] = zscores[member.code]
@@ -1034,11 +1048,13 @@ def compute_cross_section(
                 for _member, momentum, _trend in momentum_trend
             )
             if variance > 0:
-                slope = sum(
-                    (float(momentum) - momentum_mean)
-                    * (float(trend) - trend_mean)
-                    for _member, momentum, trend in momentum_trend
-                ) / variance
+                slope = (
+                    sum(
+                        (float(momentum) - momentum_mean) * (float(trend) - trend_mean)
+                        for _member, momentum, trend in momentum_trend
+                    )
+                    / variance
+                )
                 for member, momentum, trend in momentum_trend:
                     member.zscores["trend"] = (
                         float(trend)
@@ -1065,15 +1081,16 @@ def compute_cross_section(
                 for _member, short, _long in volatility_pair
             )
             if variance > 0:
-                slope = sum(
-                    (float(short) - short_mean) * (float(long) - long_mean)
-                    for _member, short, long in volatility_pair
-                ) / variance
+                slope = (
+                    sum(
+                        (float(short) - short_mean) * (float(long) - long_mean)
+                        for _member, short, long in volatility_pair
+                    )
+                    / variance
+                )
                 for member, short, long in volatility_pair:
                     member.zscores["volatility_120"] = (
-                        float(long)
-                        - long_mean
-                        - slope * (float(short) - short_mean)
+                        float(long) - long_mean - slope * (float(short) - short_mean)
                     )
 
     for result in results:
@@ -1176,16 +1193,12 @@ def factor_correlation_matrix(
                 continue
             left_mean = fmean(a for a, _b in pairs)
             right_mean = fmean(b for _a, b in pairs)
-            numerator = sum(
-                (a - left_mean) * (b - right_mean) for a, b in pairs
-            )
+            numerator = sum((a - left_mean) * (b - right_mean) for a, b in pairs)
             denominator = math.sqrt(
                 sum((a - left_mean) ** 2 for a, _b in pairs)
                 * sum((b - right_mean) ** 2 for _a, b in pairs)
             )
-            matrix[left][right] = (
-                numerator / denominator if denominator > 0 else None
-            )
+            matrix[left][right] = numerator / denominator if denominator > 0 else None
     return matrix
 
 
